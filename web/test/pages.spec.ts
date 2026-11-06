@@ -22,8 +22,12 @@ beforeEach(() => {
   server = new FakeServer().install()
   // jsdom has no scrolling; the pages scroll to the top on every step.
   vi.stubGlobal('scrollTo', () => {})
+  let issue: (token: string) => void = () => {}
+  // As Cloudflare's widget: after a reset the fresh token arrives a moment later, not in the reset call.
+  widgetReset.mockImplementation(() => void setTimeout(() => issue('turnstile-pass-again'), 0))
   window.turnstile = {
     render: (_el, o) => {
+      issue = o.callback
       o.callback('turnstile-pass')
       return 'w1'
     },
@@ -287,7 +291,7 @@ describe('decided B4: refusals on Send and Add to report say what happened', () 
   const CHECK = 'The safety check did not pass. Wait a moment, then send it again.'
   const lines = () => [RATE, CHECK, t.errSend, t.errCode].filter((l) => screen.queryByText(l) !== null)
 
-  async function sendReport(): Promise<void> {
+  async function reportStep3(): Promise<void> {
     history.replaceState(null, '', '/')
     page(Report)
     fireEvent.change(screen.getByLabelText(t.q1), { target: { value: 'The boss stopped on the bridge.' } })
@@ -295,12 +299,18 @@ describe('decided B4: refusals on Send and Add to report say what happened', () 
     fireEvent.click(await screen.findByRole('button', { name: t.next }))
     await screen.findByText(t.h3)
     pick(file('clip.mp4', 2 * PART))
+  }
+  async function sendReport(): Promise<void> {
+    await reportStep3()
     await press(t.send)
   }
-  async function addToReport(): Promise<void> {
+  function addPage(): void {
     history.replaceState(null, '', `/add?code=${CODE}`)
     page(AddVideo)
     pick(file('clip.mp4', 2 * PART))
+  }
+  async function addToReport(): Promise<void> {
+    addPage()
     await press(t.addSend)
   }
   const onCreate = (f: Fault) => (server.routeFault = (m, p) => (m === 'POST' && p === '/reports' ? f : null))
@@ -336,13 +346,31 @@ describe('decided B4: refusals on Send and Add to report say what happened', () 
     expect(lines()).toEqual([t.errSend])
   })
 
-  it('B4 send, not yet: while createReport is unanswered none of the four lines shows', async () => {
+  it('B4 send, not yet: before Send, and while createReport is unanswered, none of the four lines shows', async () => {
     const gate = deferred()
     server.holdRoute = (m, p) => (m === 'POST' && p === '/reports' ? gate.promise : null)
-    await sendReport()
+    await reportStep3()
+    await screen.findByRole('button', { name: t.send })
+    expect(lines()).toEqual([])
+    await press(t.send)
     await waitFor(() => expect(server.requests('POST', '/reports')).toHaveLength(1))
     expect(lines()).toEqual([])
     gate.resolve()
+    await screen.findByText(t.h4)
+  })
+
+  it('B4 send, not yet: Send again after a 429 clears the old line while the new request is out', async () => {
+    onCreate({ status: 429, error: 'rate_limited' })
+    await sendReport()
+    await screen.findByText(RATE)
+    const gate = deferred()
+    server.routeFault = () => null
+    server.holdRoute = (m, p) => (m === 'POST' && p === '/reports' ? gate.promise : null)
+    await press(t.send)
+    await waitFor(() => expect(server.requests('POST', '/reports')).toHaveLength(2))
+    expect(lines()).toEqual([])
+    gate.resolve()
+    await screen.findByText(t.h4)
   })
 
   it('B4 add: 429 rate_limited on attach-session shows the errRate line, not the Wi-Fi line', async () => {
@@ -361,6 +389,20 @@ describe('decided B4: refusals on Send and Add to report say what happened', () 
     await screen.findByText(CHECK)
     expect(lines()).toEqual([CHECK])
     expect(widgetReset).toHaveBeenCalledWith('w1')
+  })
+
+  it('B4 add, not yet: before Add to report, and while attach-session is unanswered, none of the four lines shows', async () => {
+    server.addReport(CODE)
+    const gate = deferred()
+    server.holdRoute = (_m, p) => (p.endsWith('/attach-session') ? gate.promise : null)
+    addPage()
+    await screen.findByRole('button', { name: t.addSend })
+    expect(lines()).toEqual([])
+    await press(t.addSend)
+    await waitFor(() => expect(server.requests('POST', '/attach-session')).toHaveLength(1))
+    expect(lines()).toEqual([])
+    gate.resolve()
+    await screen.findByText(t.h4)
   })
 
   it('B4 add: 404 not_found on attach-session shows the errCode line', async () => {
