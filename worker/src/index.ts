@@ -54,7 +54,7 @@ async function fetchHandler(req: Request, env: Env, ctx: ExecutionContext): Prom
   try {
     res = await route(req, env, ctx, url);
   } catch (err) {
-    if (err instanceof HttpError) res = errorResponse(err.status, err.code);
+    if (err instanceof HttpError) res = errorResponse(err.status, err.code, err.extra);
     else {
       // The message only: never a request body, a token or a stack, in the log or in the answer.
       console.error("internal error", req.method, apiPath(url), err instanceof Error ? err.message : String(err));

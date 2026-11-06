@@ -1,7 +1,9 @@
-// Creating a report, shared by the web, game and Discord routes: one row and its `created` event in one batch.
+// Creating a report, shared by the web, game and Discord routes: one row and its `created` event in one batch. Also
+// the lookup by code the agent and desk routes share.
 import { newReportToken, sha256Hex } from "./auth";
 import { ulid, withNewCode } from "./codes";
 import { eventStatement } from "./events";
+import { HttpError } from "./http";
 
 // Fixed column list: the SQL text never depends on the caller's object, only the bound values do.
 const OPTIONAL = ["title", "where_area", "device", "lang", "roblox_name", "roblox_user_id", "discord_user_id",
@@ -28,4 +30,11 @@ export async function insertReport(env: Env, fields: NewReportFields) {
     ]);
     return { id, code, reportToken };
   });
+}
+
+/** The report's id and status by code, or 404 `not_found`. */
+export async function reportOf(env: Env, code: string): Promise<{ id: string; status: string }> {
+  const row = await env.DB.prepare("SELECT id, status FROM reports WHERE code = ?").bind(code).first<{ id: string; status: string }>();
+  if (!row) throw new HttpError(404, "not_found");
+  return row;
 }

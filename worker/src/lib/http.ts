@@ -2,15 +2,20 @@
 
 export const API_BASE = "/api/v1";
 
+/** What a few refusals add to `{error: code}`: fields the caller acts on (e.g. `retryAfter`) and their headers. */
+export type ErrorExtra = { body?: Record<string, unknown>; headers?: Record<string, string> };
+
 /** A refusal the router turns into `{error: code}` with this status. Codes are snake_case and safe to show. */
 export class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string) {
+  constructor(readonly status: number, readonly code: string, readonly extra?: ErrorExtra) {
     super(code);
   }
 }
 
 export const json = (data: unknown, status = 200): Response => Response.json(data, { status });
-export const errorResponse = (status: number, code: string): Response => json({ error: code }, status);
+// `error` last, so an extra field can never replace the code.
+export const errorResponse = (status: number, code: string, extra?: ErrorExtra): Response =>
+  Response.json({ ...extra?.body, error: code }, { status, headers: extra?.headers });
 
 /** At most `maxBytes` of the body, read in chunks and stopped early, so a huge body never sits in memory; else 413. */
 export async function readBody(req: Request, maxBytes: number): Promise<Uint8Array> {
