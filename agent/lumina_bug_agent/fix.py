@@ -244,11 +244,16 @@ def open_pr(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any]
     except (subprocess.TimeoutExpired, OSError):
         raise FixFailed("pr_failed") from None
     urls = [ln.strip() for ln in out.decode("utf-8", "replace").splitlines() if PR_URL_RX.fullmatch(ln.strip())]
-    if rc != 0 or not urls:
-        # No draft PR points at the pushed branch, so nobody would see the fix on the fork: delete it, best effort and
-        # never forced. A gh timeout above keeps it, since the PR may have been opened before the timeout.
+    if urls:
+        # gh printed the PR's URL, so the PR exists whatever gh's exit code says; deleting its head would close it.
+        if rc != 0:
+            log("gh pr create exited non-zero after printing a PR URL", code=code, exit=rc)
+        return urls[-1]
+    if rc != 0:
+        # gh failed and printed no URL: no draft PR points at the pushed branch, so nobody would see the fix on the
+        # fork. Delete it, best effort and never forced. An exit 0 without a URL keeps it (the PR may exist), and so
+        # does a gh timeout above, since the PR may have been opened before the timeout.
         deleted = wt_git(wt, "push", "--quiet", cfg.fork_remote, "--delete", f"refs/heads/{branch}")[0]
         if deleted != 0:
             log("remote branch left", code=code, branch=branch, exit=deleted)
-        raise FixFailed("pr_failed")
-    return urls[-1]
+    raise FixFailed("pr_failed")
