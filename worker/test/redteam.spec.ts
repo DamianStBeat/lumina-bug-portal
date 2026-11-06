@@ -1,5 +1,6 @@
 // Specs for the red team findings of round 1 (redteam-astra.md, redteam-opus.md) and the lead's fix decisions 1-7
-// (brief-fix-rt.md), then of round 2 (redteam-astra-2.md, redteam-opus-2.md, brief-fix-rt2.md), named `redteam-2:`.
+// (brief-fix-rt.md), then of round 2 (redteam-astra-2.md, redteam-opus-2.md, brief-fix-rt2.md), named `redteam-2:`, then of
+// round 3 (redteam-astra-3.md: concurrent duplicate cycles, events for re-pointed links), named `redteam-3:`.
 // CONTRACT.md "Limits" (rate, retention), "Statuses", "Game", "Agent and bot", "Desk".
 //
 // Races are made deterministic with binding doubles passed as env overrides: a D1 or R2 binding that forwards every
@@ -808,5 +809,298 @@ describe("redteam-2: duplicate links made from the leaf towards the root", () =>
     for (const [i, r] of reports.slice(0, 11).entries()) {
       expect((await reportByCode(r.code))!.duplicate_of, `R${i} points at the root`).toBe(root.code);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 3 (redteam-astra-3.md), finding 1: two triages that close a cycle at the same instant. The cycle check and
+// the write must be one atomic step: one wins, the other is 409 duplicate_cycle and leaves its report as it was.
+// ---------------------------------------------------------------------------------------------------------------
+
+const WRITE_SQL = /^\s*(INSERT|UPDATE|DELETE|REPLACE|WITH)\b/i;
+
+/**
+ * A D1 binding as the real one, except that the first write the route sends (a `batch`, or a single INSERT/UPDATE
+ * statement run on its own) first awaits `gap()`. Unlike dbWithGapBeforeFirstBatch it does not assume the route
+ * writes through a batch: an atomic conditional statement is a write too, and the gap lands right before it.
+ */
+function dbWithGapBeforeFirstWrite(gap: () => Promise<void>): { db: D1Database; fired: () => boolean } {
+  let fired = false;
+  const real = env.DB;
+  const unwrap = new WeakMap<object, D1PreparedStatement>();
+  async function once(): Promise<void> {
+    if (fired) return;
+    fired = true;
+    await gap();
+  }
+  function wrap(stmt: D1PreparedStatement, sql: string): D1PreparedStatement {
+    const proxy = new Proxy(stmt, {
+      get(target, prop) {
+        if (prop === "bind") return (...args: unknown[]) => wrap(target.bind(...args), sql);
+        if ((prop === "run" || prop === "first" || prop === "all" || prop === "raw") && WRITE_SQL.test(sql)) {
+          return async (...args: unknown[]) => {
+            await once();
+            return (target[prop] as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    unwrap.set(proxy, stmt);
+    return proxy;
+  }
+  const db = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
+      if (prop === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          await once();
+          return target.batch(statements.map((s) => unwrap.get(s) ?? s));
+        };
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  return { db, fired: () => fired };
+}
+
+type Snapshot = { status: string; verdict: string | null; duplicate_of: string | null; events: EventRow[] };
+
+async function snapshot(r: ReportRow): Promise<Snapshot> {
+  const row = (await reportByCode(r.code))!;
+  return { status: row.status, verdict: row.verdict, duplicate_of: row.duplicate_of, events: await eventsOf(r.id) };
+}
+
+/** Follows the stored duplicate_of links from `code`: none of them may come back to a report already visited. */
+async function expectNoLoopFrom(code: string): Promise<void> {
+  const seen = new Set<string>();
+  let at: string | null = code;
+  for (let hop = 0; at !== null && hop < 20; hop++) {
+    expect(seen.has(at), `the duplicate_of links from ${code} come back to ${at}`).toBe(false);
+    seen.add(at);
+    const row: ReportRow | null = await reportByCode(at);
+    if (row === null) return;
+    expect(row.duplicate_of, `${at} is linked to itself`).not.toBe(at);
+    at = row.duplicate_of;
+  }
+  expect(at, `the duplicate_of links from ${code} never end`).toBeNull();
+}
+
+/**
+ * The outcome row 1 asks for, whatever order the two requests landed in: exactly one 200 and one 409
+ * duplicate_cycle, no loop, the loser exactly as it was before, the winner showing the loser's public status.
+ */
+async function expectOneWinner(
+  pair: [ReportRow, ReportRow],
+  answers: [Response, Response],
+  before: [Snapshot, Snapshot],
+  label: string,
+): Promise<void> {
+  const statuses = answers.map((a) => a.status);
+  expect([...statuses].sort(), `${label}: one 200 and one 409`).toEqual([200, 409]);
+  const loserIndex = statuses.indexOf(409);
+  const winner = pair[1 - loserIndex]!;
+  const loser = pair[loserIndex]!;
+  await expectError(answers[loserIndex]!, 409, "duplicate_cycle");
+
+  await expectNoLoopFrom(pair[0].code);
+  await expectNoLoopFrom(pair[1].code);
+  const rows = [(await reportByCode(pair[0].code))!, (await reportByCode(pair[1].code))!];
+  expect(rows.filter((r) => r.status === "duplicate").length, `${label}: at most one of the two is a duplicate`).toBeLessThanOrEqual(1);
+
+  expect(await snapshot(loser), `${label}: the loser ${loser.code} is unchanged`).toEqual(before[loserIndex]);
+  const w = (await reportByCode(winner.code))!;
+  expect(w.status).toBe("duplicate");
+  expect(w.duplicate_of).toBe(loser.code);
+
+  const loserPublic = await publicStatus(loser.code);
+  expect(loserPublic, "the loser is seeded looking and stays looking").toBe("looking");
+  expect(await publicStatus(winner.code), `${label}: the winner shows its original's status, not a loop's checked`).toBe(
+    loserPublic,
+  );
+}
+
+describe("redteam-3: two triages closing a duplicate cycle at the same instant", () => {
+  it("redteam-3: B -> A landing between A -> B's check and its write: A -> B is 409 duplicate_cycle, B -> A stands", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    const beforeA = await snapshot(a);
+    let gapAnswer = 0;
+    const { db, fired } = dbWithGapBeforeFirstWrite(async () => {
+      gapAnswer = (await linkDuplicate(b.code, a.code)).status;
+    });
+
+    const res = await triage(a.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: b.code }, { DB: db });
+
+    expect(fired(), "A -> B wrote after its read").toBe(true);
+    expect(gapAnswer, "B -> A in the gap").toBe(200);
+    await expectError(res, 409, "duplicate_cycle");
+    await expectNoLoopFrom(a.code);
+    await expectNoLoopFrom(b.code);
+    expect(await snapshot(a), "A is unchanged").toEqual(beforeA);
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(a.code);
+    expect(await publicStatus(b.code)).toBe("looking");
+    expect(await publicStatus(a.code)).toBe("looking");
+  });
+
+  it("redteam-3: fifteen pairs A -> B and B -> A posted together: each pair has one winner and one duplicate_cycle", async () => {
+    for (let i = 0; i < 15; i++) {
+      const a = await seedReport({ status: "looking" });
+      const b = await seedReport({ status: "looking" });
+      const before: [Snapshot, Snapshot] = [await snapshot(a), await snapshot(b)];
+
+      const answers = await Promise.all([linkDuplicate(a.code, b.code), linkDuplicate(b.code, a.code)]);
+
+      await expectOneWinner([a, b], answers, before, `pair #${i + 1}`);
+    }
+  });
+
+  it("redteam-3: A -> B, B -> C and C -> A posted together leave no loop and at least one duplicate_cycle", async () => {
+    for (let i = 0; i < 5; i++) {
+      const reports = [await seedReport({ status: "looking" }), await seedReport({ status: "looking" }), await seedReport({ status: "looking" })];
+      const answers = await Promise.all(reports.map((r, k) => linkDuplicate(r.code, reports[(k + 1) % 3]!.code)));
+
+      const statuses = answers.map((x) => x.status);
+      expect(statuses.every((s) => s === 200 || s === 409), `round #${i + 1}: ${statuses.join(",")}`).toBe(true);
+      expect(statuses.filter((s) => s === 409).length, `round #${i + 1}: at least one refused`).toBeGreaterThanOrEqual(1);
+      for (const x of answers) if (x.status === 409) await expectError(x, 409, "duplicate_cycle");
+      for (const r of reports) await expectNoLoopFrom(r.code);
+      const rows = await Promise.all(reports.map((r) => reportByCode(r.code)));
+      expect(rows.some((r) => r!.status !== "duplicate"), `round #${i + 1}: one report is still an original`).toBe(true);
+      for (const r of reports) expect(await publicStatus(r.code), `round #${i + 1}: ${r.code}`).toBe("looking");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 3, finding 2: a report re-pointed to a new root gets its own duplicate_linked event (the bot posts
+// "Same bug" in that report's thread from it), as the report that was triaged does.
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("redteam-3: duplicate_linked for every report re-pointed to the new root", () => {
+  function linkedEvents(events: EventRow[]): EventRow[] {
+    return events.filter((e) => e.type === "duplicate_linked");
+  }
+
+  /** Events of `r` written after the snapshot `before` (the log is append-only). */
+  async function newEvents(r: ReportRow, before: EventRow[]): Promise<EventRow[]> {
+    const all = await eventsOf(r.id);
+    expect(all.slice(0, before.length), `${r.code}: the old events are untouched`).toEqual(before);
+    return all.slice(before.length);
+  }
+
+  it("redteam-3: C -> B, then B -> A: C points at A and gets its own duplicate_linked to A, like B", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    const c = await seedReport();
+    expect((await linkDuplicate(c.code, b.code)).status, "C -> B").toBe(200);
+    const beforeA = await eventsOf(a.id);
+    const beforeB = await eventsOf(b.id);
+    const beforeC = await eventsOf(c.id);
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(a.code);
+    expect((await reportByCode(c.code))!.duplicate_of).toBe(a.code);
+    const bLinked = linkedEvents(await newEvents(b, beforeB));
+    const cLinked = linkedEvents(await newEvents(c, beforeC));
+    expect(bLinked.length, "B has one new duplicate_linked").toBe(1);
+    expect(bLinked[0]!.data).toMatchObject({ duplicateOf: a.code });
+    expect(cLinked.length, "C has one new duplicate_linked").toBe(1);
+    expect(cLinked[0]!.data).toMatchObject({ duplicateOf: a.code });
+    expect(Object.keys(cLinked[0]!.data!), "C's event has the fields of B's").toEqual(
+      expect.arrayContaining(Object.keys(bLinked[0]!.data!)),
+    );
+    expect(await newEvents(a, beforeA), "A, the root, gets no event").toEqual([]);
+  });
+
+  it("redteam-3: the bot sees C's duplicate_linked through GET /agent/events with C's code and A in its data", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    const c = await seedReport();
+    expect((await linkDuplicate(c.code, b.code)).status, "C -> B").toBe(200);
+    const max = await env.DB.prepare("SELECT max(seq) AS m FROM events").first<{ m: number | null }>();
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    const res = await call(`/agent/events?after=${max!.m ?? 0}&limit=100`, { headers: agentHeaders() });
+    expect(res.status).toBe(200);
+    type Ev = { code: string; type: string; data: unknown };
+    const events = (await body<{ events: Ev[] }>(res)).events;
+    const forC = events.filter((e) => e.code === c.code && e.type === "duplicate_linked");
+    expect(forC.length, "one duplicate_linked for C").toBe(1);
+    const data = typeof forC[0]!.data === "string" ? JSON.parse(forC[0]!.data as string) : forC[0]!.data;
+    expect(data).toMatchObject({ duplicateOf: a.code });
+  });
+
+  it("redteam-3 (edge): C1 and C2 both -> B, then B -> A: each gets exactly one new duplicate_linked to A", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    const c1 = await seedReport();
+    const c2 = await seedReport();
+    expect((await linkDuplicate(c1.code, b.code)).status, "C1 -> B").toBe(200);
+    expect((await linkDuplicate(c2.code, b.code)).status, "C2 -> B").toBe(200);
+    const before1 = await eventsOf(c1.id);
+    const before2 = await eventsOf(c2.id);
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    for (const [r, before] of [
+      [c1, before1],
+      [c2, before2],
+    ] as const) {
+      expect((await reportByCode(r.code))!.duplicate_of, `${r.code} points at A`).toBe(a.code);
+      const linked = linkedEvents(await newEvents(r, before));
+      expect(linked.length, `${r.code}: exactly one new duplicate_linked`).toBe(1);
+      expect(linked[0]!.data).toMatchObject({ duplicateOf: a.code });
+    }
+  });
+
+  it("redteam-3 (edge): D, a duplicate of another original E, is not re-pointed and gets no event", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    const c = await seedReport();
+    const e = await seedReport({ status: "looking" });
+    const d = await seedReport();
+    expect((await linkDuplicate(c.code, b.code)).status, "C -> B").toBe(200);
+    expect((await linkDuplicate(d.code, e.code)).status, "D -> E").toBe(200);
+    const beforeD = await eventsOf(d.id);
+    const beforeE = await eventsOf(e.id);
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    expect((await reportByCode(d.code))!.duplicate_of).toBe(e.code);
+    expect(await newEvents(d, beforeD), "D gets no event").toEqual([]);
+    expect(await newEvents(e, beforeE), "E gets no event").toEqual([]);
+    expect((await reportByCode(c.code))!.duplicate_of, "C, on B, is re-pointed").toBe(a.code);
+  });
+
+  it("redteam-3 (edge): B -> A with nobody pointing at B writes duplicate_linked for B only", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    const max = await env.DB.prepare("SELECT max(seq) AS m FROM events").first<{ m: number | null }>();
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    const linked = await env.DB.prepare("SELECT report_id FROM events WHERE seq > ? AND type = 'duplicate_linked'")
+      .bind(max!.m ?? 0)
+      .all<{ report_id: string }>();
+    expect(linked.results.map((x) => x.report_id)).toEqual([b.id]);
+  });
+
+  it("redteam-3 (edge): a refused B -> A (it would close a cycle) re-points nobody and writes no event for C", async () => {
+    const b = await seedReport();
+    const c = await seedReport();
+    const a = await seedReport();
+    expect((await linkDuplicate(c.code, b.code)).status, "C -> B").toBe(200);
+    expect((await linkDuplicate(a.code, c.code)).status, "A -> C, stored as A -> B").toBe(200);
+    const beforeC = await eventsOf(c.id);
+
+    await expectError(await linkDuplicate(b.code, a.code), 409, "duplicate_cycle");
+
+    expect((await reportByCode(c.code))!.duplicate_of).toBe(b.code);
+    expect(await newEvents(c, beforeC), "C gets no event").toEqual([]);
   });
 });
