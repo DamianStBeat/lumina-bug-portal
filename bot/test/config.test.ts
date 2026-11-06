@@ -61,3 +61,19 @@ for (const name of ['DISCORD_TOKEN', 'DISCORD_APP_ID', 'PORTAL_API_BASE', 'AGENT
 test('design: an empty string counts as missing (not yet set is not a value)', () => {
   assert.throws(() => loadConfig({ ...FULL, AGENT_KEY: '' }), ConfigError);
 });
+
+// fix round 1, decision 8: LUMINA_BOT_REPLAY=1 makes a poller with no cursor file process from 0 instead of
+// fast-forwarding. Only "1" turns it on; unset or blank ("not set yet") is off, not an error.
+for (const [label, value, expected] of [
+  ['"1"', '1', true],
+  ['unset', undefined, false],
+  ['blank', '', false],
+  ['"0"', '0', false],
+] as const) {
+  test(`fix1-8: LUMINA_BOT_REPLAY ${label} -> replay ${expected}`, () => {
+    const env: Record<string, string | undefined> = { ...FULL };
+    if (value === undefined) delete env['LUMINA_BOT_REPLAY'];
+    else env['LUMINA_BOT_REPLAY'] = value;
+    assert.equal(loadConfig(env).replay, expected);
+  });
+}

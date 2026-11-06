@@ -79,4 +79,27 @@ describe('See status button', () => {
       assert.equal(worker.requests.length, 0);
     });
   }
+
+  // fix round 1, decision 6: CONTRACT.md does not pin the shape of GET /agent/reports/{code}; a nested answer
+  // `{ report, attachments }` is read like the flat row.
+  test('fix1-6: a nested { report, attachments } answer shows the report\'s status', async () => {
+    worker.override = (r) =>
+      r.method === 'GET' && r.path === `/agent/reports/${CODE}`
+        ? { status: 200, body: { report: { code: CODE, status: 'fixed', source: 'discord' }, attachments: [] } }
+        : undefined;
+    const i = await press(`status:${CODE}`);
+    const final = i.finalAnswer();
+    assert.ok(final);
+    assert.equal(readMessage(final.options).content, `${CODE}: Fixed. It is in the game.`);
+    assert.equal(final.ephemeral, true);
+  });
+
+  test('fix1-6: the flat row with an attachments list (the worker\'s own shape) still reads', async () => {
+    worker.override = (r) =>
+      r.method === 'GET' && r.path === `/agent/reports/${CODE}`
+        ? { status: 200, body: { code: CODE, status: 'looking', source: 'discord', attachments: [] } }
+        : undefined;
+    const i = await press(`status:${CODE}`);
+    assert.equal(readMessage(i.finalAnswer()!.options).content, `${CODE}: We're looking.`);
+  });
 });

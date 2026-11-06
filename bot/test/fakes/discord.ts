@@ -154,11 +154,14 @@ export class FakeForum {
   failCreateWithFiles = 0;
   /** Reject every create call. */
   failCreate = false;
+  /** When set, a create call that carries files waits for this promise before answering (an upload in flight). */
+  holdCreateWithFiles: Promise<void> | null = null;
   private seq = 0;
   readonly threads = {
     create: async (options: ThreadCreateOptions): Promise<FakeThread> => {
       this.createCalls.push(options);
       const hasFiles = Array.isArray(options.message?.files) && options.message.files.length > 0;
+      if (hasFiles && this.holdCreateWithFiles) await this.holdCreateWithFiles;
       if (this.failCreate) throw new Error('Missing Permissions');
       if (hasFiles && this.failCreateWithFiles > 0) {
         this.failCreateWithFiles -= 1;

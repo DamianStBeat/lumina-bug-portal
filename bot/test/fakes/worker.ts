@@ -120,11 +120,14 @@ export class FakeWorker {
     if (r.path.startsWith('/agent/')) {
       if (!agentOk) return { status: 401, body: { error: 'unauthorized' } };
       if (r.method === 'POST' && r.path === '/agent/reports') {
+        const refused = refuseDiscordReport(r.json);
+        if (refused) return refused;
         return { status: 201, body: { code: this.nextCode, reportToken: REPORT_TOKEN } };
       }
       if (r.method === 'POST' && (m = r.path.match(/^\/agent\/reports\/(LUM-\d{6})\/discord$/))) {
         const row = this.reports.get(m[1]!);
         const threadId = (r.json as { threadId?: unknown } | undefined)?.threadId;
+        if (!isSnowflake(threadId)) return { status: 400, body: { error: 'invalid_thread_id' } };
         if (row && typeof threadId === 'string') row['discord_thread_id'] = threadId;
         return { status: 200, body: { ok: true } };
       }
@@ -166,6 +169,49 @@ export class FakeWorker {
     }
     return { status: 404, body: { error: 'not_found' } };
   }
+}
+
+// ---------------------------------------------------------------- validation, as the real worker does it
+// A copy of worker/src/lib/validate.ts and createDiscord/setThread in worker/src/routes/agent.ts (worker slice,
+// 6 Nov 2026). The real module cannot be imported here (another package, extensionless imports), so the rules are
+// mirrored one by one; a fake looser than the worker let `where: "Match"` pass a spec while production refused it.
+
+export const WHERE_AREAS = ['lobby', 'match', 'shop', 'crates', 'clan', 'other'] as const;
+// C0 and C1 control characters except tab and newline, as the worker's cleanText.
+const CONTROL = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
+const SNOWFLAKE = /^\d{1,20}$/;
+
+function isSnowflake(v: unknown): boolean {
+  return typeof v === 'string' && SNOWFLAKE.test(v);
+}
+
+/** true when the field passes v.text(value, field, min, max): code points after cleaning, optional when min is 0. */
+function textOk(value: unknown, min: number, max: number): boolean {
+  if ((value === undefined || value === null) && min === 0) return true;
+  if (typeof value !== 'string') return false;
+  const len = [...value.replace(CONTROL, '').trim()].length;
+  if (len === 0 && min === 0) return true;
+  return len >= min && len <= max;
+}
+
+function refuse(field: string): Reply {
+  return { status: 400, body: { error: `invalid_${field}` } };
+}
+
+/** The 400 the worker answers to POST /agent/reports, or undefined when it would accept the body. */
+function refuseDiscordReport(json: unknown): Reply | undefined {
+  const b = (json ?? {}) as Record<string, unknown>;
+  if (b['source'] !== 'discord') return refuse('source');
+  if (!isSnowflake(b['discordUserId'])) return refuse('discord_user_id');
+  if (!textOk(b['discordName'], 1, 100)) return refuse('discord_name');
+  if (b['threadId'] !== undefined && b['threadId'] !== null && !isSnowflake(b['threadId'])) return refuse('thread_id');
+  if (!textOk(b['what'], 1, 2000)) return refuse('what');
+  if (!textOk(b['title'], 0, 200)) return refuse('title');
+  const where = b['where'];
+  if (where !== undefined && where !== null && !(typeof where === 'string' && (WHERE_AREAS as readonly string[]).includes(where))) {
+    return refuse('where');
+  }
+  return undefined;
 }
 
 /** An API base where nothing listens: a server is opened on port 0 and closed, so connecting is refused. */

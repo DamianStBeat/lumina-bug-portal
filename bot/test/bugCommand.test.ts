@@ -3,7 +3,7 @@
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { bugCommandData, buildBugModal, handleBugCommand, handleBugModalSubmit } from '../src/bugCommand.ts';
-import { PortalApi } from '../src/portal.ts';
+import { errorTag, PortalApi, PortalError } from '../src/portal.ts';
 import { AGENT_KEY, deadBase, FakeWorker, PART_SIZE, REPORT_TOKEN } from './fakes/worker.ts';
 import { fakeCdn, patternBytes } from './fakes/cdn.ts';
 import {
@@ -135,7 +135,8 @@ describe('/bug command and modal', () => {
     assert.equal(typeof body['discordName'], 'string');
     assert.ok((body['discordName'] as string).length > 0);
     assert.equal(body['what'], WHAT);
-    assert.equal(body['where'], 'Match');
+    // fix round 1, decision 1: the typed "Match" reaches the worker as CONTRACT's where_area value.
+    assert.equal(body['where'], 'match');
 
     // One forum post with the player's text; the 18 MB file is over this server's limit, so text only.
     assert.equal(forum.createCalls.length, 1);
@@ -244,8 +245,8 @@ describe('/bug command and modal', () => {
     assert.ok(!content.includes('**grassetto**'), content);
     assert.ok(content.includes('@everyone'), 'shown, not removed');
     assert.ok(mentionsNobody(post.message), 'cannot ping');
-    assert.ok(!post.name.includes('**grassetto**'), post.name);
-    assert.ok(!post.name.includes('second line'), 'thread name is the first line');
+    // fix round 1, decision 7: a post title does not render markdown, so the name is the first line as typed.
+    assert.equal(post.name, '@everyone **grassetto** look');
     for (const sent of forum.created[0]!.sent) assert.ok(mentionsNobody(sent));
     for (const c of i.answers()) assert.ok(mentionsNobody(c.options));
     // The archive keeps what the player typed; escaping is for Discord only.
@@ -303,5 +304,197 @@ describe('/bug command and modal', () => {
     const answer = readMessage(i.finalAnswer()!.options);
     assert.equal(answer.embeds[0]!.title, `We have it · ${CODE}`);
     assert.ok(i.finalAnswer()!.ephemeral);
+  });
+});
+
+/** The values of a log line's data (keys are the builder's; the specs look for what the line carries). */
+function logValues(data: unknown): unknown[] {
+  return data && typeof data === 'object' ? Object.values(data as Record<string, unknown>) : [];
+}
+
+async function waitFor(cond: () => boolean, ms = 2000): Promise<boolean> {
+  for (let t = 0; t < ms && !cond(); t += 5) await new Promise((r) => setTimeout(r, 5));
+  return cond();
+}
+
+function createdBody(): Record<string, unknown> {
+  const creates = worker.find('POST', '/agent/reports');
+  assert.equal(creates.length, 1, 'one report created');
+  return creates[0]!.json as Record<string, unknown>;
+}
+
+describe('fix round 1: /bug modal submit', () => {
+  // Decision 1: the typed "Where in the game?" is mapped to CONTRACT's where_area; the worker refuses anything else.
+  for (const [typed, area] of [
+    ['Match', 'match'],
+    ['  LOBBY  ', 'lobby'],
+    ['shop', 'shop'],
+    ['Clan', 'clan'],
+    ['crate', 'crates'],
+    ['Crates', 'crates'],
+    ['Something else', 'other'],
+    ['other', 'other'],
+    ['Match.', 'match'],
+    ['Something else.', 'other'],
+  ] as const) {
+    test(`fix1-1: where "${typed}" reaches the worker as "${area}", the text unchanged`, async () => {
+      const i = modalInteraction({ user: PLAYER, forum, what: WHAT, where: typed });
+      await handleBugModalSubmit(i as unknown as Interaction, deps());
+      const body = createdBody();
+      assert.equal(body['where'], area);
+      assert.equal(body['what'], WHAT);
+      assert.equal(readMessage(i.finalAnswer()!.options).embeds[0]?.title, `We have it · ${CODE}`);
+    });
+  }
+
+  for (const typed of ['on the Bridge', 'match lobby', 'shops']) {
+    test(`fix1-1: where "${typed}" (not an area) -> "other", the typed text kept at the end of what`, async () => {
+      const i = modalInteraction({ user: PLAYER, forum, what: WHAT, where: typed });
+      await handleBugModalSubmit(i as unknown as Interaction, deps());
+      const body = createdBody();
+      assert.equal(body['where'], 'other');
+      assert.equal(body['what'], `${WHAT}\n\nWhere: ${typed}`);
+      assert.equal(readMessage(i.finalAnswer()!.options).embeds[0]?.title, `We have it · ${CODE}`);
+    });
+  }
+
+  for (const typed of ['', '   ']) {
+    test(`fix1-1: where ${JSON.stringify(typed)} (left empty) -> no where field at all`, async () => {
+      const i = modalInteraction({ user: PLAYER, forum, what: WHAT, where: typed });
+      await handleBugModalSubmit(i as unknown as Interaction, deps());
+      const body = createdBody();
+      assert.ok(!('where' in body), JSON.stringify(body));
+      assert.equal(body['what'], WHAT);
+    });
+  }
+
+  test('fix1-1: the "Where:" suffix is cut first so the total stays 2000; the player text is never cut', async () => {
+    const what = 'a'.repeat(1990);
+    const i = modalInteraction({ user: PLAYER, forum, what, where: 'on the bridge' });
+    await handleBugModalSubmit(i as unknown as Interaction, deps());
+    const body = createdBody();
+    assert.equal(body['where'], 'other');
+    assert.equal(body['what'], what + '\n\nWhere: on the bridge'.slice(0, 10));
+    assert.equal((body['what'] as string).length, 2000);
+  });
+
+  test('fix1-1: a 2000-character text with an unknown place keeps the whole text and no suffix', async () => {
+    const what = 'b'.repeat(2000);
+    const i = modalInteraction({ user: PLAYER, forum, what, where: 'on the bridge' });
+    await handleBugModalSubmit(i as unknown as Interaction, deps());
+    const body = createdBody();
+    assert.equal(body['where'], 'other');
+    assert.equal(body['what'], what);
+  });
+
+  test('fix1-1: a worker 400 at the create is logged with its code and the player reads the try-again text', async () => {
+    worker.override = (r) =>
+      r.method === 'POST' && r.path === '/agent/reports' ? { status: 400, body: { error: 'invalid_where' } } : undefined;
+    const i = modalInteraction({ user: PLAYER, forum, what: WHAT, where: 'Match' });
+    await assert.doesNotReject(handleBugModalSubmit(i as unknown as Interaction, deps()));
+    const final = i.finalAnswer();
+    assert.ok(final);
+    assert.equal(readMessage(final.options).content, TRY_AGAIN);
+    assert.equal(final.ephemeral, true);
+    assert.equal(forum.createCalls.length, 0);
+    const tag = errorTag(new PortalError('invalid_where', 400));
+    assert.ok(log.lines.some((l) => logValues(l.data).includes(tag)), log.text());
+  });
+
+  // Decision 5: the forum re-post carries the file only up to min(attachmentSizeLimit, 25 MiB), one at a time.
+  for (const [label, size, attached] of [
+    ['exactly 25 MiB', 25 * MiB, 1],
+    ['25 MiB + 1 byte', 25 * MiB + 1, 0],
+  ] as const) {
+    test(`fix1-5: on a 100 MiB server a file of ${label} is ${attached ? '' : 'not '}re-posted; the archive copy runs`, async () => {
+      const video: RawAttachment = { id: '910', name: 'clip.mp4', size, contentType: 'video/mp4' };
+      // The CDN link answers 404: the archive copy is attempted without moving 25 MiB through the test.
+      const cdn = fakeCdn({}, new Set([cdnUrl(video)]));
+      const i = modalInteraction({ user: PLAYER, forum, what: WHAT, file: video, attachmentSizeLimit: 100 * MiB });
+      await handleBugModalSubmit(i as unknown as Interaction, deps(cdn.fetchImpl));
+      assert.equal(forum.createCalls.length, 1);
+      assert.equal(readMessage(forum.createCalls[0]!.message).files.length, attached);
+      assert.ok(cdn.calls.includes(cdnUrl(video)), 'archive copy attempted either way');
+    });
+  }
+
+  test('fix1-5: while one re-post is in flight, a second report posts text only and still archives its file', async () => {
+    let release!: () => void;
+    forum.holdCreateWithFiles = new Promise<void>((r) => (release = r));
+    const a: RawAttachment = { id: '920', name: 'a.png', size: 500, contentType: 'image/png' };
+    const b: RawAttachment = { id: '921', name: 'b.png', size: 600, contentType: 'image/png' };
+    const cdn = fakeCdn({ [cdnUrl(a)]: patternBytes(500), [cdnUrl(b)]: patternBytes(600) });
+    const first = modalInteraction({ user: PLAYER, forum, what: WHAT, file: a, attachmentSizeLimit: 10 * MiB });
+    const second = modalInteraction({ user: PLAYER, forum, what: 'Second report.', file: b, attachmentSizeLimit: 10 * MiB });
+
+    const running1 = handleBugModalSubmit(first as unknown as Interaction, deps(cdn.fetchImpl));
+    assert.ok(await waitFor(() => forum.createCalls.length === 1), 'first post in flight');
+    const running2 = handleBugModalSubmit(second as unknown as Interaction, deps(cdn.fetchImpl));
+    const secondPosted = await waitFor(() => forum.createCalls.length === 2);
+    release();
+    await Promise.all([running1, running2]);
+
+    assert.ok(secondPosted, 'the second post did not wait for the first upload');
+    assert.equal(readMessage(forum.createCalls[0]!.message).files.length, 1, 'first carries its file');
+    assert.equal(readMessage(forum.createCalls[1]!.message).files.length, 0, 'second: text only while busy');
+    assert.ok(cdn.calls.includes(cdnUrl(b)), 'the second file is archived anyway');
+    assert.equal(readMessage(second.finalAnswer()!.options).embeds[0]?.title, `We have it · ${CODE}`);
+
+    // The slot is free again: the next report re-posts its file.
+    forum.holdCreateWithFiles = null;
+    const third = modalInteraction({ user: PLAYER, forum, what: WHAT, file: a, attachmentSizeLimit: 10 * MiB });
+    await handleBugModalSubmit(third as unknown as Interaction, deps(cdn.fetchImpl));
+    assert.equal(readMessage(forum.createCalls[2]!.message).files.length, 1, 'slot released after the re-post');
+  });
+
+  test('fix1-5: a refused re-post frees the slot (the next report re-posts its file)', async () => {
+    forum.failCreateWithFiles = 1;
+    const a: RawAttachment = { id: '930', name: 'a.png', size: 500, contentType: 'image/png' };
+    const cdn = fakeCdn({ [cdnUrl(a)]: patternBytes(500) });
+    const first = modalInteraction({ user: PLAYER, forum, what: WHAT, file: a, attachmentSizeLimit: 10 * MiB });
+    await handleBugModalSubmit(first as unknown as Interaction, deps(cdn.fetchImpl));
+    const second = modalInteraction({ user: PLAYER, forum, what: WHAT, file: a, attachmentSizeLimit: 10 * MiB });
+    await handleBugModalSubmit(second as unknown as Interaction, deps(cdn.fetchImpl));
+    const last = forum.createCalls[forum.createCalls.length - 1]!;
+    assert.equal(readMessage(last.message).files.length, 1);
+  });
+
+  // Decision 7: the thread name is the first line as typed: control characters removed, cut to 100, no escaping.
+  for (const [label, what, name] of [
+    ['markdown is kept', '**grassetto** _look_ @everyone\nsecond line', '**grassetto** _look_ @everyone'],
+    ['control characters are removed', 'Boss\u0007 stuck\r\nmore', 'Boss stuck'],
+    ['a first line of control characters falls back', '\u0007\u0007\nsecond line', 'Bug report'],
+    ['exactly 100 characters stay whole', '*'.repeat(100), '*'.repeat(100)],
+  ] as const) {
+    test(`fix1-7: thread name, ${label}`, async () => {
+      const i = modalInteraction({ user: PLAYER, forum, what });
+      await handleBugModalSubmit(i as unknown as Interaction, deps());
+      assert.equal(forum.createCalls.length, 1);
+      assert.equal(forum.createCalls[0]!.name, name);
+    });
+  }
+
+  test('fix1-7: a 101-character first line is cut to 100; the message content stays escaped', async () => {
+    const i = modalInteraction({ user: PLAYER, forum, what: '*'.repeat(101) });
+    await handleBugModalSubmit(i as unknown as Interaction, deps());
+    const post = forum.createCalls[0]!;
+    assert.ok(post.name.length <= 100 && post.name.startsWith('*'.repeat(90)), post.name);
+    assert.ok(!post.name.includes('\\'), 'no escape backslash in the name');
+    assert.ok((readMessage(post.message).content ?? '').startsWith('\\*'), 'content escaped');
+  });
+
+  // Decision 9: a failed archive copy is logged with its error tag (no secret: afterEach checks the logs).
+  test('fix1-9: a failed archive upload is logged with the code and the error tag', async () => {
+    worker.override = (r) =>
+      r.method === 'POST' && r.path === `/reports/${CODE}/attachments` ? { status: 500, body: { error: 'internal' } } : undefined;
+    const pic: RawAttachment = { id: '940', name: 'p.png', size: 500, contentType: 'image/png' };
+    const cdn = fakeCdn({ [cdnUrl(pic)]: patternBytes(500) });
+    const i = modalInteraction({ user: PLAYER, forum, what: WHAT, file: pic, attachmentSizeLimit: 10 * MiB });
+    await assert.doesNotReject(handleBugModalSubmit(i as unknown as Interaction, deps(cdn.fetchImpl)));
+    const tag = errorTag(new PortalError('internal', 500));
+    const lines = log.lines.filter((l) => logValues(l.data).includes(tag));
+    assert.equal(lines.length, 1, log.text());
+    assert.ok(logValues(lines[0]!.data).includes(CODE), 'the line names the report');
+    assert.notEqual(lines[0]!.level, 'info');
   });
 });

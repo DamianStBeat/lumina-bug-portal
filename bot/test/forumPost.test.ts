@@ -2,7 +2,7 @@
 import { after, afterEach, before, beforeEach, describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleThreadCreate } from '../src/forumPost.ts';
-import { PortalApi } from '../src/portal.ts';
+import { errorTag, PortalApi, PortalError } from '../src/portal.ts';
 import { AGENT_KEY, deadBase, FakeWorker, REPORT_TOKEN } from './fakes/worker.ts';
 import { fakeCdn, patternBytes } from './fakes/cdn.ts';
 import {
@@ -239,5 +239,34 @@ describe('new forum post', () => {
     await run(t);
     assert.equal(worker.requests.length, 0);
     assert.equal(t.sent.length, 0);
+  });
+});
+
+describe('fix round 1: new forum post', () => {
+  // Decision 9: each failed archive copy is logged with its error tag, not only counted.
+  test('fix1-9: two failed uploads -> two log lines, each with the code and the error tag', async () => {
+    worker.override = (r) =>
+      r.method === 'POST' && r.path === `/reports/${CODE}/attachments` ? { status: 500, body: { error: 'internal' } } : undefined;
+    const a: RawAttachment = { id: '610', name: 'a.png', size: 400, contentType: 'image/png' };
+    const b: RawAttachment = { id: '611', name: 'b.mp4', size: 700, contentType: 'video/mp4' };
+    const cdn = fakeCdn({ [cdnUrl(a)]: patternBytes(400), [cdnUrl(b)]: patternBytes(700) });
+    const t = post({ attachments: [a, b] });
+    await assert.doesNotReject(run(t, true, deps(cdn.fetchImpl)));
+    assert.equal(t.sent.length, 1, 'the player was answered');
+    const tag = errorTag(new PortalError('internal', 500));
+    const values = (d: unknown) => (d && typeof d === 'object' ? Object.values(d as Record<string, unknown>) : []);
+    const lines = log.lines.filter((l) => values(l.data).includes(tag));
+    assert.equal(lines.length, 2, log.text());
+    for (const l of lines) {
+      assert.ok(values(l.data).includes(CODE), 'names the report');
+      assert.notEqual(l.level, 'info');
+    }
+  });
+
+  test('fix1-9: a successful copy logs no failure line', async () => {
+    const a: RawAttachment = { id: '612', name: 'a.png', size: 400, contentType: 'image/png' };
+    const cdn = fakeCdn({ [cdnUrl(a)]: patternBytes(400) });
+    await run(post({ attachments: [a] }), true, deps(cdn.fetchImpl));
+    assert.ok(!log.lines.some((l) => l.level !== 'info'), log.text());
   });
 });

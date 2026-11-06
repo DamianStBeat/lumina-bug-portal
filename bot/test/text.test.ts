@@ -146,8 +146,8 @@ describe('text', () => {
       what: HOSTILE,
       game_context: JSON.stringify({ errors: ['```\n@everyone **x**', 'ok'] }),
     }));
-    assert.ok(post.name.startsWith('Bug report: '));
-    assert.ok(!post.name.includes('**grassetto**'), post.name);
+    // fix round 1, decision 7: post titles do not render markdown, so the name is not escaped (cut to 100).
+    assert.equal(post.name, `Bug report: ${HOSTILE}`);
     const content = readMessage(post.message).content ?? '';
     assert.ok(content.includes('\\*\\*grassetto\\*\\*'), content);
     assert.equal(content.split('```').length - 1, 2, 'exactly one opening and one closing fence');
@@ -172,5 +172,31 @@ describe('text', () => {
     const post = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: 'Hi', what: 'Text here', game_context: null }));
     assert.equal(post.name, 'Bug report: Hi');
     assert.ok((readMessage(post.message).content ?? '').includes('Text here'));
+  });
+
+  // fix round 1, decision 7: thread names are the first line, control characters removed, cut to 100, not escaped.
+  test('fix1-7: a game report title keeps its markdown characters in the post name', () => {
+    const post = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: '**Boss** stuck_on `bridge`', what: 'x' }));
+    assert.equal(post.name, 'Bug report: **Boss** stuck_on `bridge`');
+  });
+
+  test('fix1-7: control characters are removed from the post name', () => {
+    const post = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: 'Boss\u0007 st\u0000uck\r\nsecond', what: 'x' }));
+    assert.equal(post.name, 'Bug report: Boss stuck');
+  });
+
+  test('fix1-7: a title of control characters only falls back to "Bug report"', () => {
+    const post = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: '\u0007\u0008', what: 'x' }));
+    assert.equal(post.name, 'Bug report');
+  });
+
+  test('fix1-7: a name exactly at 100 characters is kept whole; one more is cut to 100', () => {
+    // 'Bug report: ' is 12 characters: 88 stars make exactly 100, unescaped.
+    const at = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: '*'.repeat(88), what: 'x' }));
+    assert.equal(at.name, `Bug report: ${'*'.repeat(88)}`);
+    const over = gameReportPost(row({ code: 'LUM-333333', source: 'game', title: '*'.repeat(89), what: 'x' }));
+    assert.ok(over.name.length <= 100, `name ${over.name.length}`);
+    assert.ok(over.name.startsWith(`Bug report: ${'*'.repeat(80)}`), over.name);
+    assert.ok(!over.name.includes('\\'), 'no escape backslash');
   });
 });

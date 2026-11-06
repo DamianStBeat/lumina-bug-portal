@@ -44,7 +44,7 @@ describe('PortalApi', () => {
       threadId: '456',
       what: 'The boss stopped on the bridge.',
       title: 'Boss stuck',
-      where: 'Match',
+      where: 'match',
     });
     assert.deepEqual(res, { code: 'LUM-482193', reportToken: REPORT_TOKEN });
     const [req] = worker.find('POST', '/agent/reports');
@@ -57,7 +57,7 @@ describe('PortalApi', () => {
     assert.equal(body['threadId'], '456');
     assert.equal(body['what'], 'The boss stopped on the bridge.');
     assert.equal(body['title'], 'Boss stuck');
-    assert.equal(body['where'], 'Match');
+    assert.equal(body['where'], 'match');
   });
 
   test('design: linkThread posts {threadId} to /agent/reports/{code}/discord', async () => {
