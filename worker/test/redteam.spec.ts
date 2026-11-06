@@ -31,6 +31,7 @@ import {
   reportByCode,
   runCron,
   seedAttachment,
+  seedCode,
   seedReport,
   sha256Hex,
   sha256OfParts,
@@ -1180,5 +1181,365 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
     const bLinked = linkedEvents(await newEvents(b, beforeB));
     expect(bLinked.length, "B has its own duplicate_linked").toBe(1);
     expect(bLinked[0]!.data).toMatchObject({ duplicateOf: a.code });
+  });
+});
+
+// ===============================================================================================================
+// Round 4 (slice worker-status, brief-tests.md): manual status changes never revive a duplicate link, a report or
+// root deleted by retention between the triage's read and its write, and a chain still moving after the two
+// attempts. Lead's decisions: a status other than `duplicate` clears duplicate_of in the same write; `duplicate` by
+// hand needs a valid `duplicateOf` and goes through the triage link (root, re-pointing, cycle guard); a vanished
+// report or root writes nothing; a chain that moved under both guarded writes is 409 duplicate_busy + Retry-After.
+// ===============================================================================================================
+
+type FullSnapshot = {
+  status: string;
+  verdict: string | null;
+  triage: string | null;
+  duplicate_of: string | null;
+  pr_url: string | null;
+  updated_at: number;
+  events: EventRow[];
+};
+
+/** Everything a refused request must leave as it was, the events included. */
+async function fullSnapshot(r: ReportRow): Promise<FullSnapshot> {
+  const row = (await reportByCode(r.code))!;
+  return {
+    status: row.status,
+    verdict: row.verdict,
+    triage: row.triage,
+    duplicate_of: row.duplicate_of,
+    pr_url: row.pr_url,
+    updated_at: row.updated_at,
+    events: await eventsOf(r.id),
+  };
+}
+
+/** Events of `r` written after `before` (the log is append-only). */
+async function eventsAfter(r: ReportRow, before: EventRow[]): Promise<EventRow[]> {
+  const all = await eventsOf(r.id);
+  expect(all.slice(0, before.length), `${r.code}: the old events are untouched`).toEqual(before);
+  return all.slice(before.length);
+}
+
+async function maxSeq(): Promise<number> {
+  const r = await env.DB.prepare("SELECT max(seq) AS m FROM events").first<{ m: number | null }>();
+  return r!.m ?? 0;
+}
+
+/** Event rows written after `seq` for any of `reportIds`, whether or not the report still exists. */
+async function eventsSince(seq: number, reportIds: string[]): Promise<{ report_id: string; type: string }[]> {
+  const marks = reportIds.map(() => "?").join(", ");
+  const r = await env.DB.prepare(`SELECT report_id, type FROM events WHERE seq > ? AND report_id IN (${marks}) ORDER BY seq`)
+    .bind(seq, ...reportIds)
+    .all<{ report_id: string; type: string }>();
+  return r.results;
+}
+
+/** What the daily retention does to a 12-month report (worker/src/cron.ts deleteOldReports), run as plain SQL. */
+async function deleteAsRetention(r: ReportRow): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM reports WHERE id = ?1").bind(r.id),
+    env.DB.prepare("DELETE FROM events WHERE report_id = ?1").bind(r.id),
+    env.DB.prepare("DELETE FROM report_tokens WHERE report_id = ?1").bind(r.id),
+  ]);
+  expect(await reportByCode(r.code), `${r.code} is gone`).toBeNull();
+}
+
+/**
+ * Like dbWithGapBeforeFirstWrite, but `gap()` runs before every write the route sends (each `batch`, each lone
+ * INSERT/UPDATE/DELETE), at most `limit` times: another writer that lands before each guarded attempt.
+ */
+function dbWithGapBeforeEveryWrite(gap: () => Promise<void>, limit: number): { db: D1Database; gaps: () => number } {
+  let gaps = 0;
+  const real = env.DB;
+  const unwrap = new WeakMap<object, D1PreparedStatement>();
+  async function each(): Promise<void> {
+    if (gaps >= limit) return;
+    gaps += 1;
+    await gap();
+  }
+  function wrap(stmt: D1PreparedStatement, sql: string): D1PreparedStatement {
+    const proxy = new Proxy(stmt, {
+      get(target, prop) {
+        if (prop === "bind") return (...args: unknown[]) => wrap(target.bind(...args), sql);
+        if ((prop === "run" || prop === "first" || prop === "all" || prop === "raw") && WRITE_SQL.test(sql)) {
+          return async (...args: unknown[]) => {
+            await each();
+            return (target[prop] as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        const value = Reflect.get(target, prop, target) as unknown;
+        return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+    unwrap.set(proxy, stmt);
+    return proxy;
+  }
+  const db = new Proxy(real, {
+    get(target, prop) {
+      if (prop === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
+      if (prop === "batch") {
+        return async (statements: D1PreparedStatement[]) => {
+          await each();
+          return target.batch(statements.map((s) => unwrap.get(s) ?? s));
+        };
+      }
+      const value = Reflect.get(target, prop, target) as unknown;
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+  return { db, gaps: () => gaps };
+}
+
+/** The stored root of `code`: follows duplicate_of (bounded) to the report that has none. */
+async function storedRoot(code: string): Promise<string> {
+  let at = code;
+  for (let hop = 0; hop < 20; hop++) {
+    const row = (await reportByCode(at))!;
+    if (row.duplicate_of === null) return at;
+    at = row.duplicate_of;
+  }
+  throw new Error(`no root from ${code}`);
+}
+
+describe("redteam-4: a status route leaving duplicate clears the link (row 1)", () => {
+  it.each(statusRoutes)("redteam-4: %s B -> A, B set back to looking, then A -> B: 200, A points at B, no self-link, nothing checked", async (_route, post) => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    expect((await post(b.code, { status: "looking" })).status, "B back to looking").toBe(200);
+    const cleared = (await reportByCode(b.code))!;
+    expect(cleared.status).toBe("looking");
+    expect(cleared.duplicate_of, "leaving duplicate clears the stored link").toBeNull();
+    expect(cleared.verdict, "the status route never changes verdict").toBe("duplicate");
+
+    expect((await linkDuplicate(a.code, b.code)).status, "A -> B").toBe(200);
+
+    const rowA = (await reportByCode(a.code))!;
+    const rowB = (await reportByCode(b.code))!;
+    expect(rowA.status).toBe("duplicate");
+    expect(rowA.duplicate_of).toBe(b.code);
+    expect(rowB.status, "B is not a duplicate").not.toBe("duplicate");
+    expect(rowB.duplicate_of, "B is not re-pointed to itself").toBeNull();
+    expect(rowA.duplicate_of).not.toBe(a.code);
+    await expectNoLoopFrom(a.code);
+    await expectNoLoopFrom(b.code);
+    expect(await publicStatus(b.code)).toBe("looking");
+    expect(await publicStatus(a.code), "A shows B's looking, not a loop's checked").toBe("looking");
+  });
+
+  const leaving = ["received", "looking", "fixed", "not_bug", "closed"] as const;
+  const leaveCases = statusRoutes.flatMap(([route, post]) => leaving.map((to) => [route, to, post] as const));
+
+  it.each(leaveCases)("redteam-4: %s duplicate -> %s stores duplicate_of NULL in the same change", async (_route, to, post) => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+    const before = await eventsOf(b.id);
+
+    expect((await post(b.code, { status: to })).status).toBe(200);
+
+    const row = (await reportByCode(b.code))!;
+    expect(row.status).toBe(to);
+    expect(row.duplicate_of).toBeNull();
+    expect(row.verdict).toBe("duplicate");
+    const added = await eventsAfter(b, before);
+    expect(added.filter((e) => e.type === "status_changed").length, "one status_changed").toBe(1);
+    expect(added.filter((e) => e.type === "duplicate_linked"), "no duplicate_linked when leaving").toEqual([]);
+  });
+
+  it.each(statusRoutes)("redteam-4: %s after the round trip, B set to duplicate of A (A now points at B) is 409 duplicate_cycle, B unchanged", async (_route, post) => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+    expect((await post(b.code, { status: "looking" })).status, "B back to looking").toBe(200);
+    expect((await linkDuplicate(a.code, b.code)).status, "A -> B").toBe(200);
+    const beforeA = await fullSnapshot(a);
+    const beforeB = await fullSnapshot(b);
+
+    await expectError(await post(b.code, { status: "duplicate", duplicateOf: a.code }), 409, "duplicate_cycle");
+
+    expect(await fullSnapshot(b), "B unchanged").toEqual(beforeB);
+    expect(await fullSnapshot(a), "A unchanged").toEqual(beforeA);
+    await expectNoLoopFrom(a.code);
+    await expectNoLoopFrom(b.code);
+  });
+
+  it.each(statusRoutes)("redteam-4: %s B set to duplicate of a fresh original C: B -> C, events as a triage link, D on B re-pointed to C", async (_route, post) => {
+    const c = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking", verdict: "needs_person" });
+    const d = await seedReport();
+    expect((await linkDuplicate(d.code, b.code)).status, "D -> B").toBe(200);
+    const beforeB = await eventsOf(b.id);
+    const beforeC = await eventsOf(c.id);
+    const beforeD = await eventsOf(d.id);
+
+    expect((await post(b.code, { status: "duplicate", duplicateOf: c.code })).status).toBe(200);
+
+    const rowB = (await reportByCode(b.code))!;
+    expect(rowB.status).toBe("duplicate");
+    expect(rowB.duplicate_of).toBe(c.code);
+    expect(rowB.verdict, "the status route never changes verdict").toBe("needs_person");
+    const addedB = await eventsAfter(b, beforeB);
+    const changes = addedB.filter((e) => e.type === "status_changed");
+    expect(changes.length, "B: one status_changed").toBe(1);
+    expect(changes[0]!.data).toMatchObject({ from: "looking", to: "duplicate" });
+    const linkedB = addedB.filter((e) => e.type === "duplicate_linked");
+    expect(linkedB.length, "B: one duplicate_linked").toBe(1);
+    expect(linkedB[0]!.data).toEqual({ duplicateOf: c.code });
+
+    const rowD = (await reportByCode(d.code))!;
+    expect(rowD.duplicate_of, "D, on B, is re-pointed to the root C").toBe(c.code);
+    const linkedD = (await eventsAfter(d, beforeD)).filter((e) => e.type === "duplicate_linked");
+    expect(linkedD.length, "D: its own duplicate_linked").toBe(1);
+    expect(linkedD[0]!.data).toMatchObject({ duplicateOf: c.code });
+    expect(await eventsAfter(c, beforeC), "C, the root, gets no event").toEqual([]);
+    expect(await publicStatus(d.code)).toBe("looking");
+  });
+
+  it.each(statusRoutes)("redteam-4 (edge): %s B set to duplicate of E, itself a duplicate of C, stores the root C", async (_route, post) => {
+    const c = await seedReport({ status: "fixed" });
+    const e = await seedReport();
+    const b = await seedReport({ status: "looking" });
+    expect((await linkDuplicate(e.code, c.code)).status, "E -> C").toBe(200);
+    const before = await eventsOf(b.id);
+
+    expect((await post(b.code, { status: "duplicate", duplicateOf: e.code })).status).toBe(200);
+
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(c.code);
+    const linked = (await eventsAfter(b, before)).filter((x) => x.type === "duplicate_linked");
+    expect(linked.map((x) => x.data)).toEqual([{ duplicateOf: c.code }]);
+    expect(await publicStatus(b.code)).toBe("fixed");
+  });
+});
+
+describe("redteam-4: duplicate by hand needs a valid link (row 2)", () => {
+  type Bad = [label: string, payload: (self: ReportRow, other: ReportRow) => Record<string, unknown>];
+  const bad: Bad[] = [
+    ["duplicate without duplicateOf", () => ({ status: "duplicate" })],
+    ["duplicate with duplicateOf null", () => ({ status: "duplicate", duplicateOf: null })],
+    ["duplicate with duplicateOf empty", () => ({ status: "duplicate", duplicateOf: "" })],
+    ["duplicate with a malformed code", () => ({ status: "duplicate", duplicateOf: "LUM-12" })],
+    ["duplicate with a number for a code", () => ({ status: "duplicate", duplicateOf: 482193 })],
+    ["duplicate with its own code", (self) => ({ status: "duplicate", duplicateOf: self.code })],
+    ["duplicate with a code that does not exist", () => ({ status: "duplicate", duplicateOf: seedCode() })],
+    ["fixed with a valid duplicateOf", (_self, other) => ({ status: "fixed", duplicateOf: other.code })],
+    ["looking with a valid duplicateOf", (_self, other) => ({ status: "looking", duplicateOf: other.code })],
+  ];
+  const badCases = statusRoutes.flatMap(([route, post]) => bad.map(([label, payload]) => [route, label, payload, post] as const));
+
+  it.each(badCases)("redteam-4: %s, B looking with no link, %s is 400 invalid_duplicate_of and B is unchanged", async (_route, _label, payload, post) => {
+    const b = await seedReport({ status: "looking", verdict: "needs_person", updated_at: Date.now() - DAY });
+    const other = await seedReport({ status: "looking" });
+    const before = await fullSnapshot(b);
+    const beforeOther = await fullSnapshot(other);
+
+    await expectError(await post(b.code, payload(b, other)), 400, "invalid_duplicate_of");
+
+    expect(await fullSnapshot(b), "B: status, link, verdict, updated_at and events as they were").toEqual(before);
+    expect(await fullSnapshot(other), "the other report is untouched").toEqual(beforeOther);
+  });
+
+  it.each(statusRoutes)("redteam-4 (edge): %s B already duplicate of A, duplicate without duplicateOf is 400 and keeps the link", async (_route, post) => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport();
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+    const before = await fullSnapshot(b);
+
+    await expectError(await post(b.code, { status: "duplicate" }), 400, "invalid_duplicate_of");
+
+    expect(await fullSnapshot(b)).toEqual(before);
+    expect(before.duplicate_of).toBe(a.code);
+  });
+});
+
+describe("redteam-4: retention deletes a report between the triage's read and its write (row 3)", () => {
+  it("redteam-4: target B deleted during triage C -> B: 400 invalid_duplicate_of, no event for C or B, C unchanged", async () => {
+    const b = await seedReport({ status: "looking" });
+    const c = await seedReport();
+    const beforeC = await fullSnapshot(c);
+    const seq = await maxSeq();
+    const { db, fired } = dbWithGapBeforeFirstWrite(() => deleteAsRetention(b));
+
+    const res = await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: b.code }, { DB: db });
+
+    expect(fired(), "the triage wrote after its read").toBe(true);
+    await expectError(res, 400, "invalid_duplicate_of");
+    expect(await eventsSince(seq, [c.id, b.id]), "no event for C, none orphaned on B's id").toEqual([]);
+    expect(await fullSnapshot(c), "C unchanged").toEqual(beforeC);
+    expect(await reportByCode(b.code), "B stays deleted").toBeNull();
+  });
+
+  it("redteam-4: C itself deleted during triage C -> B: 404 not_found, no event on C's id, D still on C and not re-pointed", async () => {
+    const b = await seedReport({ status: "looking" });
+    const c = await seedReport({ status: "looking" });
+    const d = await seedReport();
+    expect((await linkDuplicate(d.code, c.code)).status, "D -> C").toBe(200);
+    const beforeB = await fullSnapshot(b);
+    const beforeD = await fullSnapshot(d);
+    const seq = await maxSeq();
+    const { db, fired } = dbWithGapBeforeFirstWrite(() => deleteAsRetention(c));
+
+    const res = await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: b.code }, { DB: db });
+
+    expect(fired(), "the triage wrote after its read").toBe(true);
+    await expectError(res, 404, ERRORS.notFound);
+    expect(await eventsSince(seq, [c.id, b.id, d.id]), "no event for C's id, B or D").toEqual([]);
+    expect(await reportByCode(c.code), "C stays deleted").toBeNull();
+    expect(await fullSnapshot(d), "D still points at C, no duplicate_linked").toEqual(beforeD);
+    expect(beforeD.duplicate_of).toBe(c.code);
+    expect(await fullSnapshot(b), "B unchanged").toEqual(beforeB);
+  });
+});
+
+describe("redteam-4: a chain still moving after the two attempts is duplicate_busy (row 4)", () => {
+  it("redteam-4: the root moves before every guarded write of C -> A: 409 {error: duplicate_busy, retryAfter: n}, Retry-After n, C unchanged", async () => {
+    const a = await seedReport({ status: "looking" });
+    const c = await seedReport();
+    const beforeC = await fullSnapshot(c);
+    const moved: string[] = [];
+    // Each gap links the current root of A to a fresh original: the chain grows, never closes a loop.
+    const { db, gaps } = dbWithGapBeforeEveryWrite(async () => {
+      const root = await storedRoot(a.code);
+      const fresh = await seedReport({ status: "looking" });
+      expect((await linkDuplicate(root, fresh.code)).status, `move ${root} -> ${fresh.code}`).toBe(200);
+      moved.push(fresh.code);
+    }, 6);
+
+    const res = await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: a.code }, { DB: db });
+
+    expect(gaps(), "both attempts met a moved chain").toBeGreaterThanOrEqual(2);
+    expect(res.status).toBe(409);
+    const b = await body(res);
+    expect(b, "the busy answer, not duplicate_cycle").toEqual({ error: "duplicate_busy", retryAfter: expect.any(Number) });
+    const n = b.retryAfter as number;
+    expect(Number.isInteger(n), `retryAfter ${n} is whole seconds`).toBe(true);
+    expect(n).toBeGreaterThan(0);
+    expect(res.headers.get("Retry-After")).toBe(String(n));
+    expect(await fullSnapshot(c), "C unchanged, no event").toEqual(beforeC);
+    for (const code of [a.code, ...moved]) await expectNoLoopFrom(code);
+  });
+
+  it("redteam-4 (edge): after duplicate_busy the same triage, retried on a still chain, is 200 and stores the root", async () => {
+    const a = await seedReport({ status: "looking" });
+    const c = await seedReport();
+    const { db } = dbWithGapBeforeEveryWrite(async () => {
+      const root = await storedRoot(a.code);
+      const fresh = await seedReport({ status: "looking" });
+      expect((await linkDuplicate(root, fresh.code)).status).toBe(200);
+    }, 6);
+    await expectError(
+      await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: a.code }, { DB: db }),
+      409,
+      "duplicate_busy",
+    );
+
+    expect((await linkDuplicate(c.code, a.code)).status, "the retry").toBe(200);
+    const rowC = (await reportByCode(c.code))!;
+    expect(rowC.duplicate_of).toBe(await storedRoot(a.code));
+    await expectNoLoopFrom(c.code);
   });
 });
