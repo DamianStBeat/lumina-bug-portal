@@ -1,5 +1,6 @@
 // Specs for the red team findings of round 1 (redteam-astra.md, redteam-opus.md) and the lead's fix decisions 1-7
-// (brief-fix-rt.md). CONTRACT.md "Limits" (rate, retention), "Statuses", "Game", "Agent and bot", "Desk".
+// (brief-fix-rt.md), then of round 2 (redteam-astra-2.md, redteam-opus-2.md, brief-fix-rt2.md), named `redteam-2:`.
+// CONTRACT.md "Limits" (rate, retention), "Statuses", "Game", "Agent and bot", "Desk".
 //
 // Races are made deterministic with binding doubles passed as env overrides: a D1 or R2 binding that forwards every
 // call to the real one and, once, runs another real request in the gap the finding names (between a route's read
@@ -8,8 +9,11 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import {
   agentHeaders,
+  attachmentById,
   body,
   call,
+  completeUpload,
+  createAttachment,
   createReport,
   DAY,
   devDeskEnv,
@@ -18,12 +22,17 @@ import {
   expectError,
   gameHeaders,
   jsonInit,
+  listParts,
   nextIp,
+  PART_SIZE,
   pattern,
+  putPart,
   reportByCode,
   runCron,
   seedAttachment,
   seedReport,
+  sha256Hex,
+  sha256OfParts,
   TURNSTILE_PASS,
   uniqueText,
   type ReportRow,
@@ -620,5 +629,184 @@ describe("redteam: a desk status change between a route's read and its write", (
     expect((await reportByCode(r.code))!.status).toBe("closed");
     const changes = await statusChanges(r.id);
     expect(changes.at(-1)).toMatchObject({ from: "fixed", to: "closed" });
+  });
+});
+
+// ===============================================================================================================
+// Round 2 (redteam-astra-2.md, redteam-opus-2.md) and the lead's decisions 1-3 of brief-fix-rt2.md.
+// ===============================================================================================================
+
+// ---------------------------------------------------------------------------------------------------------------
+// Astra and Opus STATE uploads.ts:113 and decision 1: an obsolete part etag makes the upload recoverable, not stuck.
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("redteam-2: a part etag overwritten by a late re-send", () => {
+  type Uploaded = { uploaded: { n: number; size: number }[] };
+
+  async function putOk(id: string, n: number, token: string, bytes: Uint8Array): Promise<string> {
+    const res = await putPart(id, n, token, bytes);
+    expect(res.status, `PUT part ${n}`).toBe(200);
+    return (await body<{ etag: string }>(res)).etag;
+  }
+
+  async function fileAddedCount(reportId: string): Promise<number> {
+    return (await eventTypesOf(reportId)).filter((t) => t === "file_added").length;
+  }
+
+  it("redteam-2: complete with an obsolete etag stored for part 2 is 409 missing_parts [1, 2, 3], parts cleared; re-send and complete is 200, byte-identical, one file_added", async () => {
+    const sizes = [PART_SIZE, PART_SIZE, 1000];
+    const total = sizes.reduce((a, b) => a + b, 0);
+    const r = await createReport();
+    const created = await createAttachment(r.code, r.reportToken, { size: total });
+    expect(created.status, "creating the attachment").toBe(201);
+    const id = (await body<{ attachmentId: string }>(created)).attachmentId;
+    const reportId = (await reportByCode(r.code))!.id;
+    const right = [pattern(21, 0, sizes[0]!), pattern(21, PART_SIZE, sizes[1]!), pattern(21, 2 * PART_SIZE, sizes[2]!)];
+
+    await putOk(id, 1, r.reportToken, right[0]!);
+    // PUT A of part 2 (its bytes differ, so R2 gives its part a different etag), then PUT B replaces it in R2.
+    const etagA = await putOk(id, 2, r.reportToken, pattern(77, 0, PART_SIZE));
+    const etagB = await putOk(id, 2, r.reportToken, right[1]!);
+    expect(etagA, "the two sends of part 2 have different etags").not.toBe(etagB);
+    await putOk(id, 3, r.reportToken, right[2]!);
+    // A's delayed upsert lands after B's: D1 now holds the etag R2 no longer knows for part 2.
+    const stale = await env.DB.prepare("UPDATE parts SET etag = ? WHERE attachment_id = ? AND n = 2").bind(etagA, id).run();
+    expect(stale.meta.changes, "the part 2 row was overwritten").toBe(1);
+
+    const first = await completeUpload(id, r.reportToken);
+    expect(first.status, "complete with the obsolete etag (never 500)").not.toBe(500);
+    const refused = await expectError(first, 409, ERRORS.missingParts);
+    expect(Object.values(refused).filter(Array.isArray)).toEqual([[1, 2, 3]]);
+
+    const list = await listParts(id, r.reportToken);
+    expect(list.status).toBe(200);
+    expect((await body<Uploaded>(list)).uploaded).toEqual([]);
+    const row = await attachmentById(id);
+    expect(row!.status, "the upload stays open for the re-send").toBe("uploading");
+    expect(await fileAddedCount(reportId)).toBe(0);
+
+    // A client retrying complete before re-sending gets the same 409, not a 500.
+    const again = await completeUpload(id, r.reportToken);
+    expect(again.status).not.toBe(500);
+    expect(Object.values(await expectError(again, 409, ERRORS.missingParts)).filter(Array.isArray)).toEqual([[1, 2, 3]]);
+
+    for (const [i, bytes] of right.entries()) await putOk(id, i + 1, r.reportToken, bytes);
+    const done = await completeUpload(id, r.reportToken);
+    expect(done.status).toBe(200);
+
+    const after = await attachmentById(id);
+    expect(after!.status).toBe("complete");
+    const obj = await env.FILES.get(after!.r2_key);
+    expect(obj, "the object exists after the second complete").not.toBeNull();
+    expect(obj!.size).toBe(total);
+    expect(await sha256Hex(await obj!.arrayBuffer())).toBe(await sha256OfParts(right));
+    expect(await fileAddedCount(reportId)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Astra STATE cron.ts:110 and decision 2: an `aborted` row that still holds an upload id is retried the next day.
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("redteam-2: aborted uploads left by a failed cron run", () => {
+  /** An attachment row in `aborted` with a live upload id, `ageDays` old, on a recent report (no 12-month purge). */
+  async function seedAbortedWithUpload(ageDays: number, finished: boolean) {
+    const created = Date.now() - ageDays * DAY;
+    const r = await seedReport({ created_at: created });
+    const key = `spec/rt2-aborted/${crypto.randomUUID()}`;
+    const upload = await env.FILES.createMultipartUpload(key);
+    const part = await upload.uploadPart(1, pattern(22, 0, 1000));
+    // R2 took the complete, D1 never heard of it: the object exists while the row says aborted.
+    if (finished) await upload.complete([part]);
+    const a = await seedAttachment(r.id, {
+      created_at: created,
+      status: "aborted",
+      r2_key: key,
+      upload_id: upload.uploadId,
+      part_size: PART_SIZE,
+      part_count: 1,
+      size_bytes: 1000,
+    });
+    return { key, uploadId: upload.uploadId, attachment: a };
+  }
+
+  async function stillOpen(key: string, uploadId: string): Promise<boolean> {
+    try {
+      await env.FILES.resumeMultipartUpload(key, uploadId).uploadPart(2, pattern(22, 1, 10));
+      return true;
+    } catch {
+      // R2 refuses a part for an aborted or completed upload: it is closed.
+      return false;
+    }
+  }
+
+  it("redteam-2: an 8-day aborted row whose R2 upload was completed loses its object in one run and keeps no live upload id", async () => {
+    const s = await seedAbortedWithUpload(8, true);
+    expect(await env.FILES.head(s.key), "the finished object exists before the run").not.toBeNull();
+
+    await runCron();
+
+    expect(await env.FILES.head(s.key)).toBeNull();
+    const row = await attachmentById(s.attachment.id);
+    const settled = row === null || row.status === "deleted" || row.upload_id === null;
+    expect(settled, `row after one run: ${JSON.stringify(row && { status: row.status, upload_id: row.upload_id })}`).toBe(true);
+  });
+
+  it("redteam-2 (edge): an 8-day aborted row whose R2 upload is still open has it aborted in one run and its upload id cleared", async () => {
+    const s = await seedAbortedWithUpload(8, false);
+    expect(await stillOpen(s.key, s.uploadId), "the upload is open before the run").toBe(true);
+
+    await runCron();
+
+    expect(await stillOpen(s.key, s.uploadId)).toBe(false);
+    expect(await env.FILES.head(s.key)).toBeNull();
+    const row = await attachmentById(s.attachment.id);
+    expect(row === null || row.upload_id === null || row.status === "deleted", "no live upload id left").toBe(true);
+  });
+
+  it("redteam-2 (edge): a 6-day aborted row with a finished object is not touched yet (the 7-day line)", async () => {
+    const s = await seedAbortedWithUpload(6, true);
+
+    await runCron();
+
+    expect(await env.FILES.head(s.key)).not.toBeNull();
+    const row = await attachmentById(s.attachment.id);
+    expect(row!.status).toBe("aborted");
+    expect(row!.upload_id).toBe(s.uploadId);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Astra CONCEPT status.ts:21 / agent.ts:205 and decision 3: links made in reverse order are flattened too.
+// ---------------------------------------------------------------------------------------------------------------
+
+describe("redteam-2: duplicate links made from the leaf towards the root", () => {
+  it("redteam-2: R0 -> R1 then R1 -> R2 (fixed): R0 shows fixed and stores R2 as its original", async () => {
+    const r0 = await seedReport();
+    const r1 = await seedReport();
+    const r2 = await seedReport({ status: "fixed" });
+
+    expect((await linkDuplicate(r0.code, r1.code)).status, "R0 -> R1").toBe(200);
+    expect((await linkDuplicate(r1.code, r2.code)).status, "R1 -> R2").toBe(200);
+
+    expect(await publicStatus(r0.code)).toBe("fixed");
+    expect((await reportByCode(r0.code))!.duplicate_of).toBe(r2.code);
+    expect((await reportByCode(r1.code))!.duplicate_of).toBe(r2.code);
+  });
+
+  it("redteam-2: a chain of 11 links made one at a time, R0 -> R1 first and R10 -> R11 (fixed) last, shows fixed on R0", async () => {
+    const reports: ReportRow[] = [];
+    for (let i = 0; i < 11; i++) reports.push(await seedReport());
+    const root = await seedReport({ status: "fixed" });
+    reports.push(root);
+
+    for (let i = 0; i < 11; i++) {
+      expect((await linkDuplicate(reports[i]!.code, reports[i + 1]!.code)).status, `R${i} -> R${i + 1}`).toBe(200);
+    }
+
+    expect(await publicStatus(reports[0]!.code)).toBe("fixed");
+    for (const [i, r] of reports.slice(0, 11).entries()) {
+      expect((await reportByCode(r.code))!.duplicate_of, `R${i} points at the root`).toBe(root.code);
+    }
   });
 });
