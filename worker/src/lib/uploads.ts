@@ -56,8 +56,11 @@ export const ABORT_R2_CALLS = 2;
  * Aborts a multipart upload and removes the object it may already have become. An upload that R2 completed while
  * D1 still says `uploading` (a complete whose D1 write failed, or one racing this abort) answers "no such upload",
  * or nothing at all in Miniflare; its object would then outlive every retention step, which only looks at `complete`
- * rows. Aborting first means no complete can land afterwards, so the head below is the final word. Returns whether a
- * finished object was found and deleted: the row should then say `deleted`, not `aborted`.
+ * rows. Aborting first means no complete can land afterwards in R2, so the head below is the final word there. D1 is
+ * the caller's side: when the object must not outlive a complete that races this call (the cron), claim the row
+ * (`uploading` -> `aborted`, one row changed) before calling, so a complete landing in between loses its D1 write
+ * and answers 409 instead of "ok" for a file deleted here. Returns whether a finished object was found and deleted:
+ * the row should then say `deleted`, not `aborted`.
  */
 export async function abortUpload(bucket: R2Bucket, key: string, uploadId: string): Promise<boolean> {
   try {

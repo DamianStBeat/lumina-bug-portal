@@ -13,7 +13,8 @@ const HASH_DAYS = 2;
 
 const BATCH = 100;
 const MAX_BATCHES = 10;
-// R2 calls per run, well under the per-invocation subrequest limit even with the D1 queries added.
+// R2 calls per run, well under the per-invocation subrequest limit even with the D1 queries added. An abort that
+// finds a finished object makes one uncharged delete more; such objects only exist after a failed D1 write.
 const R2_BUDGET = 500;
 
 type Budget = { r2: number };
@@ -68,6 +69,10 @@ async function expireMedia(env: Env, now: number, budget: Budget) {
 /**
  * Uploads still open after 7 days: aborted in R2 (its stored parts go with it), row `aborted`, parts rows dropped.
  * One R2 already completed (its D1 write failed) has its object deleted and its row marked `deleted` instead.
+ *
+ * The row is claimed in D1 before R2 is touched. A complete that lands first keeps its row and its object (the claim
+ * changes nothing); one that lands after the claim finds its own D1 write refused and answers 409, so no player is
+ * told "ok" for a file this step then deletes.
  */
 async function abortStaleUploads(env: Env, now: number, budget: Budget) {
   type Row = { id: string; r2_key: string; upload_id: string | null };
@@ -82,21 +87,37 @@ async function abortStaleUploads(env: Env, now: number, budget: Budget) {
           .all<Row>()
       ).results,
     async (rows) => {
-      const done: { id: string; status: "aborted" | "deleted" }[] = [];
+      const claim = env.DB.prepare("UPDATE attachments SET status = 'aborted' WHERE id = ? AND status = 'uploading'");
+      const release = env.DB.prepare("UPDATE attachments SET status = 'uploading' WHERE id = ? AND status = 'aborted'");
+      const claimed: string[] = [];
+      const found: string[] = [];
+      // Rows a complete took first are no longer `uploading`: they count as handled, the next select skips them.
+      let skipped = 0;
       for (const row of rows) {
         if (budget.r2 < ABORT_R2_CALLS) break;
+        if ((await claim.bind(row.id).run()).meta.changes !== 1) {
+          skipped++;
+          continue;
+        }
         budget.r2 -= ABORT_R2_CALLS;
         try {
-          const found = row.upload_id ? await abortUpload(env.FILES, row.r2_key, row.upload_id) : false;
-          done.push({ id: row.id, status: found ? "deleted" : "aborted" });
+          if (row.upload_id && (await abortUpload(env.FILES, row.r2_key, row.upload_id))) found.push(row.id);
+          claimed.push(row.id);
         } catch (err) {
           console.error("retention: upload abort failed", row.id, reason(err));
+          // Back to `uploading` so tomorrow's run tries again, as it did before the claim existed.
+          try {
+            await release.bind(row.id).run();
+          } catch (err2) {
+            console.error("retention: upload release failed", row.id, reason(err2));
+          }
         }
       }
-      const mark = env.DB.prepare("UPDATE attachments SET status = ? WHERE id = ? AND status = 'uploading'");
+      const mark = env.DB.prepare("UPDATE attachments SET status = 'deleted' WHERE id = ? AND status = 'aborted'");
       const parts = env.DB.prepare("DELETE FROM parts WHERE attachment_id = ?");
-      if (done.length) await env.DB.batch(done.flatMap(({ id, status }) => [mark.bind(status, id), parts.bind(id)]));
-      return done.length;
+      const statements = [...found.map((id) => mark.bind(id)), ...claimed.map((id) => parts.bind(id))];
+      if (statements.length) await env.DB.batch(statements);
+      return claimed.length + skipped;
     },
   );
 }

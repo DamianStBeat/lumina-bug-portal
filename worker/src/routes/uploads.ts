@@ -159,12 +159,18 @@ async function complete(req: Request, env: Env, id: string): Promise<Response> {
   const data = JSON.stringify({ attachmentId: a.id, kind: a.kind, size: a.size_bytes });
   // One transaction; the event is written only while the row is still `uploading`, so two racing completes add one
   // file_added between them.
-  await env.DB.batch([
+  const [, marked] = await env.DB.batch([
     env.DB.prepare(
       "INSERT INTO events (report_id, at, type, data) SELECT ?, ?, 'file_added', ? WHERE EXISTS (SELECT 1 FROM attachments WHERE id = ? AND status = 'uploading')",
     ).bind(a.report_id, at, data, a.id),
     env.DB.prepare("UPDATE attachments SET status = 'complete', completed_at = ? WHERE id = ? AND status = 'uploading'").bind(at, a.id),
   ]);
+  if (marked!.meta.changes !== 1) {
+    // The row left `uploading` under us. A racing complete that wrote it first: the same ok. Anything else (the cron
+    // claimed it, a DELETE, the report expired) is about to remove the object, so "ok" would be a lie.
+    const now = await env.DB.prepare("SELECT status FROM attachments WHERE id = ?").bind(a.id).first<{ status: string }>();
+    if (now?.status !== "complete") throw new HttpError(409, "not_uploading");
+  }
   return json({ ok: true });
 }
 
