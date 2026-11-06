@@ -1140,8 +1140,8 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
   });
 
   // Audit round 1, finding 1 and the lead's decision: only reports whose status is `duplicate` and that point at the
-  // triaged report are re-pointed, and never the new root itself. The desk changes `status` only, so a report a
-  // person took back out of `duplicate` keeps its old `duplicate_of` in storage.
+  // triaged report are re-pointed, and never the new root itself. Since slice worker-status, a report a person takes
+  // back out of `duplicate` also loses its stored `duplicate_of`, so no stale link is left to revive.
   it("redteam-3: B -> A, the desk sets B back to looking, then A -> B: 200, B is not linked to itself, no event for B", async () => {
     const a = await seedReport({ status: "looking" });
     const b = await seedReport({ status: "looking" });
@@ -1149,7 +1149,7 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
     expect((await deskStatus(b.code, { status: "looking" })).status, "the desk sets B back to looking").toBe(200);
     const stored = (await reportByCode(b.code))!;
     expect(stored.status).toBe("looking");
-    expect(stored.duplicate_of, "the desk changes status only").toBe(a.code);
+    expect(stored.duplicate_of, "leaving duplicate clears the link").toBeNull();
     const beforeB = await eventsOf(b.id);
 
     expect((await linkDuplicate(a.code, b.code)).status, "A -> B").toBe(200);
@@ -1157,7 +1157,7 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
     expect((await reportByCode(a.code))!.duplicate_of).toBe(b.code);
     const rowB = (await reportByCode(b.code))!;
     expect(rowB.duplicate_of, "B is not linked to itself").not.toBe(b.code);
-    expect(rowB.duplicate_of, "B keeps its stored link").toBe(a.code);
+    expect(rowB.duplicate_of, "B has no stored link").toBeNull();
     expect(rowB.status).toBe("looking");
     expect(linkedEvents(await newEvents(b, beforeB)), "B gets no duplicate_linked").toEqual([]);
     expect(await publicStatus(a.code), "A shows B's public status").toBe("looking");
@@ -1175,7 +1175,7 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
     expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
 
     const rowC = (await reportByCode(c.code))!;
-    expect(rowC.duplicate_of, "C still points at B in storage").toBe(b.code);
+    expect(rowC.duplicate_of, "C lost its link when it left duplicate").toBeNull();
     expect(rowC.status, "C is still fixed").toBe("fixed");
     expect(linkedEvents(await newEvents(c, beforeC)), "C gets no duplicate_linked").toEqual([]);
     const bLinked = linkedEvents(await newEvents(b, beforeB));
