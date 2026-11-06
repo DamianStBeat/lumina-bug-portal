@@ -24,6 +24,9 @@ FRAMES_TIMEOUT = 1200
 SMALL_TIMEOUT = 120
 # Safe input options for every ffmpeg/ffprobe call: local files only, allowlisted demuxers only.
 _INPUT_GUARD = ["-protocol_whitelist", "file", "-format_whitelist", FORMATS]
+# ffmpeg starts one decoder/filter/encoder thread per CPU (64 on Valor1), each with its own frame buffers: two keep
+# a 1080p frame extraction near 106 MB instead of 208 MB, under the 250 MB per-process target.
+_THREADS = ["-threads", "2"]
 
 
 class MediaError(Exception):
@@ -48,7 +51,8 @@ def sniff(path: Path) -> str | None:
 
 
 def _ffmpeg(cfg: Config, src: Path, tail: list[str], timeout: float, cwd: Path) -> None:
-    argv = [cfg.ffmpeg_bin, "-nostdin", "-v", "error", *_INPUT_GUARD, "-i", str(src), "-an", "-sn", "-dn", *tail]
+    argv = [cfg.ffmpeg_bin, "-nostdin", "-v", "error", "-filter_threads", "2", *_THREADS, *_INPUT_GUARD, "-i", str(src),
+            "-an", "-sn", "-dn", *_THREADS, *tail]  # fmt: skip
     try:
         code, _, _ = run_child(argv, timeout, cwd=cwd)
     except (subprocess.TimeoutExpired, OSError):
@@ -61,7 +65,8 @@ def probe(cfg: Config, path: Path) -> dict[str, Any]:
     """{'kind': 'video'|'image', 'duration': float|None}; MediaError not_media / too_long otherwise."""
     if sniff(path) is None:
         raise MediaError("not_media")
-    argv = [cfg.ffprobe_bin, "-v", "error", *_INPUT_GUARD, "-show_format", "-show_streams", "-of", "json", str(path)]
+    argv = [cfg.ffprobe_bin, "-v", "error", *_THREADS, *_INPUT_GUARD, "-show_format", "-show_streams", "-of", "json",
+            str(path)]  # fmt: skip
     try:
         code, out, _ = run_child(argv, PROBE_TIMEOUT, cwd=path.parent)
         info = json.loads(out) if code == 0 else None

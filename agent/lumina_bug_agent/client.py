@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import urllib.error
 import urllib.request
@@ -47,7 +48,8 @@ class Client:
         except urllib.error.HTTPError as exc:
             exc.close()
             raise WorkerError(exc.code) from None
-        except (urllib.error.URLError, OSError, ValueError):
+        # A bad status line or header from the worker comes out of urllib as http.client's own error, not OSError.
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
             raise WorkerError(None) from None
 
     def _json(self, method: str, path: str, data: bytes | None = None, headers: dict[str, str] | None = None) -> Any:
@@ -56,7 +58,8 @@ class Client:
             with resp:
                 raw = resp.read()
             return json.loads(raw) if raw.strip() else None
-        except (OSError, ValueError):
+        # A reply cut short (IncompleteRead) is an HTTPException, not an OSError: still "the worker failed".
+        except (OSError, ValueError, http.client.HTTPException):
             raise WorkerError(resp.status) from None
 
     def get_json(self, path: str) -> Any:
@@ -80,6 +83,11 @@ class Client:
                     if total > cap:
                         raise TooLarge()
                     out.write(chunk)
-        except OSError:
+        except (OSError, http.client.HTTPException):  # a download cut short: the caller notes download_failed
             raise WorkerError(None) from None
+        # A streamed read(amt) returns short at EOF without raising: only the declared length shows a cut-off file,
+        # which must never reach ffprobe. An absent or unreadable header leaves nothing to compare.
+        declared = resp.headers.get("Content-Length", "").strip()
+        if declared.isascii() and declared.isdigit() and int(declared) != total:
+            raise WorkerError(resp.status)
         return total
