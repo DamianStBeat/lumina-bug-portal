@@ -1,0 +1,31 @@
+// Placeholders only: the real ids, domain and audience are filled in at deploy time (CONTRACT.md "Worker bindings").
+// Secrets (TURNSTILE_SECRET, GAME_KEY, AGENT_KEY, IP_SALT_SEED) are never here: `wrangler secret put`, or .dev.vars locally.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lumina-bug-portal",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "lumina-bug-portal",
+      "database_id": "REPLACE_AT_DEPLOY",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "lumina-bug-portal-files"
+    }
+  ],
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "https://REPLACE.pages.dev",
+    "ENVIRONMENT": "production",
+    "ACCESS_TEAM_DOMAIN": "REPLACE.cloudflareaccess.com",
+    "ACCESS_AUD": "REPLACE_AT_DEPLOY"
+  }
+}
