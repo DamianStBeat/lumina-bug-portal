@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { deskList, deskReport } from '../src/api/client'
 import type { DeskAttachmentWire, DeskListRowWire, DeskReportWire } from '../src/api/types'
 import Desk from '../src/pages/desk/Desk'
+import { triageReal } from './fixtures/triage-real'
 
 const AT = 1_762_400_000_000
 const A = 'LUM-482193'
@@ -280,17 +281,16 @@ describe('desk: the worker\'s columns reach the page (snake_case in, null as not
 
   it('fields, detail: the AI triage shows, pr_url gives Open PR #12, and duplicate_of reaches the row', async () => {
     const d = detail(A, [])
+    // The triage as the agent on main posts it (test/fixtures/triage-real.ts): what it is is stage A `what`, the
+    // cause is stage B `summary`.
+    const triage = triageReal().report.triage!
+    triage.stage_a!.what = 'The boss script stops on the bridge.'
+    Object.assign(triage.stage_b!, { summary: 'A nil target after the wave ends.', duplicate_of: B })
     serve(
       () => ({ reports: [row(A, 0)], nextCursor: null }),
       () => ({
         ...d,
-        report: {
-          ...d.report,
-          verdict: 'duplicate',
-          duplicate_of: B,
-          pr_url: PR,
-          triage: { summary: 'The boss script stops on the bridge.', cause: 'A nil target after the wave ends.' },
-        },
+        report: { ...d.report, verdict: 'duplicate', duplicate_of: B, pr_url: PR, triage },
       }),
     )
     open()
