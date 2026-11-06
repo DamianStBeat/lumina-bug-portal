@@ -62,4 +62,9 @@ export const en = {
     checked: 'We checked it. There is nothing to fix.',
   },
   loading: 'Loading…',
+  // Stage C: the copy button, the status page's date line and its network error.
+  copy: 'Copy the code',
+  copied: 'Copied',
+  updated: (date: string): string => `Last change: ${date}`,
+  errLoad: "We can't load this now. Check your Wi-Fi, then press Try again.",
 }

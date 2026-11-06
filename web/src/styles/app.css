@@ -144,3 +144,24 @@ button.chip{width:100%;text-align:left}
 .frames img.hit{outline:2px solid var(--warm-gold);opacity:1}
 .video video{display:block;width:100%;height:100%;background:#000}
 .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+/* stage C */
+.q{display:block;font:700 20px Inter;margin:6px 0 10px}
+.q .opt{font-weight:500;color:var(--slate);font-size:16px}
+.btn:disabled{opacity:.5;cursor:default}
+.drop{display:block;width:100%}
+.drop span{display:block}
+.drop.over{border-color:var(--warm-gold);background:rgba(215,154,43,.10)}
+.drop[aria-disabled=true]{opacity:.6;cursor:default}
+.hint b{color:var(--soft-white);overflow-wrap:anywhere}
+.file .info{min-width:0}
+.file .name b{font-weight:inherit;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file .name span{flex:none}
+.file.failed .bar i{background:var(--setback)}
+.err svg{flex:0 0 22px}
+.code .val{user-select:all;overflow-wrap:anywhere}
+.code .copy{margin-top:14px}
+.track{list-style:none}
+.track li{text-align:center;font-size:15px;color:var(--slate)}
+.state{font-size:18px;color:var(--soft-white);margin-bottom:8px}
+.turnstile{min-height:65px;max-width:100%;overflow:hidden;margin-bottom:6px}
