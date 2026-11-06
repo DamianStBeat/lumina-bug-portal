@@ -125,7 +125,7 @@ describe('text', () => {
       source: 'game',
       title: 'Boss stuck on bridge',
       what: 'The boss stopped on the bridge and the wave never ended.',
-      game_context: JSON.stringify({ placeId: 1, map: 'Bridge', wave: 12, device: 'phone' }),
+      game_context: { placeId: 1, map: 'Bridge', wave: 12, device: 'phone' }, // parsed, as the worker sends it
     }));
     assert.equal(post.name, 'Bug report: Boss stuck on bridge');
     const m = readMessage(post.message);
@@ -144,7 +144,7 @@ describe('text', () => {
       source: 'game',
       title: HOSTILE,
       what: HOSTILE,
-      game_context: JSON.stringify({ errors: ['```\n@everyone **x**', 'ok'] }),
+      game_context: { errors: ['```\n@everyone **x**', 'ok'] },
     }));
     // fix round 1, decision 7: post titles do not render markdown, so the name is not escaped (cut to 100).
     assert.equal(post.name, `Bug report: ${HOSTILE}`);
@@ -160,7 +160,7 @@ describe('text', () => {
       source: 'game',
       title: 'T'.repeat(200),
       what: 'W'.repeat(2000),
-      game_context: JSON.stringify({ errors: Array.from({ length: 50 }, () => 'e'.repeat(300)) }),
+      game_context: { errors: Array.from({ length: 50 }, () => 'e'.repeat(300)) },
     }));
     assert.ok(post.name.length <= 100, `name ${post.name.length}`);
     const content = readMessage(post.message).content ?? '';

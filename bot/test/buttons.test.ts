@@ -80,12 +80,13 @@ describe('See status button', () => {
     });
   }
 
-  // fix round 1, decision 6: CONTRACT.md does not pin the shape of GET /agent/reports/{code}; a nested answer
-  // `{ report, attachments }` is read like the flat row.
-  test('fix1-6: a nested { report, attachments } answer shows the report\'s status', async () => {
+  // fix round 1, decision 6 read a nested `{ report, attachments }` answer like the flat row. Contract slice
+  // (tests-commit 1): CONTRACT.md "Agent report shape" now pins the flat row only (the nested one: contract.test.ts k7),
+  // so this case feeds the flat row, fixed.
+  test('fix1-6: the flat row, fixed, shows the report\'s status', async () => {
     worker.override = (r) =>
       r.method === 'GET' && r.path === `/agent/reports/${CODE}`
-        ? { status: 200, body: { report: { code: CODE, status: 'fixed', source: 'discord' }, attachments: [] } }
+        ? { status: 200, body: { code: CODE, status: 'fixed', source: 'discord', attachments: [] } }
         : undefined;
     const i = await press(`status:${CODE}`);
     const final = i.finalAnswer();

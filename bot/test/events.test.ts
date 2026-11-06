@@ -143,13 +143,13 @@ function poller(
 }
 
 function fixedEvent(seq: number, code: string, note = 'The boss now finishes the bridge.') {
-  // The worker's own shape (routes/agent.ts, desk.ts): `{ from, to, note, prUrl }`, stored as JSON text.
+  // The worker's own shape (CONTRACT.md "Event data", agent status POST): `{ from, to, note, prUrl }`, an object.
   return {
     seq,
     code,
     at: 1_700_000_000_000 + seq,
     type: 'status_changed',
-    data: JSON.stringify({ from: 'looking', to: 'fixed', note, prUrl: null }),
+    data: { from: 'looking', to: 'fixed', note, prUrl: null },
   };
 }
 
@@ -209,9 +209,11 @@ describe('EventPoller.tick', () => {
     assert.equal(polls[polls.length - 1]!.query.get('after'), '7');
   });
 
-  test('row 5: status_changed with no status in data asks the report, and posts when it is fixed', async () => {
+  // Contract slice (tests-commit 1): the data is always the pinned object; it was `null` here ("no status, ask the
+  // report"), a guess the pinned contract removes. Now the agent's `to: fixed` with no note asks the report for its thread.
+  test('row 5: status_changed to fixed with note null asks the report for its thread and posts', async () => {
     worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055'));
-    worker.events.push({ seq: 1, code: 'LUM-482193', at: 1, type: 'status_changed', data: null });
+    worker.events.push({ seq: 1, code: 'LUM-482193', at: 1, type: 'status_changed', data: { from: 'looking', to: 'fixed', note: null, prUrl: null } });
     const d = fakeDiscord();
     await poller(seededCursor(), d).p.tick();
     assert.equal(d.sent.length, 1);
@@ -261,7 +263,7 @@ describe('EventPoller.tick', () => {
       status: 'received',
       title: 'Boss stuck on bridge',
       what: 'The boss stopped on the bridge and the wave never ended.',
-      game_context: JSON.stringify({ placeId: 1, map: 'Bridge', wave: 12, device: 'phone' }),
+      game_context: { placeId: 1, map: 'Bridge', wave: 12, device: 'phone' }, // parsed (CONTRACT.md "Agent report shape")
       discord_thread_id: null,
     });
     worker.events.push({ seq: 10, code: 'LUM-333333', at: 1, type: 'created', data: { source: 'game' } });
@@ -290,7 +292,7 @@ describe('EventPoller.tick', () => {
 
   test('row 6: a game report that already has a thread gets no second post', async () => {
     worker.reports.set('LUM-333334', {
-      code: 'LUM-333334', source: 'game', status: 'received', title: 'x', what: 'y', game_context: '{}',
+      code: 'LUM-333334', source: 'game', status: 'received', title: 'x', what: 'y', game_context: {},
       discord_thread_id: '770000000000000077',
     });
     worker.events.push({ seq: 11, code: 'LUM-333334', at: 1, type: 'created', data: {} });
@@ -757,10 +759,12 @@ describe('fix round 1: cursor write failure (decision 4)', () => {
 });
 
 describe('fix round 1: report and event shapes (decision 6)', () => {
-  test('fix1-6: a nested { report, attachments } answer is read like the flat row', async () => {
+  // Contract slice (tests-commit 1): the nested `{ report, attachments }` answer is outside the pinned contract (the
+  // bot no longer reads it: contract.test.ts k7); this case now feeds the pinned flat row with its `attachments`.
+  test('fix1-6: the flat row with its attachments array is read', async () => {
     worker.override = (r) =>
       r.method === 'GET' && r.path === '/agent/reports/LUM-482193'
-        ? { status: 200, body: { report: discordReport('LUM-482193', '770000000000000055'), attachments: [] } }
+        ? { status: 200, body: { ...discordReport('LUM-482193', '770000000000000055'), attachments: [] } }
         : undefined;
     worker.events.push(fixedEvent(1, 'LUM-482193'));
     const file = seededCursor();
@@ -774,10 +778,12 @@ describe('fix round 1: report and event shapes (decision 6)', () => {
     assert.equal(await cursorValue(file), 1);
   });
 
-  test('fix1-6: duplicate_linked with duplicate_of (snake case) in the event data names the original', async () => {
+  // Contract slice (tests-commit 1): `duplicate_of` in the data is not a pinned key (contract.test.ts k6); the case now
+  // sends the pinned `duplicateOf`, with the original fixed.
+  test('fix1-6: duplicate_linked with duplicateOf in the event data names the original, which is fixed', async () => {
     worker.reports.set('LUM-482540', discordReport('LUM-482540', '770000000000000066', { status: 'duplicate', duplicate_of: null }));
     worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055', { status: 'fixed' }));
-    worker.events.push({ seq: 5, code: 'LUM-482540', at: 1, type: 'duplicate_linked', data: { duplicate_of: 'LUM-482193' } });
+    worker.events.push({ seq: 5, code: 'LUM-482540', at: 1, type: 'duplicate_linked', data: { duplicateOf: 'LUM-482193' } });
     const d = fakeDiscord();
     await poller(seededCursor(), d).p.tick();
     assert.equal(d.sent.length, 1);
@@ -961,23 +967,31 @@ describe('fix round 1: status_changed data as the worker writes it (decision 12)
 
   test('fix1-12: to wins over status when both are present', async () => {
     worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
-    worker.events.push(statusEvent(1, { to: 'looking', status: 'fixed' }));
+    // The pinned keys plus a stray `status`, which is ignored (CONTRACT.md "Event data": any other key is ignored).
+    worker.events.push(statusEvent(1, { from: 'received', to: 'looking', note: null, prUrl: null, status: 'fixed' }));
     const d = fakeDiscord();
     await poller(seededCursor(), d).p.tick();
     assert.equal(d.sent.length, 0);
   });
 
-  test('fix1-12: status alone is still read (tolerance): fixed posts, looking does not', async () => {
+  // Contract slice (tests-commit 1): `status` alone is no longer read (contract.test.ts k2); the same two steps in the
+  // pinned shape.
+  test('fix1-12: received -> looking posts nothing, looking -> fixed posts once', async () => {
     worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
-    worker.events.push(statusEvent(1, { status: 'looking' }), statusEvent(2, { status: 'fixed', note: 'n' }));
+    worker.events.push(
+      statusEvent(1, { from: 'received', to: 'looking', note: null, prUrl: null }),
+      statusEvent(2, { from: 'looking', to: 'fixed', note: 'n', prUrl: null }),
+    );
     const d = fakeDiscord();
     await poller(seededCursor(), d).p.tick();
     assert.equal(fixedTitles(d), 1);
   });
 
-  test('fix1-12: neither to nor status ("not said", not "not fixed") -> the report is asked, and posts when fixed', async () => {
+  // Contract slice (tests-commit 1): an event without `to` is outside the contract and ignored (contract.test.ts k2);
+  // every writer sends `to`. The case keeps its other half: the report is asked (for its thread) and the post made.
+  test('fix1-12: to fixed -> the report is asked for its thread, and the Fixed posted', async () => {
     worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
-    worker.events.push(statusEvent(1, { from: 'looking' }));
+    worker.events.push(statusEvent(1, { from: 'looking', to: 'fixed', note: null, prUrl: null }));
     const d = fakeDiscord();
     await poller(seededCursor(), d).p.tick();
     assert.equal(fixedTitles(d), 1);
@@ -989,7 +1003,7 @@ describe('fix round 1: events of removed reports (decision 13)', () => {
   test('fix1-13: a code null event is skipped, the page is read, the next event posts, the cursor moves past both', async () => {
     worker.reports.set('LUM-000002', discordReport('LUM-000002', T2));
     worker.events.push(
-      { seq: 1, code: null, at: 1, type: 'status_changed', data: JSON.stringify({ from: 'looking', to: 'fixed' }) },
+      { seq: 1, code: null, at: 1, type: 'status_changed', data: { from: 'looking', to: 'fixed', note: null, prUrl: null } },
       fixedEvent(2, 'LUM-000002'),
     );
     const file = seededCursor();

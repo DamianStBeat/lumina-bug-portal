@@ -75,12 +75,14 @@ describe('PortalApi', () => {
     assert.equal((row as Record<string, unknown>)['discord_thread_id'], '9');
   });
 
-  test('design: getEvents sends after and limit, and normalises data (string, object, absent, broken)', async () => {
+  // Contract slice (tests-commit 1): `data` is always an object, or null (CONTRACT.md "Event data"); the JSON-string
+  // cases left (a string is not parsed any more: contract.test.ts k3).
+  test('design: getEvents sends after and limit, and passes data through (object; null as {})', async () => {
     worker.events.push(
-      { seq: 3, code: 'LUM-000003', at: 1, type: 'status_changed', data: '{"from":"looking","to":"fixed","note":"n"}' },
+      { seq: 3, code: 'LUM-000003', at: 1, type: 'status_changed', data: { from: 'looking', to: 'fixed', note: 'n', prUrl: null } },
       { seq: 4, code: 'LUM-000004', at: 2, type: 'status_changed', data: { from: 'received', to: 'looking' } },
       { seq: 5, code: 'LUM-000005', at: 3, type: 'created', data: null },
-      { seq: 6, code: 'LUM-000006', at: 4, type: 'created', data: '{not json' },
+      { seq: 6, code: 'LUM-000006', at: 4, type: 'created', data: { source: 'game' } },
     );
     const res = await api().getEvents(2);
     const [req] = worker.find('GET', '/agent/events');
@@ -92,10 +94,10 @@ describe('PortalApi', () => {
       res.events.map((e: { seq: number }) => e.seq),
       [3, 4, 5, 6],
     );
-    assert.deepEqual(res.events[0]!.data, { from: 'looking', to: 'fixed', note: 'n' });
+    assert.deepEqual(res.events[0]!.data, { from: 'looking', to: 'fixed', note: 'n', prUrl: null });
     assert.deepEqual(res.events[1]!.data, { from: 'received', to: 'looking' });
     assert.deepEqual(res.events[2]!.data, {});
-    assert.deepEqual(res.events[3]!.data, {});
+    assert.deepEqual(res.events[3]!.data, { source: 'game' });
   });
 
   test('design: uploadAttachment runs create, every part in slices of partSize, then complete', async () => {
