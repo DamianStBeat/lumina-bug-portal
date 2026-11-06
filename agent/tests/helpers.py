@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -156,6 +157,10 @@ class FakeWorker:
         self.reports: dict[str, dict[str, Any]] = {}
         self.blobs: dict[str, bytes] = {}
         self.leased: set[str] = set()  # codes whose claim answers 409 leased
+        # Leases as the real worker keeps them (CONTRACT.md "Agent and bot"): a successful claim holds the report until
+        # now + minutes; while it is live the queue leaves the report out and another claim answers 409. Nothing in the
+        # contract releases a lease early, so a spec that wants the next round to see the report calls expire_lease.
+        self.leases: dict[str, int] = {}  # code -> lease_until, unix ms
         self.failures: dict[str, list[int]] = {}  # route -> statuses for the next calls (then normal)
         self.always_fail: dict[str, int] = {}  # route -> status for every call
         self.requests: list[dict[str, Any]] = []
@@ -224,6 +229,8 @@ class FakeWorker:
             "triage": None,
             "duplicate_of": None,
             "pr_url": None,
+            "lease_until": None,
+            "lease_by": None,
             "attachments": [],
         }
         for att in attachments or []:
@@ -249,6 +256,18 @@ class FakeWorker:
             self.always_fail[route] = status
         else:
             self.failures.setdefault(route, []).extend([status] * times)
+
+    def expire_lease(self, code: str | None = None) -> None:
+        """Moves the lease of `code` (every lease when None) into the past, as if its minutes had run out."""
+        with self._lock:
+            for c in [code] if code is not None else list(self.leases):
+                if c in self.leases:
+                    self.leases[c] = 0
+                    if c in self.reports:
+                        self.reports[c]["lease_until"] = 0
+
+    def _live_lease(self, code: str) -> bool:
+        return self.leases.get(code, 0) > int(time.time() * 1000)
 
     # -- inspection -----------------------------------------------------------------------------------------
     def calls(self, route: str | None = None, code: str | None = None) -> list[dict[str, Any]]:
@@ -318,16 +337,34 @@ class FakeWorker:
         code = params.get("code")
         if route == "queue":
             limit = int(record["query"].get("limit", "50"))
-            rows = [r for r in self.reports.values() if r["status"] == "received"]
+            with self._lock:
+                rows = [r for r in self.reports.values() if r["status"] == "received" and not self._live_lease(r["code"])]
             rows.sort(key=lambda r: r["created_at"])
             items = [{"code": r["code"], "created_at": r["created_at"], "status": r["status"]} for r in rows[:limit]]
             return self._send(h, 200, {"reports": items})
         if route in ("claim", "report", "frames", "triage", "status") and code not in self.reports:
             return self._send(h, 404, {"error": "not_found"})
         if route == "claim":
-            if code in self.leased:
+            try:
+                claim = json.loads(body)
+                by, minutes = claim.get("by"), claim.get("minutes")
+            except (ValueError, AttributeError):
+                return self._send(h, 400, {"error": "bad_json"})
+            if not isinstance(by, str) or not by:
+                return self._send(h, 400, {"error": "invalid_by"})
+            if not isinstance(minutes, int) or isinstance(minutes, bool) or not 1 <= minutes <= 60:
+                return self._send(h, 400, {"error": "invalid_minutes"})
+            with self._lock:
+                if code in self.leased or self._live_lease(code):
+                    won = None
+                else:
+                    won = int(time.time() * 1000) + minutes * 60_000
+                    self.leases[code] = won
+                    self.reports[code]["lease_until"] = won
+                    self.reports[code]["lease_by"] = by
+            if won is None:
                 return self._send(h, 409, {"error": "leased"})
-            return self._send(h, 200, {"leaseUntil": 1_762_403_600_000})
+            return self._send(h, 200, {"leaseUntil": won})
         if route == "report":
             return self._send(h, 200, self.reports[code])
         if route == "download":

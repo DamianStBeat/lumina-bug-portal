@@ -55,6 +55,10 @@ class Row08WorkerUnreachable(unittest.TestCase):
         h.assert_round_ok(p)
         self.assertEqual(h.triages(), [], "no triage when the report could not be read")
         self.assertEqual(h.claude_calls(), [])
+        self.assertEqual(len(h.worker.calls("claim", "LUM-800003")), 1, "the first round claimed it")
+        # The claim holds the report out of the queue for LEASE_MINUTES (the real worker does the same): the next
+        # round that sees it again is the one after the lease ran out.
+        h.worker.expire_lease("LUM-800003")
         p2 = h.run()
         h.assert_round_ok(p2)
         self.assertEqual(len(h.triages("LUM-800003")), 1, "the next round retries and triages it")
