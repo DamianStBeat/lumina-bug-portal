@@ -136,7 +136,7 @@ td .sub{color:var(--slate);font-size:12.5px;margin-top:3px}
 /* Additions: what the preview lacks because its elements were pictures, not controls. */
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 :focus-visible{outline:3px solid var(--glow-blue);outline-offset:3px}
-header .lang{display:inline-flex;align-items:center;gap:8px;min-height:56px;padding:0 18px}
+header .lang{display:inline-flex;align-items:center;gap:8px;min-height:56px;padding:0 14px}
 button.chip{width:100%;text-align:left}
 .filters button{font-size:13px;padding:7px 12px;border-radius:999px;border:1px solid rgba(142,220,255,.22);color:var(--slate)}
 .filters button.on{color:#1a0f02;background:var(--warm-gold);border-color:var(--warm-gold);font-weight:700}
@@ -165,3 +165,7 @@ button.chip{width:100%;text-align:left}
 .track li{text-align:center;font-size:15px;color:var(--slate)}
 .state{font-size:18px;color:var(--soft-white);margin-bottom:8px}
 .turnstile{min-height:65px;max-width:100%;overflow:hidden;margin-bottom:6px}
+
+/* stage E: two chip columns need about 370 px ("Something else" does not shrink); tighter below, one column under 360. */
+@media(max-width:379px){.chip{padding:0 12px;gap:8px}}
+@media(max-width:359px){.chips{grid-template-columns:1fr}}

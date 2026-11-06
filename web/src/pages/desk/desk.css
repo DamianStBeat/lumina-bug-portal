@@ -1,6 +1,8 @@
 /* Stage D: the team desk. The preview's .dash, .filters, .tag, .video, .frames and .ai rules live in app.css; these
    are the parts a real list, player and narrow screen need. Loaded with the desk chunk only. */
 .desk header{flex-wrap:wrap}
+/* The desk's Cloudflare Access pill is a label, not a control: the preview's size, not the 56 px touch target. */
+.desk header .lang{min-height:0;padding:8px 14px}
 @media(max-width:1023px){.dash{grid-template-columns:minmax(0,1fr)}}
 @media(max-width:599px){.dash{padding:8px 16px 30px}.desk .detail{padding:16px}}
 .dash.one{grid-template-columns:minmax(0,720px);justify-content:center}

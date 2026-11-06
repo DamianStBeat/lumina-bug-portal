@@ -40,7 +40,12 @@ type Rec = {
 type Att = DeskAttachment & { code: string; partCount: number; parts: Map<number, number> }
 type Faults = { failParts: number; offline: boolean; slowMs: number }
 
-type State = { reports: Map<string, Rec>; atts: Map<string, Att>; nextCode: number; nextAtt: number; faults: Faults }
+// Per attachment and part number: PUTs that reached the server, and the ones it answered 200. Read by dev/shots.mjs
+// to prove that a retry or a resume does not send confirmed parts again.
+type Puts = Map<string, Map<number, { got: number; ok: number }>>
+type State = {
+  reports: Map<string, Rec>; atts: Map<string, Att>; nextCode: number; nextAtt: number; faults: Faults; puts: Puts
+}
 type SeedFile = [kind: AttachmentKind, filename: string, mime: string, sizeBytes: number]
 type Seed = [ageMin: number, report: Omit<Report, 'createdAt' | 'updatedAt' | 'source'>, files: SeedFile[]]
 const TOP = 'LUM-482193'
@@ -91,7 +96,8 @@ function fresh(): State {
       atts.set(id, { id, code: report.code, kind, filename, mime, sizeBytes, status: 'complete', partCount, parts })
     }
   }
-  return { reports, atts, nextCode: FIRST_CODE, nextAtt: 1, faults: { failParts: 0, offline: false, slowMs: 0 } }
+  const faults = { failParts: 0, offline: false, slowMs: 0 }
+  return { reports, atts, nextCode: FIRST_CODE, nextAtt: 1, faults, puts: new Map() }
 }
 let state: State = fresh()
 
@@ -280,7 +286,8 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
     const { filename, size, mime } = b
     const ok = typeof filename === 'string' && filename.trim() && typeof mime === 'string'
     if (!ok || typeof size !== 'number' || !Number.isInteger(size) || size < 1) throw new HttpError(400, 'bad_request')
-    if (!/^(video|image)\//.test(mime)) throw new HttpError(400, 'bad_type')
+    // Same word as the worker slice, so the client sees one name for this refusal in dev and in production.
+    if (!/^(video|image)\//.test(mime)) throw new HttpError(400, 'invalid_mime')
     // 2 GiB is exactly 128 parts of 16 MiB, so the size cap is also the parts cap.
     if (size > MAX_FILE) throw new HttpError(400, 'file_too_large')
     if (liveFiles(rec.report.code).length >= MAX_FILES) throw new HttpError(400, 'too_many_files')
@@ -297,6 +304,12 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
   if ((m = at(/^\/attachments\/([\w-]+)\/parts\/(\d+)$/, 'PUT'))) {
     const att = needAtt(req, m[1]!)
     const n = Number(m[2])
+    // Counted on arrival, before the body: a part cut by a reload was still sent once.
+    const byPart = state.puts.get(att.id) ?? new Map<number, { got: number; ok: number }>()
+    state.puts.set(att.id, byPart)
+    const count = byPart.get(n) ?? { got: 0, ok: 0 }
+    byPart.set(n, count)
+    count.got++
     // Only the length is kept: a 2 GB upload must not live in the dev server's memory.
     const { length } = await readBody(req, PART_CAP, false)
     if (state.faults.slowMs > 0) await new Promise((r) => setTimeout(r, state.faults.slowMs))
@@ -310,6 +323,7 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
     const expected = n < att.partCount ? PART_SIZE : att.sizeBytes - (att.partCount - 1) * PART_SIZE
     if (length !== expected) throw new HttpError(400, 'bad_part_size')
     att.parts.set(n, length)
+    count.ok++
     return send(res, 200, { n, etag: `"${att.id}-${n}-${length}"` })
   }
   if ((m = at(/^\/attachments\/([\w-]+)\/parts$/, 'GET'))) {
@@ -395,6 +409,10 @@ async function control(req: IncomingMessage, res: ServerResponse, p: string): Pr
     if (offline !== undefined) f.offline = offline as boolean
     if (slowMs !== undefined) f.slowMs = slowMs as number
     return send(res, 200, f)
+  }
+  if (req.method === 'GET' && p === '/__mock/stats') {
+    const parts = (byPart: Map<number, { got: number; ok: number }>) => Object.fromEntries([...byPart])
+    return send(res, 200, Object.fromEntries([...state.puts].map(([id, byPart]) => [id, parts(byPart)])))
   }
   throw new HttpError(404, 'not_found')
 }

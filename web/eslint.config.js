@@ -16,4 +16,10 @@ export default defineConfig([
     extends: [js.configs.recommended],
     languageOptions: { ecmaVersion: 2022, sourceType: 'module', globals: globals.node },
   },
+  {
+    // dev/shots.mjs runs in Node, and hands some functions to the page, where the browser globals exist.
+    files: ['dev/**/*.mjs'],
+    extends: [js.configs.recommended],
+    languageOptions: { ecmaVersion: 2024, sourceType: 'module', globals: { ...globals.node, ...globals.browser } },
+  },
 ])
