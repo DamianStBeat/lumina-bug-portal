@@ -26,6 +26,21 @@ agent/lumina_bug_agent/cache.py|`triaged` event for a cached code with an empty 
 agent/lumina_bug_agent/media.py|FONT from env FRAME_FONT|hard-coded FreeSans path|test_row4_frame_font_existing_file_is_used_as_fontfile
 agent/lumina_bug_agent/media.py|missing font file → drawtext font=Sans, no fontfile|always fontfile=<FONT>|test_row4_frame_font_missing_file_falls_back_to_fontconfig_sans
 agent/lumina_bug_agent/media.py|FRAME_FONT default /usr/share/fonts/truetype/freefont/FreeSans.ttf|another default|test_row4_frame_font_unset_uses_freesans
+
+Follow-up audit (bp-agent-fix/audit.md), the `test_audit<N>_*` specs, filter `-k audit`. Findings 1-2 were red on
+4b25711 (the code they describe); 3-10 guard rules already there. Mutations on 4b25711 (file|old|new|label), each red:
+agent/lumina_bug_agent/fix.py|        if now - at > PENDING_MAX_AGE:|        if False:|M1 test_audit3
+agent/lumina_bug_agent/fix.py|(current[0] != "looking" or current[1] > at * 1000)|(current[1] > at * 1000)|M2 test_audit4
+agent/lumina_bug_agent/fix.py|(current[0] != "looking" or current[1] > at * 1000)|(current[0] != "looking")|M3 test_audit5
+agent/lumina_bug_agent/fix.py|            if current is None:  # kept|            if False:  # kept|M5 test_audit6
+agent/lumina_bug_agent/fix.py|status >= 500 or status in (408, 429)|status >= 500 or status in (404, 408, 429)|M7 test_audit7
+agent/lumina_bug_agent/fix.py|status is None or status >= 500 or status in (408, 429)|status is None or status in (408, 429)|M6 test_audit7
+agent/lumina_bug_agent/run.py|        if rounds >= STALL_ROUNDS:|        if False:|M10 test_audit8
+agent/lumina_bug_agent/run.py|                if not all(isinstance(ev, dict) and _is_int(ev.get("seq")) for ev in events):|                if False:|M13 test_audit9
+agent/lumina_bug_agent/run.py|self.cache.set_meta("events_cursor", str(events[handled - 1]["seq"]))|pass|M17 test_audit10
+agent/lumina_bug_agent/run.py|str(events[handled - 1]["seq"]))|str(events[handled]["seq"]))|M18 test_audit10
+For findings 1-2 the mutation is the code of 4b25711 itself: `transient()` back to `status >= 500` (bad 200 final),
+and the `triaged` refresh without the cached `verdict is None` condition.
 """
 
 from __future__ import annotations
@@ -45,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # `python3 -m unittest
 from helpers import (  # noqa: E402
     STAGE_B_NEEDS_PERSON,
     STAGE_B_SIMPLE_FIX,
+    VALID_STAGE_A,
     EventsWorker,
     Harness,
     mp4_attachment,
@@ -306,6 +322,312 @@ class Row4FrameFont(unittest.TestCase):
         h = Harness(self)
         for argv in self._draws(h):
             self.assertRegex(argv, r"fontfile='?" + re.escape(FREESANS), "the default font is FreeSans")
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Follow-up audit (bp-agent-fix/audit.md), findings 1-10. Filter: `python3 -m unittest tests.test_followup_findings -k audit`
+# --------------------------------------------------------------------------------------------------------------
+
+PENDING_BODY = json.dumps({"status": "looking", "note": "needs_person: low_confidence"})
+WEEK = 7 * 86400
+NOT_JSON = b"<html><body>502 Bad Gateway</body></html>"
+
+
+def _db(h: Harness, sql: str, args: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+    """Rows of the agent's own STATE_DIR/cache.sqlite3, read only; [] while the file does not exist yet."""
+    db = h.state_dir / "cache.sqlite3"
+    if not db.exists():
+        return []
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+def _pending(h: Harness) -> dict[str, int]:
+    """code -> `at` (unix s) of the status POSTs still waiting in the cache."""
+    return {str(c): int(a) for c, a in _db(h, "SELECT code, at FROM pending_status")}
+
+
+def _cursor(h: Harness) -> int | None:
+    """The saved events cursor; None while the agent never saved one (not the same as a saved 0)."""
+    rows = _db(h, "SELECT value FROM meta WHERE key = 'events_cursor'")
+    return int(rows[0][0]) if rows and str(rows[0][0]).strip() else None
+
+
+def _round(h: Harness) -> tuple[Any, list[dict[str, Any]]]:
+    start = _mark(h)
+    p = h.run()
+    h.assert_round_ok(p)
+    return p, _since(h, start)
+
+
+def _fresh_round(test: unittest.TestCase, h: Harness, w: EventsWorker) -> tuple[Any, list[dict[str, Any]]]:
+    """One round with one new report in the queue: the agent reads the events only in a round that has one."""
+    i = len([c for c in w.reports if c.startswith("LUM-48")])  # fresh codes of this test's worker so far
+    fresh = f"LUM-48{i:04d}"
+    w.add_report(fresh, what=f"Fresh report number {i}")
+    p, reqs = _round(h)
+    test.assertEqual(len(h.triages(fresh)), 1, f"scenario: round {i + 1} triaged its queued report {fresh}")
+    return p, reqs
+
+
+def _pending_after_round1(test: unittest.TestCase, code: str) -> Harness:
+    """Round 1 triages `code` (simple_fix, low confidence → final `looking` + needs_person note) while every status
+    POST answers 503, so the note waits in the cache. The status route is healthy again afterwards."""
+    h = Harness(test)
+    assert h.worker is not None
+    h.worker.add_report(code)
+    h.set_stage("stage_b", mode="json", object=dict(LOW_CONFIDENCE))
+    h.worker.fail("status", 503)
+    _, r1 = _round(h)
+    del h.worker.always_fail["status"]
+    test.assertEqual(len(h.triages(code)), 1, "scenario: the triage went through")
+    test.assertTrue(_status_bodies(r1, code), "scenario: round 1 tried to post the final status")
+    test.assertEqual(h.worker.reports[code]["status"], "looking", "scenario: the triage set looking")
+    test.assertIn(code, _pending(h), "scenario: the undelivered status waits in the cache")
+    return h
+
+
+def _insert_pending(h: Harness, rows: list[tuple[str, int]]) -> None:
+    """Pending status rows with a chosen `at` (unix s), written into the agent's cache after a first round made it."""
+    conn = sqlite3.connect(h.state_dir / "cache.sqlite3")
+    try:
+        with conn:
+            conn.executemany("INSERT INTO pending_status(code, body, at) VALUES(?, ?, ?)",
+                             [(c, PENDING_BODY, at) for c, at in rows])
+    finally:
+        conn.close()
+
+
+def _looking_report(h: Harness, code: str) -> None:
+    """A report the agent triaged long ago (status `looking`, `updated_at` from 2025): a pending status may land on it."""
+    assert h.worker is not None
+    h.worker.add_report(code)["status"] = "looking"
+
+
+class AuditFinding1BadTwoHundred(unittest.TestCase):
+    """Finding 1: un GET del report che risponde 200 con un corpo non JSON o tagliato non è una risposta finale."""
+
+    CODE = "LUM-450001"
+    A, X, B = "LUM-450011", "LUM-450012", "LUM-450013"
+
+    def _pending_stays(self, **answer: Any) -> None:
+        h = _pending_after_round1(self, self.CODE)
+        assert h.worker is not None
+        h.worker.answer_report(self.CODE, **answer)
+        p2, r2 = _round(h)
+        self.assertTrue([r for r in r2 if r["route"] == "report" and r["code"] == self.CODE],
+                        "scenario: round 2 read the report before resending")
+        self.assertEqual(_status_bodies(r2, self.CODE), [], "nothing POSTed on a bad 200 answer")
+        self.assertIn(self.CODE, _pending(h), f"a bad 200 answer keeps the pending status:\n{p2.stderr[-1500:]}")
+        _, r3 = _round(h)
+        resent = _status_bodies(r3, self.CODE)
+        self.assertEqual([b.get("status") for b in resent], ["looking"], "delivered once the worker answers normally")
+        self.assertTrue(str(resent[0].get("note", "")).startswith("needs_person"), f"the stored note: {resent[0]}")
+
+    def test_audit1_pending_status_kept_when_report_get_is_not_json(self) -> None:
+        self._pending_stays(raw=NOT_JSON)
+
+    def test_audit1_pending_status_kept_when_report_get_is_cut_short(self) -> None:
+        self._pending_stays(body={"report": {"status": "looking", "updated_at": 0}}, cut_short=True)
+
+    def _seed_not_handled(self, **answer: Any) -> None:
+        h, w = _events_harness(self)
+        for code in (self.A, self.X, self.B):
+            _triaged_row(w, code, f"Summary of {code}")
+            w.add_event(code, "triaged", {"verdict": "needs_person"})
+        x_seq = w.events[1]["seq"]
+        w.answer_report(self.X, **answer)
+        _fresh_round(self, h, w)
+        self.assertTrue(w.calls("report", self.X), "scenario: round 1 tried to fetch X")
+        self.assertNotIn(self.X, _cached_values(h), "a bad 200 answer caches nothing")
+        cursor = _cursor(h)
+        self.assertTrue(cursor is None or cursor < x_seq, f"the events cursor stays before X's event (seq {x_seq}): {cursor}")
+        _fresh_round(self, h, w)
+        cached = _cached_values(h)
+        self.assertIn(self.X, cached, "X is fetched again and cached once the worker answers normally")
+        self.assertIn(f"Summary of {self.X}", cached, "with its summary")
+        self.assertIn(self.B, cached, "and the events after it are read too")
+
+    def test_audit1_seed_not_handled_when_report_get_is_not_json(self) -> None:
+        self._seed_not_handled(raw=NOT_JSON)
+
+    def test_audit1_seed_not_handled_when_report_get_is_cut_short(self) -> None:
+        self._seed_not_handled(body={"report": {"code": self.X, "title": None}}, cut_short=True)
+
+
+class AuditFinding2OwnTriagedEvent(unittest.TestCase):
+    """Finding 2: l'evento `triaged` del report che l'agente ha triato da sé (fase B non valida) non lo rilegge."""
+
+    R = "LUM-460001"
+    OWN_WHAT = "Crate opens twice on a fast double tap"
+
+    def test_audit2_own_triage_with_invalid_stage_b_is_not_refetched_on_its_triaged_event(self) -> None:
+        h, w = _events_harness(self)
+        w.add_report(self.R, what="the crate thing")  # a web report: the worker's `title` is None
+        h.set_stage("stage_a", mode="json", object=dict(VALID_STAGE_A, what=self.OWN_WHAT))
+        h.set_stage("stage_b", mode="json", object={"verdict": "not a verdict"})
+        _round(h)
+        self.assertEqual(len(h.triages(self.R)), 1, "scenario: the agent triaged R itself")
+        self.assertEqual(h.one_triage(self.R).get("verdict"), "unclear", "scenario: stage B was invalid")
+        before = _db(h, "SELECT title, summary, verdict FROM reports WHERE code = ?", (self.R,))
+        self.assertEqual(len(before), 1, "scenario: R is cached after its own triage")
+        self.assertEqual(before[0][1] or "", "", "scenario: cached with an empty summary")
+        self.assertIsNotNone(before[0][2], "scenario: cached with the verdict the agent posted")
+
+        w.add_event(self.R, "triaged", {"verdict": "unclear"})  # the worker's event for the agent's own triage
+        h.set_stage("stage_a", mode="json", object=dict(VALID_STAGE_A, what="Another player's shop problem"))
+        h.set_stage("stage_b", mode="json", object=dict(STAGE_B_NEEDS_PERSON))
+        _, r2 = _fresh_round(self, h, w)
+        self.assertEqual([r["path"] for r in r2 if r["route"] == "report" and r["code"] == self.R], [],
+                         "the agent's own triaged event does not fetch R again")
+        after = _db(h, "SELECT title FROM reports WHERE code = ?", (self.R,))
+        self.assertEqual(after, [(before[0][0],)], "R's cached title is unchanged")
+        stage_b = h.claude_calls("stage_b")
+        self.assertIn(before[0][0], stage_b[-1]["stdin"], "the next report's duplicate list still shows R's description")
+
+
+class AuditFinding3PendingExpiry(unittest.TestCase):
+    """Finding 3: uno stato in attesa da più di 7 giorni si scarta; appena dentro i 7 giorni si invia."""
+
+    OLD, YOUNG = "LUM-470001", "LUM-470002"
+
+    def test_audit3_pending_status_older_than_seven_days_is_dropped_unsent(self) -> None:
+        h = Harness(self)
+        assert h.worker is not None
+        _round(h)  # an empty queue: the agent makes its cache
+        _looking_report(h, self.OLD)
+        _looking_report(h, self.YOUNG)
+        now = int(time.time())
+        _insert_pending(h, [(self.OLD, now - WEEK - 1), (self.YOUNG, now - WEEK + 120)])
+        _, r = _round(h)
+        self.assertEqual(_status_bodies(r, self.OLD), [], "a status pending for more than 7 days is not sent")
+        self.assertNotIn(self.OLD, _pending(h), "and it leaves the cache")
+        self.assertEqual(len(_status_bodies(r, self.YOUNG)), 1, "one just inside the 7 days is still sent")
+        self.assertEqual(_pending(h), {}, "nothing left pending")
+
+
+class AuditFinding4To6PendingReadsTheReport(unittest.TestCase):
+    """Findings 4-6: il reinvio di uno stato in attesa legge il report: stato, `updated_at`, risposta incompleta."""
+
+    CODE = "LUM-470901"
+
+    def test_audit4_person_closed_with_an_old_updated_at_gets_no_looking(self) -> None:
+        h = _pending_after_round1(self, self.CODE)
+        assert h.worker is not None
+        old = h.worker.reports[self.CODE]["created_at"]  # the report's first updated_at
+        h.worker.person_sets_status(self.CODE, "closed")
+        h.worker.reports[self.CODE]["updated_at"] = old  # the worker's clock is behind
+        self.assertLessEqual(old, _pending(h)[self.CODE] * 1000, "scenario: only the status tells the person's change")
+        for _ in range(2):
+            _, r = _round(h)
+            self.assertEqual(_status_bodies(r, self.CODE), [], "no `looking` over the person's `closed`")
+        self.assertEqual(h.worker.reports[self.CODE]["status"], "closed")
+        self.assertNotIn(self.CODE, _pending(h), "the superseded status leaves the cache")
+
+    def test_audit5_still_looking_but_updated_after_the_pending_status_is_dropped(self) -> None:
+        h = _pending_after_round1(self, self.CODE)
+        assert h.worker is not None
+        time.sleep(0.01)
+        h.worker.person_sets_status(self.CODE, "looking")  # a person set it again: same status, newer write
+        self.assertGreater(h.worker.reports[self.CODE]["updated_at"], _pending(h)[self.CODE] * 1000,
+                           "scenario: only the time tells the person's change")
+        for _ in range(2):
+            _, r = _round(h)
+            self.assertEqual(_status_bodies(r, self.CODE), [], "nothing resent over a newer write")
+        self.assertNotIn(self.CODE, _pending(h), "the superseded status leaves the cache")
+
+    def test_audit6_report_answer_without_updated_at_keeps_the_pending_status(self) -> None:
+        h = _pending_after_round1(self, self.CODE)
+        assert h.worker is not None
+        h.worker.answer_report(self.CODE, body={"report": {"status": "looking"}})
+        _, r2 = _round(h)
+        self.assertEqual(_status_bodies(r2, self.CODE), [], "nothing POSTed on an answer without updated_at")
+        self.assertIn(self.CODE, _pending(h), "the pending status is kept")
+        _, r3 = _round(h)
+        self.assertEqual([b.get("status") for b in _status_bodies(r3, self.CODE)], ["looking"],
+                         "and delivered once the worker answers in full")
+
+
+class AuditFinding7PendingGetFails(unittest.TestCase):
+    """Finding 7: GET del report 404 → stato scartato; 503 → tenuto, e la riga dopo si prova lo stesso."""
+
+    GONE, BUSY, FINE = "LUM-490001", "LUM-490002", "LUM-490003"
+
+    def test_audit7_pending_get_404_drops_503_keeps_and_the_next_row_is_tried(self) -> None:
+        h = Harness(self)
+        assert h.worker is not None
+        _round(h)
+        for code in (self.GONE, self.BUSY, self.FINE):
+            _looking_report(h, code)
+        now = int(time.time())
+        _insert_pending(h, [(self.GONE, now - 30), (self.BUSY, now - 20), (self.FINE, now - 10)])  # oldest first
+        h.worker.answer_report(self.GONE, status=404)
+        h.worker.answer_report(self.BUSY, status=503)
+        _, r1 = _round(h)
+        self.assertEqual(_status_bodies(r1, self.GONE), [], "404: nothing POSTed")
+        self.assertEqual(_status_bodies(r1, self.BUSY), [], "503: nothing POSTed this round")
+        self.assertEqual(len(_status_bodies(r1, self.FINE)), 1, "the row after a 503 is still tried")
+        self.assertEqual(set(_pending(h)), {self.BUSY}, "404 dropped, 503 kept")
+        _, r2 = _round(h)
+        self.assertEqual(len(_status_bodies(r2, self.BUSY)), 1, "the kept one is delivered next round")
+        self.assertEqual(_status_bodies(r2, self.GONE), [], "the dropped one never comes back")
+
+
+class AuditFinding8To10Events(unittest.TestCase):
+    """Findings 8-10: blocco su un seme che fallisce, `seq` non valido, cursore su una pagina fermata."""
+
+    BAD, AFTER = "LUM-491001", "LUM-491002"
+
+    def test_audit8_stall_guard_lets_a_failing_seed_go_in_round_three(self) -> None:
+        h, w = _events_harness(self)
+        for code in (self.BAD, self.AFTER):
+            _triaged_row(w, code, f"Summary of {code}")
+            w.add_event(code, "triaged", {"verdict": "needs_person"})
+        w.report_fails.add(self.BAD)  # 500 on every GET
+        for n in (1, 2):
+            _fresh_round(self, h, w)
+            self.assertNotIn(self.AFTER, _cached_values(h), f"round {n}: the code after the failing one waits")
+        before = len(w.calls("report", self.BAD))
+        _fresh_round(self, h, w)
+        self.assertEqual(len(w.calls("report", self.BAD)), before + 1, "scenario: round 3 tried the failing code again")
+        self.assertIn(self.AFTER, _cached_values(h), "round 3 lets the failing code go and caches the ones after it")
+        self.assertNotIn(self.BAD, _cached_values(h))
+
+    def test_audit9_event_without_an_int_seq_is_a_bad_answer_cursor_unchanged(self) -> None:
+        for label, broken in (("missing", None), ("string", "2")):
+            with self.subTest(seq=label):
+                h, w = _events_harness(self)
+                _triaged_row(w, self.BAD, "Summary one")
+                w.add_event(self.BAD, "triaged", {"verdict": "needs_person"})
+                _fresh_round(self, h, w)
+                self.assertEqual(_cursor(h), 1, "scenario: round 1 read the first event")
+                _triaged_row(w, self.AFTER, "Summary two")
+                w.add_event(self.AFTER, "triaged", {"verdict": "needs_person"})
+                w.add_event(self.AFTER, "status_changed", {"from": "looking", "to": "fixed"})
+                if broken is None:
+                    del w.events[1]["seq"]
+                else:
+                    w.events[1]["seq"] = broken
+                p, _ = _fresh_round(self, h, w)  # the round itself goes on: exit 0, its queued report triaged
+                self.assertRegex(p.stderr, r"lumina-bug-agent: events failed\b.*bad_answer", "logged as a bad answer")
+                self.assertEqual(_cursor(h), 1, "the cursor is not moved by a page it cannot trust")
+
+    def test_audit10_stopped_page_saves_the_cursor_at_the_last_handled_event(self) -> None:
+        h, w = _events_harness(self)
+        for i in range(10):  # handled without a seed: status changes of codes the cache does not know
+            w.add_event(f"LUM-49{i:04d}", "status_changed", {"from": "looking", "to": "fixed"})
+        olds = [f"LUM-492{n:03d}" for n in range(60)]
+        for i, code in enumerate(olds):
+            _triaged_row(w, code, f"Summary of {code}")
+            w.add_event(code, "created" if i % 2 == 0 else "triaged", {} if i % 2 == 0 else {"verdict": "needs_person"})
+        seeded = [e["seq"] for e in w.events if e["type"] in ("created", "triaged")]
+        _, r1 = _fresh_round(self, h, w)
+        gets = [r["code"] for r in r1 if r["route"] == "report" and r["code"] in set(olds)]
+        self.assertEqual(len(gets), 50, "scenario: the cap of 50 stopped the page")
+        self.assertEqual(_cursor(h), seeded[49], "the cursor is saved at the seq of the 50th seeded event")
 
 
 if __name__ == "__main__":

@@ -163,6 +163,9 @@ class FakeWorker:
         self.leases: dict[str, int] = {}  # code -> lease_until, unix ms
         self.failures: dict[str, list[int]] = {}  # route -> statuses for the next calls (then normal)
         self.always_fail: dict[str, int] = {}  # route -> status for every call
+        # code -> the next answers of GET /agent/reports/{code} (answer_report); `report_always` for every call.
+        self.report_answers: dict[str, list[dict[str, Any]]] = {}
+        self.report_always: dict[str, dict[str, Any]] = {}
         self.requests: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._frames = 0
@@ -257,6 +260,31 @@ class FakeWorker:
         else:
             self.failures.setdefault(route, []).extend([status] * times)
 
+    def answer_report(self, code: str, status: int = 200, body: Any = None, raw: bytes | None = None,
+                      cut_short: bool = False, times: int | None = 1) -> None:
+        """The next `times` GETs of `/agent/reports/{code}` (every one when None) answer `status` with `body` as JSON,
+        or with the bytes `raw` as is. `cut_short`: the headers promise 100 bytes more than are sent before the
+        connection closes (an IncompleteRead on the agent's side). Not counted as a failure of the whole route."""
+        answer = {"status": status, "body": body, "raw": raw, "cut_short": cut_short}
+        with self._lock:
+            if times is None:
+                self.report_always[code] = answer
+            else:
+                self.report_answers.setdefault(code, []).extend([answer] * times)
+
+    def _special_report(self, h: http.server.BaseHTTPRequestHandler, answer: dict[str, Any]) -> None:
+        data = answer["raw"] if answer["raw"] is not None else json.dumps(answer["body"]).encode("utf-8")
+        if not answer["cut_short"]:
+            return self._send(h, answer["status"], data)
+        h.close_connection = True
+        h.send_response(answer["status"])
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(data) + 100))
+        h.send_header("Connection", "close")
+        h.end_headers()
+        h.wfile.write(data)
+        h.wfile.flush()
+
     def expire_lease(self, code: str | None = None) -> None:
         """Moves the lease of `code` (every lease when None) into the past, as if its minutes had run out."""
         with self._lock:
@@ -350,6 +378,12 @@ class FakeWorker:
         if forced:
             return self._send(h, forced, {"error": "internal"})
         code = params.get("code")
+        if route == "report" and code is not None:
+            with self._lock:
+                queued_answers = self.report_answers.get(code)
+                special = queued_answers.pop(0) if queued_answers else self.report_always.get(code)
+            if special is not None:
+                return self._special_report(h, special)
         if route == "queue":
             limit = int(record["query"].get("limit", "50"))
             with self._lock:
@@ -432,8 +466,9 @@ class EventsWorker(FakeWorker):
                 q = dict(urllib.parse.parse_qsl(parsed.query))
                 after = int(q.get("after") or 0)
                 limit = min(int(q.get("limit") or 100), 500)
-                page = [e for e in self.events if e["seq"] > after][:limit]
-                payload = {"events": page, "last": page[-1]["seq"] if page else after}
+                # Paged by position in the log, which is each event's `seq` unless a spec broke that field on purpose.
+                page = [(i + 1, e) for i, e in enumerate(self.events) if i + 1 > after][:limit]
+                payload = {"events": [e for _, e in page], "last": page[-1][0] if page else after}
             m = re.match(r"^/api/v1/agent/reports/([^/]+)$", parsed.path)
             if m and m.group(1) in self.report_fails:
                 return super()._send(h, 500, {"error": "internal"})
