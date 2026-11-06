@@ -1,0 +1,149 @@
+import { API_BASE } from '../config'
+import type {
+  ApiErrorBody,
+  AttachSessionBody,
+  AttachSessionRes,
+  CreateAttachmentBody,
+  CreateAttachmentRes,
+  CreateReportBody,
+  CreateReportRes,
+  DeskFilter,
+  DeskListRes,
+  DeskReport,
+  DeskStatusBody,
+  ListPartsRes,
+  PutPartRes,
+  StatusRes,
+} from './types'
+
+// `code` is a machine word for the pages to map to their own strings; it never carries server or browser prose,
+// so nothing raw can reach the player.
+export class ApiError extends Error {
+  readonly status: number
+  readonly code: string
+  constructor(status: number, code: string) {
+    super(code)
+    this.name = 'ApiError'
+    this.status = status
+    this.code = code
+  }
+}
+
+type Req = { method?: string; json?: unknown; raw?: Blob; token?: string; desk?: boolean; signal?: AbortSignal }
+
+const CODE_WORD = /^[a-z0-9_]{1,64}$/
+
+async function readBody(res: Response): Promise<unknown> {
+  try {
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+function errorCode(res: Response, body: unknown): string {
+  const word = (body as Partial<ApiErrorBody> | null)?.error
+  return typeof word === 'string' && CODE_WORD.test(word) ? word : `http_${res.status}`
+}
+
+async function send(path: string, req: Req): Promise<Response> {
+  const headers: Record<string, string> = {}
+  let body: BodyInit | undefined
+  if (req.raw) {
+    body = req.raw
+    headers['Content-Type'] = 'application/octet-stream'
+  } else if (req.json !== undefined) {
+    body = JSON.stringify(req.json)
+    headers['Content-Type'] = 'application/json'
+  }
+  if (req.token) headers['X-Report-Token'] = req.token
+  try {
+    return await fetch(API_BASE + path, {
+      method: req.method ?? 'GET',
+      headers,
+      body,
+      signal: req.signal,
+      // Public calls carry no cookies at all; the desk needs the Cloudflare Access cookie of its own origin.
+      credentials: req.desk ? 'include' : 'omit',
+    })
+  } catch {
+    // Offline, DNS, CORS, abort: the browser's reason is not something a player can act on.
+    throw new ApiError(0, 'network')
+  }
+}
+
+async function call<T>(path: string, req: Req = {}): Promise<T> {
+  const res = await send(path, req)
+  const body = await readBody(res)
+  if (!res.ok) throw new ApiError(res.status, errorCode(res, body))
+  // A 2xx without the JSON we expect (a proxy page, a cut body) is a failure, not an empty success.
+  if (body === null || typeof body !== 'object') throw new ApiError(res.status, `http_${res.status}`)
+  return body as T
+}
+
+async function callVoid(path: string, req: Req): Promise<void> {
+  const res = await send(path, req)
+  if (!res.ok) throw new ApiError(res.status, errorCode(res, await readBody(res)))
+}
+
+const seg = encodeURIComponent
+
+export function createReport(body: CreateReportBody): Promise<CreateReportRes> {
+  return call('/reports', { method: 'POST', json: body })
+}
+
+export function attachSession(code: string, turnstileToken: string): Promise<AttachSessionRes> {
+  const json: AttachSessionBody = { turnstileToken }
+  return call(`/reports/${seg(code)}/attach-session`, { method: 'POST', json })
+}
+
+export function createAttachment(code: string, token: string, body: CreateAttachmentBody): Promise<CreateAttachmentRes> {
+  return call(`/reports/${seg(code)}/attachments`, { method: 'POST', json: body, token })
+}
+
+export function putPart(id: string, n: number, token: string, data: Blob, signal?: AbortSignal): Promise<PutPartRes> {
+  return call(`/attachments/${seg(id)}/parts/${n}`, { method: 'PUT', raw: data, token, signal })
+}
+
+export function listParts(id: string, token: string): Promise<ListPartsRes> {
+  return call(`/attachments/${seg(id)}/parts`, { token })
+}
+
+// 409 missing_parts is an answer the uploader acts on, not a failure. `missing` is [] when the server gave no list
+// (the contract does not fix the field name), so the caller knows to ask listParts instead.
+export async function completeAttachment(id: string, token: string): Promise<{ ok: true; missing?: number[] }> {
+  const res = await send(`/attachments/${seg(id)}/complete`, { method: 'POST', token })
+  const body = await readBody(res)
+  if (res.ok) return { ok: true }
+  const code = errorCode(res, body)
+  if (res.status !== 409 || code !== 'missing_parts') throw new ApiError(res.status, code)
+  const list = (body as Partial<ApiErrorBody>).missing
+  return { ok: true, missing: Array.isArray(list) ? list.filter((n) => Number.isInteger(n)) : [] }
+}
+
+export function deleteAttachment(id: string, token: string): Promise<void> {
+  return callVoid(`/attachments/${seg(id)}`, { method: 'DELETE', token })
+}
+
+export function getStatus(code: string): Promise<StatusRes> {
+  return call(`/status/${seg(code)}`)
+}
+
+export function deskList(filter: DeskFilter, cursor?: string): Promise<DeskListRes> {
+  const q = new URLSearchParams({ filter })
+  if (cursor) q.set('cursor', cursor)
+  return call(`/desk/reports?${q}`, { desk: true })
+}
+
+export function deskReport(code: string): Promise<DeskReport> {
+  return call(`/desk/reports/${seg(code)}`, { desk: true })
+}
+
+export function deskSetStatus(code: string, body: DeskStatusBody): Promise<void> {
+  return callVoid(`/desk/reports/${seg(code)}/status`, { method: 'POST', json: body, desk: true })
+}
+
+// Used as a <video src>: the browser sends the Access cookie itself and handles Range requests.
+export function deskStreamUrl(id: string): string {
+  return `${API_BASE}/desk/attachments/${seg(id)}/stream`
+}
