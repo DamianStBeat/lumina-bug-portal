@@ -302,6 +302,11 @@ class FakeWorker:
             self.reports[code]["status"] = status
         self._touch(code)
 
+    def player_uploads(self, code: str) -> None:
+        """A player adds a file to the report with its token (the worker's upload route, worker/src/routes/uploads.ts
+        on origin/main): `updated_at` moves to now and the status stays as it is. Not an agent request, not recorded."""
+        self._touch(code)
+
     def _touch(self, code: str) -> None:
         # Every write to a report row moves its `updated_at` (unix ms), the agent's own triage and status included, so a
         # spec can tell a person's later change from the agent's earlier one only by the time, as on the real worker.
