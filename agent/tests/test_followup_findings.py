@@ -171,7 +171,9 @@ class Row2SixtyUnknownCodes(unittest.TestCase):
         Returns the number of seed GETs (report GETs for the 60 codes) of each round."""
         olds = set(self.OLDS)
         per_round = []
-        for i in range(n):
+        for _ in range(n):
+            # A new code every round of the test, across calls: a claimed report keeps its lease and leaves the queue.
+            i = self._fresh = getattr(self, "_fresh", -1) + 1
             fresh = f"LUM-429{i:03d}"
             w.add_report(fresh, what=f"Fresh report number {i}")
             start = _mark(h)
