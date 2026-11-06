@@ -972,6 +972,40 @@ describe("redteam-3: two triages closing a duplicate cycle at the same instant",
       for (const r of reports) expect(await publicStatus(r.code), `round #${i + 1}: ${r.code}`).toBe("looking");
     }
   });
+
+  // Audit round 1, findings 2-3: the root A -> B read moves before A's write. The decided retry reads the chain again
+  // and links A to where B went (C), one hop: not 409 for a legitimate link, and not A -> B -> C.
+  it("redteam-3: B -> C landing between A -> B's read and its write: A -> B is 200 and stores C, one hop, one event", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    const c = await seedReport({ status: "looking" });
+    const beforeA = await eventsOf(a.id);
+    let gapAnswer = 0;
+    const { db, fired } = dbWithGapBeforeFirstWrite(async () => {
+      gapAnswer = (await linkDuplicate(b.code, c.code)).status;
+    });
+
+    const res = await triage(a.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: b.code }, { DB: db });
+
+    expect(fired(), "A -> B wrote after its read").toBe(true);
+    expect(gapAnswer, "B -> C in the gap").toBe(200);
+    expect(res.status, "A -> B after the root moved").toBe(200);
+    const rowA = (await reportByCode(a.code))!;
+    expect(rowA.status).toBe("duplicate");
+    expect(rowA.duplicate_of, "A points at C, one hop, not at B").toBe(c.code);
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(c.code);
+    await expectNoLoopFrom(a.code);
+
+    const all = await eventsOf(a.id);
+    expect(all.slice(0, beforeA.length), "A's old events are untouched").toEqual(beforeA);
+    const added = all.slice(beforeA.length);
+    const linked = added.filter((e) => e.type === "duplicate_linked");
+    expect(linked.length, "A has exactly one duplicate_linked").toBe(1);
+    expect(linked[0]!.data).toEqual({ duplicateOf: c.code });
+    expect(added.filter((e) => e.type === "triaged").length, "A has exactly one triaged").toBe(1);
+    expect(added.filter((e) => e.type === "status_changed").length, "A has exactly one status_changed").toBe(1);
+    expect(await publicStatus(a.code), "A shows C's status").toBe("looking");
+  });
 });
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1102,5 +1136,49 @@ describe("redteam-3: duplicate_linked for every report re-pointed to the new roo
 
     expect((await reportByCode(c.code))!.duplicate_of).toBe(b.code);
     expect(await newEvents(c, beforeC), "C gets no event").toEqual([]);
+  });
+
+  // Audit round 1, finding 1 and the lead's decision: only reports whose status is `duplicate` and that point at the
+  // triaged report are re-pointed, and never the new root itself. The desk changes `status` only, so a report a
+  // person took back out of `duplicate` keeps its old `duplicate_of` in storage.
+  it("redteam-3: B -> A, the desk sets B back to looking, then A -> B: 200, B is not linked to itself, no event for B", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+    expect((await deskStatus(b.code, { status: "looking" })).status, "the desk sets B back to looking").toBe(200);
+    const stored = (await reportByCode(b.code))!;
+    expect(stored.status).toBe("looking");
+    expect(stored.duplicate_of, "the desk changes status only").toBe(a.code);
+    const beforeB = await eventsOf(b.id);
+
+    expect((await linkDuplicate(a.code, b.code)).status, "A -> B").toBe(200);
+
+    expect((await reportByCode(a.code))!.duplicate_of).toBe(b.code);
+    const rowB = (await reportByCode(b.code))!;
+    expect(rowB.duplicate_of, "B is not linked to itself").not.toBe(b.code);
+    expect(rowB.duplicate_of, "B keeps its stored link").toBe(a.code);
+    expect(rowB.status).toBe("looking");
+    expect(linkedEvents(await newEvents(b, beforeB)), "B gets no duplicate_linked").toEqual([]);
+    expect(await publicStatus(a.code), "A shows B's public status").toBe("looking");
+  });
+
+  it("redteam-3 (edge): C -> B, the desk sets C to fixed, then B -> A: C is not re-pointed and gets no event", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    const c = await seedReport({ status: "looking" });
+    expect((await linkDuplicate(c.code, b.code)).status, "C -> B").toBe(200);
+    expect((await deskStatus(c.code, { status: "fixed" })).status, "the desk sets C to fixed").toBe(200);
+    const beforeB = await eventsOf(b.id);
+    const beforeC = await eventsOf(c.id);
+
+    expect((await linkDuplicate(b.code, a.code)).status, "B -> A").toBe(200);
+
+    const rowC = (await reportByCode(c.code))!;
+    expect(rowC.duplicate_of, "C still points at B in storage").toBe(b.code);
+    expect(rowC.status, "C is still fixed").toBe("fixed");
+    expect(linkedEvents(await newEvents(c, beforeC)), "C gets no duplicate_linked").toEqual([]);
+    const bLinked = linkedEvents(await newEvents(b, beforeB));
+    expect(bLinked.length, "B has its own duplicate_linked").toBe(1);
+    expect(bLinked[0]!.data).toMatchObject({ duplicateOf: a.code });
   });
 });
