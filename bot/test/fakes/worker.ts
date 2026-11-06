@@ -23,7 +23,9 @@ export type Reply = { status: number; body?: unknown; raw?: string };
 // hang: never answer (the client's timeout must fire). close: drop the socket without an answer.
 export type WorkerMode = 'ok' | 'error' | 'hang' | 'close';
 
-export type FakeEvent = { seq: number; code: string; at: number; type: string; data: unknown };
+// `code` is null for an event whose report retention removed (the worker keeps its place in the sequence).
+// status_changed data is `{ from, to, note?, prUrl? }`, as worker/src/routes/agent.ts and desk.ts write it.
+export type FakeEvent = { seq: number; code: string | null; at: number; type: string; data: unknown };
 
 export class FakeWorker {
   readonly requests: RecordedRequest[] = [];

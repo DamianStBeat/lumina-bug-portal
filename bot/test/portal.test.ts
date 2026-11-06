@@ -77,8 +77,8 @@ describe('PortalApi', () => {
 
   test('design: getEvents sends after and limit, and normalises data (string, object, absent, broken)', async () => {
     worker.events.push(
-      { seq: 3, code: 'LUM-000003', at: 1, type: 'status_changed', data: '{"status":"fixed","note":"n"}' },
-      { seq: 4, code: 'LUM-000004', at: 2, type: 'status_changed', data: { status: 'looking' } },
+      { seq: 3, code: 'LUM-000003', at: 1, type: 'status_changed', data: '{"from":"looking","to":"fixed","note":"n"}' },
+      { seq: 4, code: 'LUM-000004', at: 2, type: 'status_changed', data: { from: 'received', to: 'looking' } },
       { seq: 5, code: 'LUM-000005', at: 3, type: 'created', data: null },
       { seq: 6, code: 'LUM-000006', at: 4, type: 'created', data: '{not json' },
     );
@@ -92,8 +92,8 @@ describe('PortalApi', () => {
       res.events.map((e: { seq: number }) => e.seq),
       [3, 4, 5, 6],
     );
-    assert.deepEqual(res.events[0]!.data, { status: 'fixed', note: 'n' });
-    assert.deepEqual(res.events[1]!.data, { status: 'looking' });
+    assert.deepEqual(res.events[0]!.data, { from: 'looking', to: 'fixed', note: 'n' });
+    assert.deepEqual(res.events[1]!.data, { from: 'received', to: 'looking' });
     assert.deepEqual(res.events[2]!.data, {});
     assert.deepEqual(res.events[3]!.data, {});
   });

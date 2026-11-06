@@ -134,7 +134,14 @@ function poller(
 }
 
 function fixedEvent(seq: number, code: string, note = 'The boss now finishes the bridge.') {
-  return { seq, code, at: 1_700_000_000_000 + seq, type: 'status_changed', data: JSON.stringify({ status: 'fixed', note }) };
+  // The worker's own shape (routes/agent.ts, desk.ts): `{ from, to, note, prUrl }`, stored as JSON text.
+  return {
+    seq,
+    code,
+    at: 1_700_000_000_000 + seq,
+    type: 'status_changed',
+    data: JSON.stringify({ from: 'looking', to: 'fixed', note, prUrl: null }),
+  };
 }
 
 function discordReport(code: string, threadId: string | null, extra: Record<string, unknown> = {}) {
@@ -204,7 +211,7 @@ describe('EventPoller.tick', () => {
 
   test('row 5: status_changed to looking posts nothing; the cursor still advances', async () => {
     worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055', { status: 'looking' }));
-    worker.events.push({ seq: 3, code: 'LUM-482193', at: 1, type: 'status_changed', data: { status: 'looking' } });
+    worker.events.push({ seq: 3, code: 'LUM-482193', at: 1, type: 'status_changed', data: { from: 'received', to: 'looking' } });
     const file = seededCursor();
     const d = fakeDiscord();
     await poller(file, d).p.tick();
@@ -516,7 +523,7 @@ describe('fix round 1: poison events (decision 3)', () => {
   for (const type of ['status_changed', 'duplicate_linked', 'created'] as const) {
     test(`fix1-3: a worker 404 on the report of a ${type} event is permanent: skipped, the next event posts`, async () => {
       worker.reports.set('LUM-000002', discordReport('LUM-000002', T2));
-      const data = type === 'status_changed' ? { status: 'fixed' } : type === 'duplicate_linked' ? { duplicateOf: 'LUM-000002' } : {};
+      const data = type === 'status_changed' ? { from: 'looking', to: 'fixed' } : type === 'duplicate_linked' ? { duplicateOf: 'LUM-000002' } : {};
       worker.events.push({ seq: 1, code: 'LUM-404404', at: 1, type, data }, fixedEvent(2, 'LUM-000002'));
       const file = seededCursor();
       const d = fakeDiscord();
@@ -811,6 +818,111 @@ describe('fix round 1: stop waits for the running tick (decision 10)', () => {
     void again.then(() => (done = true));
     await pause(20);
     assert.equal(done, true);
+  });
+});
+
+describe('fix round 1: status_changed data as the worker writes it (decision 12)', () => {
+  const THREAD = '770000000000000055';
+  const statusEvent = (seq: number, data: unknown) => ({ seq, code: 'LUM-482193', at: seq, type: 'status_changed', data });
+  const fixedTitles = (d: Discord) =>
+    d.sent.filter((s) => readMessage(s.message).embeds[0]?.title === 'Fixed · LUM-482193').length;
+
+  test('fix1-12: to "looking" posts nothing and asks nothing, even when the report is fixed by now', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
+    worker.events.push(statusEvent(1, { from: 'received', to: 'looking', note: null, prUrl: null }));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    await poller(file, d).p.tick();
+    assert.equal(d.sent.length, 0);
+    assert.equal(worker.find('GET', /^\/agent\/reports\//).length, 0, 'no lookup: the data says the status');
+    assert.equal(await cursorValue(file), 1);
+  });
+
+  test('fix1-12: looking then fixed -> exactly one "Fixed", with the note of the fixed event', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
+    worker.events.push(
+      statusEvent(1, { from: 'received', to: 'looking' }),
+      statusEvent(2, { from: 'looking', to: 'fixed', note: 'The boss now finishes the bridge.', prUrl: 'https://github.com/x/y/pull/1' }),
+    );
+    const d = fakeDiscord();
+    await poller(seededCursor(), d).p.tick();
+    assert.equal(d.sent.length, 1);
+    assert.equal(fixedTitles(d), 1);
+    assert.ok((readMessage(d.sent[0]!.message).embeds[0]!.description ?? '').startsWith('The boss now finishes the bridge.'));
+  });
+
+  test('fix1-12: to "fixed" posts even when the report has moved on since (the event decides, not the row)', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'closed' }));
+    worker.events.push(statusEvent(1, { from: 'looking', to: 'fixed' }));
+    const d = fakeDiscord();
+    await poller(seededCursor(), d).p.tick();
+    assert.equal(fixedTitles(d), 1);
+    assert.equal(d.sent[0]!.threadId, THREAD);
+  });
+
+  test('fix1-12: to wins over status when both are present', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
+    worker.events.push(statusEvent(1, { to: 'looking', status: 'fixed' }));
+    const d = fakeDiscord();
+    await poller(seededCursor(), d).p.tick();
+    assert.equal(d.sent.length, 0);
+  });
+
+  test('fix1-12: status alone is still read (tolerance): fixed posts, looking does not', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
+    worker.events.push(statusEvent(1, { status: 'looking' }), statusEvent(2, { status: 'fixed', note: 'n' }));
+    const d = fakeDiscord();
+    await poller(seededCursor(), d).p.tick();
+    assert.equal(fixedTitles(d), 1);
+  });
+
+  test('fix1-12: neither to nor status ("not said", not "not fixed") -> the report is asked, and posts when fixed', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', THREAD, { status: 'fixed' }));
+    worker.events.push(statusEvent(1, { from: 'looking' }));
+    const d = fakeDiscord();
+    await poller(seededCursor(), d).p.tick();
+    assert.equal(fixedTitles(d), 1);
+    assert.ok(worker.find('GET', '/agent/reports/LUM-482193').length >= 1);
+  });
+});
+
+describe('fix round 1: events of removed reports (decision 13)', () => {
+  test('fix1-13: a code null event is skipped, the page is read, the next event posts, the cursor moves past both', async () => {
+    worker.reports.set('LUM-000002', discordReport('LUM-000002', T2));
+    worker.events.push(
+      { seq: 1, code: null, at: 1, type: 'status_changed', data: JSON.stringify({ from: 'looking', to: 'fixed' }) },
+      fixedEvent(2, 'LUM-000002'),
+    );
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const { p, log } = poller(file, d);
+    await assert.doesNotReject(p.tick());
+    assert.equal(sentTo(d, T2), 1);
+    assert.equal(d.sent.length, 1);
+    assert.equal(await cursorValue(file), 2);
+    assert.equal(worker.find('GET', /^\/agent\/reports\/(null|undefined)?$/).length, 0, 'no lookup without a code');
+    assert.ok(!log.text().includes('bad_response'), log.text());
+  });
+
+  for (const type of ['created', 'duplicate_linked', 'status_changed'] as const) {
+    test(`fix1-13: a page holding only a code null ${type} event advances the cursor and posts nothing`, async () => {
+      worker.events.push({ seq: 7, code: null, at: 1, type, data: {} });
+      const file = seededCursor();
+      const d = fakeDiscord();
+      await poller(file, d).p.tick();
+      assert.equal(d.sent.length + d.posts.length, 0);
+      assert.equal(await cursorValue(file), 7);
+    });
+  }
+
+  test('fix1-13: a code null event during the fast-forward does not stop it', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055'));
+    worker.events.push(fixedEvent(1, 'LUM-482193'), { seq: 2, code: null, at: 2, type: 'created', data: {} }, fixedEvent(3, 'LUM-482193'));
+    const file = cursorPath(); // missing: fast-forward (decision 8)
+    const d = fakeDiscord();
+    await poller(file, d).p.tick();
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 3);
   });
 });
 
