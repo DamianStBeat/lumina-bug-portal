@@ -299,15 +299,32 @@ Path prefix `/api/v1/desk/*`, protected by Cloudflare Access; the worker also ve
 
 | Method, path | Answer |
 |---|---|
-| `GET /desk/reports?filter=all|fix_ready|needs_person|duplicate|not_bug|waiting&cursor=` | page of 50 |
+| `GET /desk/reports?filter=all|fix_ready|needs_person|duplicate|not_bug|waiting&cursor=` | page of 50: `{reports, nextCursor, counts}` (below) |
 | `GET /desk/reports/{code}` | full report, triage, attachments, frames, linked duplicates |
 | `GET /desk/attachments/{id}/stream` | the object, with HTTP Range support (video playback) |
 | `POST /desk/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?}`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link |
+
+Desk list answer (lead, integration slice, 6 Nov 2026):
+
+- `reports[]`: `code, created_at, updated_at, source, status, verdict, title, what` (first 200 chars), `where_area,
+  device, attachment_count`, and `files: [{kind: "video"|"image", size_bytes}]`: the player's files whose status is
+  not `aborted`, oldest first (`created_at`, then `id`); frames never; `[]` when none.
+- `counts: {all, fix_ready, needs_person, duplicate, not_bug, waiting}`: integers over the whole table with the same
+  conditions as the filters; the same whatever `filter` or `cursor` was asked.
+- Filters: `fix_ready` = status `looking`, verdict `simple_fix`, `pr_url` set. `needs_person` = status `looking` and
+  `pr_url` not set and either verdict `needs_person`, or the report's latest `status_changed` event (highest `seq`)
+  has a `note` beginning `needs_person:` (the agent could not make the simple fix). `duplicate` / `not_bug` /
+  `waiting` = status `duplicate` / `not_bug` / `received`. `all` = every report.
+- The desk row shows the first video, else the first image, as `Video 312 MB · Phone` / `Picture 3 MB · Phone`
+  (MB = bytes / 1 000 000 rounded, at least 1; ` · Device` only when known), `No video` when `files` is empty.
 
 ## Worker bindings and secrets
 
 `DB` (D1), `FILES` (R2), vars `ALLOWED_ORIGINS`, `ENVIRONMENT`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`; secrets
 `TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`. Cron `0 3 * * *` (retention).
+
+Dev only: var `TURNSTILE_VERIFY_URL` replaces Cloudflare's siteverify URL **only when `ENVIRONMENT` is `dev`** (the
+end-to-end run on Valor1 answers it locally, so nothing leaves localhost); with any other `ENVIRONMENT` it is ignored.
 
 ## Player-facing text
 
