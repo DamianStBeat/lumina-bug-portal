@@ -7,10 +7,17 @@ import type {
   CreateAttachmentRes,
   CreateReportBody,
   CreateReportRes,
+  DeskAttachment,
+  DeskAttachmentWire,
   DeskFilter,
   DeskListRes,
+  DeskListRowWire,
+  DeskListWire,
   DeskReport,
+  DeskReportRow,
+  DeskReportWire,
   DeskStatusBody,
+  DeskTriage,
   ListPartsRes,
   PutPartRes,
   StatusRes,
@@ -151,14 +158,76 @@ export function getStatus(code: string): Promise<StatusRes> {
   return call(`/status/${seg(code)}`)
 }
 
-export function deskList(filter: DeskFilter, cursor?: string): Promise<DeskListRes> {
+// The worker sends null for an empty column; the pages read "not set" as absent. A 0 or '' passes unchanged.
+const opt = <T>(v: T | null | undefined): T | undefined => (v === null ? undefined : v)
+
+// Only a JSON object is read as data: the worker answers a stored text that does not parse as that text.
+const asObject = (v: unknown): Record<string, unknown> | undefined =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
+
+// A 2xx without the worker's envelope (a proxy page that happens to be JSON) is a bad gateway, never an empty desk.
+const badAnswer = () => new ApiError(502, 'bad_answer')
+
+const deskRow = (w: DeskListRowWire): DeskReportRow => ({
+  code: w.code,
+  createdAt: w.created_at,
+  updatedAt: w.updated_at,
+  source: w.source,
+  status: w.status,
+  title: opt(w.title),
+  what: w.what,
+  whereArea: opt(w.where_area),
+  device: opt(w.device),
+  verdict: opt(w.verdict),
+  fileCount: w.attachment_count,
+})
+
+const deskAttachment = (a: DeskAttachmentWire): DeskAttachment => ({
+  id: a.id,
+  kind: a.kind,
+  filename: a.filename,
+  mime: a.mime,
+  sizeBytes: a.size_bytes,
+  status: a.status,
+})
+
+export async function deskList(filter: DeskFilter, cursor?: string): Promise<DeskListRes> {
   const q = new URLSearchParams({ filter })
   if (cursor) q.set('cursor', cursor)
-  return call(`/desk/reports?${q}`, { desk: true })
+  const w = await call<DeskListWire>(`/desk/reports?${q}`, { desk: true })
+  if (!Array.isArray(w.reports)) throw badAnswer()
+  return { reports: w.reports.map(deskRow), cursor: opt(w.nextCursor) }
 }
 
-export function deskReport(code: string): Promise<DeskReport> {
-  return call(`/desk/reports/${seg(code)}`, { desk: true })
+export async function deskReport(code: string): Promise<DeskReport> {
+  const w = await call<DeskReportWire>(`/desk/reports/${seg(code)}`, { desk: true })
+  const r = w.report
+  if (!asObject(r) || !Array.isArray(w.attachments) || !Array.isArray(w.duplicates)) throw badAnswer()
+  // The worker lists the agent's frames among the attachments; the page shows them apart from the player's files.
+  const all = w.attachments.map(deskAttachment)
+  return {
+    code: r.code,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+    source: r.source,
+    status: r.status,
+    title: opt(r.title),
+    what: r.what,
+    whereArea: opt(r.where_area),
+    device: opt(r.device),
+    verdict: opt(r.verdict),
+    prUrl: opt(r.pr_url),
+    duplicateOf: opt(r.duplicate_of),
+    lang: opt(r.lang),
+    robloxName: opt(r.roblox_name),
+    robloxUserId: opt(r.roblox_user_id),
+    discordName: opt(r.discord_name),
+    gameContext: asObject(r.game_context),
+    triage: asObject(r.triage) as DeskTriage | undefined,
+    attachments: all.filter((a) => a.kind !== 'frames'),
+    frames: all.filter((a) => a.kind === 'frames'),
+    duplicates: w.duplicates,
+  }
 }
 
 export function deskSetStatus(code: string, body: DeskStatusBody): Promise<void> {

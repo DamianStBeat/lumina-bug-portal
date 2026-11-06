@@ -79,7 +79,8 @@ export default function Desk() {
     }
   }
 
-  // Mark fixed changed one report: its row takes the fresh fields, the attachment summary stays the list's.
+  // Every detail answer refreshes its row: the fresh fields, and the PR link and duplicate target the list answer does
+  // not carry. The file count stays the list's.
   const patchRow = useCallback((next: Partial<DeskReportRow> & { code: string }) => {
     setList((l) => ({ ...l, rows: l.rows.map((r) => (r.code === next.code ? { ...r, ...next } : r)) }))
   }, [])

@@ -6,8 +6,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import path from 'node:path'
 import type { Plugin } from 'vite'
 import type {
-  AttachmentKind, CreateAttachmentRes, CreateReportRes, DeskAttachment, DeskFilter, DeskListRes, DeskReport,
-  DeskReportRow, ListPartsRes, PublicStatus, ReportStatus, StatusRes,
+  AttachmentKind, CreateAttachmentRes, CreateReportRes, DeskAttachment, DeskAttachmentWire, DeskFilter,
+  DeskListRowWire, DeskListWire, DeskReport, DeskReportWire, ListPartsRes, PublicStatus, ReportStatus, StatusRes,
 } from '../src/api/types.ts'
 
 const PART_SIZE = 16777216
@@ -25,10 +25,9 @@ const WHERE = ['match', 'lobby', 'shop', 'crates', 'clan', 'other'] as const
 const DEVICES = ['phone', 'tablet', 'computer', 'console'] as const
 const STATUSES: readonly ReportStatus[] = ['received', 'looking', 'fixed', 'duplicate', 'not_bug', 'closed']
 const FILTERS: readonly DeskFilter[] = ['all', 'fix_ready', 'needs_person', 'duplicate', 'not_bug', 'waiting']
-// The preview's filter pills describe a desk of 128 reports; the five seeded rows are only its first page.
-const SEED_COUNTS: Record<DeskFilter, number> = {
-  all: 128, fix_ready: 6, needs_person: 19, duplicate: 41, not_bug: 22, waiting: 3,
-}
+// The worker's limits on a desk status change (worker/src/lib/validate.ts prUrl, lib/status.ts depth).
+const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/pull\/[1-9]\d{0,9}$/
+const MAX_DUPLICATE_DEPTH = 10
 
 type Report = Omit<DeskReport, 'attachments' | 'frames' | 'duplicates'>
 type Rec = {
@@ -121,51 +120,82 @@ function touch(rec: Rec): void {
 const fileAtts = (code: string) =>
   [...state.atts.values()].filter((a) => a.code === code && (a.kind === 'video' || a.kind === 'image'))
 const liveFiles = (code: string) => fileAtts(code).filter((a) => a.status === 'uploading' || a.status === 'complete')
-const publicAtt = ({ id, kind, filename, mime, sizeBytes, status }: Att): DeskAttachment =>
-  ({ id, kind, filename, mime, sizeBytes, status })
 
-function row(rec: Rec): DeskReportRow {
+// The desk answers below are the worker's shapes (worker/src/routes/desk.ts on main): D1 columns, null when empty.
+function row(rec: Rec): DeskListRowWire {
   const r = rec.report
-  const done = fileAtts(r.code).filter((a) => a.status === 'complete')
-  // Listed field by field: the list row must not leak the detail-only fields (lang, names, triage).
+  const t = times(rec)
+  // Listed field by field: the list row carries no detail-only field (lang, names, triage, PR link, link target).
   return {
-    code: r.code, source: r.source, status: r.status, title: r.title, what: r.what, whereArea: r.whereArea,
-    device: r.device, verdict: r.verdict, prUrl: r.prUrl, duplicateOf: r.duplicateOf,
-    ...times(rec),
-    attachments: {
-      videos: done.filter((a) => a.kind === 'video').length,
-      images: done.filter((a) => a.kind === 'image').length,
-      totalBytes: done.reduce((s, a) => s + a.sizeBytes, 0),
+    code: r.code, created_at: t.createdAt, updated_at: t.updatedAt, source: r.source, status: r.status,
+    verdict: r.verdict ?? null, title: r.title ?? null, what: r.what.slice(0, 200), where_area: r.whereArea ?? null,
+    device: r.device ?? null, attachment_count: fileAtts(r.code).filter((a) => a.status !== 'aborted').length,
+  }
+}
+
+function detail(rec: Rec): DeskReportWire {
+  const r = rec.report
+  const t = times(rec)
+  // The mock keeps no clock per file: the report's stands in (the desk reads neither time).
+  const wire = ({ id, kind, filename, mime, sizeBytes, status }: Att): DeskAttachmentWire => ({
+    id, kind, filename, mime, size_bytes: sizeBytes, status, created_at: t.createdAt,
+    completed_at: status === 'complete' ? t.updatedAt : null,
+  })
+  return {
+    report: {
+      code: r.code, created_at: t.createdAt, updated_at: t.updatedAt, source: r.source, status: r.status,
+      title: r.title ?? null, what: r.what, where_area: r.whereArea ?? null, device: r.device ?? null,
+      lang: r.lang ?? null, roblox_name: r.robloxName ?? null, roblox_user_id: r.robloxUserId ?? null,
+      discord_name: r.discordName ?? null, game_context: r.gameContext ?? null, verdict: r.verdict ?? null,
+      triage: r.triage ?? null, duplicate_of: r.duplicateOf ?? null, pr_url: r.prUrl ?? null,
     },
+    // Frames among the attachments, in creation order, as the worker lists them.
+    attachments: [...state.atts.values()].filter((a) => a.code === r.code).map(wire),
+    duplicates: [...state.reports.values()].filter((d) => d.report.duplicateOf === r.code).map((d) => d.report.code),
   }
 }
 
-function detail(rec: Rec): DeskReport {
-  const code = rec.report.code
-  return {
-    ...rec.report,
-    ...times(rec),
-    attachments: fileAtts(code).map(publicAtt),
-    frames: [...state.atts.values()].filter((a) => a.code === code && a.kind === 'frames').map(publicAtt),
-    duplicates: [...state.reports.values()].filter((r) => r.report.duplicateOf === code).map((r) => r.report.code),
-  }
-}
-
+// The worker's tabs (desk.ts FILTERS): a person's status wins over the verdict, and fix_ready needs the PR.
 const MATCH: Record<DeskFilter, (r: Report) => boolean> = {
   all: () => true,
-  fix_ready: (r) => r.verdict === 'simple_fix',
-  needs_person: (r) => r.verdict === 'needs_person',
+  fix_ready: (r) => r.verdict === 'simple_fix' && !!r.prUrl && r.status === 'looking',
+  needs_person: (r) => r.verdict === 'needs_person' && r.status === 'looking',
   duplicate: (r) => r.status === 'duplicate',
-  not_bug: (r) => r.status === 'not_bug' || r.status === 'closed',
+  not_bug: (r) => r.status === 'not_bug',
   waiting: (r) => r.status === 'received',
 }
 
-function publicStatus(code: string, hops = 0): PublicStatus {
-  const r = state.reports.get(code)?.report
-  // A duplicate shows its original's status; a broken or looping chain shows "looking", where duplicates stand.
-  if (r?.status === 'duplicate') return r.duplicateOf && hops < 5 ? publicStatus(r.duplicateOf, hops + 1) : 'looking'
-  if (r?.status === 'not_bug' || r?.status === 'closed') return 'checked'
-  return r?.status ?? 'looking'
+const PUBLIC: Partial<Record<ReportStatus, PublicStatus>> = {
+  received: 'received', looking: 'looking', fixed: 'fixed', not_bug: 'checked', closed: 'checked',
+}
+
+// As worker/src/lib/status.ts: a duplicate answers its original's status and the latest updatedAt along the chain; a
+// missing original, a loop or a chain too deep shows `checked`.
+function publicStatus(rec: Rec): { status: PublicStatus; updatedAt: number } {
+  let r = rec.report
+  let updatedAt = times(rec).updatedAt
+  for (let depth = 0; r.status === 'duplicate'; depth++) {
+    const next = r.duplicateOf ? state.reports.get(r.duplicateOf) : undefined
+    if (!next || depth >= MAX_DUPLICATE_DEPTH) return { status: 'checked', updatedAt }
+    r = next.report
+    updatedAt = Math.max(updatedAt, times(next).updatedAt)
+  }
+  return { status: PUBLIC[r.status] ?? 'looking', updatedAt }
+}
+
+// The original a manual `duplicate` links to (worker lib/duplicates.ts): the target's root, never the report itself.
+function rootOf(code: string, target: unknown): string {
+  if (typeof target !== 'string' || !/^LUM-\d{6}$/.test(target) || target === code) fail(400, 'invalid_duplicate_of')
+  const seen = new Set([code, target as string])
+  let at = state.reports.get(target as string) ?? fail(400, 'invalid_duplicate_of')
+  for (let depth = 1; at.report.status === 'duplicate' && at.report.duplicateOf && depth < MAX_DUPLICATE_DEPTH; depth++) {
+    const next = state.reports.get(at.report.duplicateOf)
+    if (!next) break
+    if (seen.has(next.report.code)) fail(409, 'duplicate_cycle')
+    seen.add(next.report.code)
+    at = next
+  }
+  return at.report.code
 }
 
 class HttpError extends Error {
@@ -355,25 +385,20 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
   if ((m = at(/^\/status\/(LUM-\d{6})$/, 'GET'))) {
     const rec = state.reports.get(m[1]!)
     if (!rec) throw new HttpError(404, 'not_found')
-    const { code } = rec.report
-    return send(res, 200, { code, status: publicStatus(code), updatedAt: times(rec).updatedAt } satisfies StatusRes)
+    return send(res, 200, { code: rec.report.code, ...publicStatus(rec) } satisfies StatusRes)
   }
 
   if (at(/^\/desk\/reports$/, 'GET')) {
-    const filter = oneOf(url.searchParams.get('filter'), FILTERS) ?? 'all'
+    const filter = url.searchParams.get('filter') ?? 'all'
+    if (!FILTERS.includes(filter as DeskFilter)) throw new HttpError(400, 'invalid_filter')
+    // The worker's cursor is opaque to the desk; an offset is enough here. No tab counts: the worker sends none.
     const offset = Number(url.searchParams.get('cursor') || 0)
-    if (!Number.isInteger(offset) || offset < 0) throw new HttpError(400, 'bad_cursor')
+    if (!Number.isInteger(offset) || offset < 0) throw new HttpError(400, 'invalid_cursor')
     const all = [...state.reports.values()].sort((a, b) => times(b).createdAt - times(a).createdAt)
-    const hits = all.filter((r) => MATCH[filter](r.report))
-    const counts = { ...SEED_COUNTS }
-    // Reports made in this dev session are added on top of the preview's totals.
-    for (const r of all) {
-      if (r.report.code < `LUM-${FIRST_CODE}`) continue
-      for (const f of FILTERS) if (MATCH[f](r.report)) counts[f]++
-    }
+    const hits = all.filter((r) => MATCH[filter as DeskFilter](r.report))
     const page = hits.slice(offset, offset + PAGE).map(row)
-    const next = offset + PAGE < hits.length ? String(offset + PAGE) : undefined
-    return send(res, 200, { reports: page, cursor: next, counts } satisfies DeskListRes)
+    const nextCursor = offset + PAGE < hits.length ? String(offset + PAGE) : null
+    return send(res, 200, { reports: page, nextCursor } satisfies DeskListWire)
   }
   if ((m = at(/^\/desk\/reports\/(LUM-\d{6})$/, 'GET'))) return send(res, 200, detail(needReport(m[1]!)))
   if ((m = at(/^\/desk\/attachments\/([\w-]+)\/stream$/, 'GET'))) {
@@ -382,13 +407,19 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
     return stream(req, res, att, jpg)
   }
   if ((m = at(/^\/desk\/reports\/(LUM-\d{6})\/status$/, 'POST'))) {
-    const rec = needReport(m[1]!)
+    // The worker's order (desk.ts setStatus): the body's fields first, then the report, then the link.
     const b = await readJson(req)
-    const status = oneOf(b.status, STATUSES)
-    if (!status) throw new HttpError(400, 'bad_request')
-    const prUrl = optStr(b.prUrl, 300)
+    if (!STATUSES.includes(b.status as ReportStatus)) throw new HttpError(400, 'invalid_status')
+    const status = b.status as ReportStatus
+    const pr = b.prUrl ?? null
+    if (pr !== null && (typeof pr !== 'string' || pr.length > 300 || !PR_URL.test(pr))) fail(400, 'invalid_pr_url')
+    if (b.note != null && (typeof b.note !== 'string' || [...b.note.trim()].length > 2000)) fail(400, 'invalid_note')
+    // A link only with `duplicate`; any other status clears it.
+    if (status !== 'duplicate' && b.duplicateOf != null) fail(400, 'invalid_duplicate_of')
+    const rec = needReport(m[1]!)
+    rec.report.duplicateOf = status === 'duplicate' ? rootOf(rec.report.code, b.duplicateOf) : undefined
     rec.report.status = status
-    if (prUrl) rec.report.prUrl = prUrl
+    if (typeof pr === 'string') rec.report.prUrl = pr
     touch(rec)
     return send(res, 200, { ok: true })
   }
