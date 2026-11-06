@@ -96,13 +96,14 @@ def video_sheets(cfg: Config, src: Path, work: Path) -> tuple[int, list[Path]]:
     frames_dir = work / f"{src.stem}-frames"
     frames_dir.mkdir(mode=0o700)
     vf = r"scale=640:-2,select='gt(scene\,0.08)+isnan(prev_selected_t)+gte(t-prev_selected_t\,2)'"
-    if FONT.is_file():
-        vf += (
-            f",drawtext=fontfile={FONT}:text='%{{pts\\:gmtime\\:0\\:%M\\\\\\:%S}}'"
-            ":x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6"
-        )
-    else:
-        log("no font for timestamps", font=FONT)
+    if not FONT.is_file():
+        log("no font file for timestamps, fontconfig Sans", font=FONT)
+    # Never a sheet without times: if drawtext cannot draw with either font, ffmpeg fails and the file is ffmpeg_failed.
+    font = f"fontfile={FONT}" if FONT.is_file() else "font=Sans"
+    vf += (
+        f",drawtext={font}:text='%{{pts\\:gmtime\\:0\\:%M\\\\\\:%S}}'"
+        ":x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6"
+    )
     _ffmpeg(cfg, src, ["-vf", vf, "-fps_mode", "vfr", "-q:v", "3", str(frames_dir / "f-%05d.jpg")],
             FRAMES_TIMEOUT, frames_dir)  # fmt: skip
     found = sorted(frames_dir.glob("f-*.jpg"))

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ MAX_LINES = 150
 BUILDER_TIMEOUT = 1800
 REDTEAM_TIMEOUT = 1800
 GH_TIMEOUT = 300
+STATUS_PAUSES = (1, 2, 0)  # seconds after each of the 3 status tries: 3 s of backoff in all (the lead's cap: 5 s)
 REDTEAM_NOT_RUN = 4  # redteam_fast.sh: no verdict (CLI, auth, network or usage limit); never a pass
 PR_URL_RX = re.compile(r"https://github\.com/.+/pull/\d+")
 IDENTITY = ("DamianStBeat", "205100563+DamianStBeat@users.noreply.github.com")
@@ -67,10 +69,38 @@ def run(cfg: Config, client: Client, cache: Cache, code: str, row: dict[str, Any
             reason = "agent_failed"
     body = {"status": "looking", "prUrl": url} if url else {"status": "looking", "note": f"needs_person: {reason}"}
     log("stage C", code=code, result="draft_pr" if url else reason)
-    try:
-        client.post_json(f"/agent/reports/{code}/status", body)
-    except WorkerError as exc:  # the triage is already posted; a person still sees the report as looking
-        log("status failed", code=code, status=exc.status or "none")
+    post_status(client, cache, code, body)
+
+
+def post_status(client: Client, cache: Cache, code: str, body: dict[str, Any]) -> None:
+    """3 tries in the round; still failing, it waits in the cache's pending_status for the next rounds (send_pending).
+    The queue never offers this report again once triaged: without it the PR link or the note would be lost."""
+    for pause in STATUS_PAUSES:
+        try:
+            client.post_json(f"/agent/reports/{code}/status", body)
+            return
+        except WorkerError as exc:
+            log("status failed", code=code, status=exc.status or "none")
+        time.sleep(pause)
+    cache.add_pending_status(code, json.dumps(body))
+    log("status pending", code=code)
+
+
+def send_pending(client: Client, cache: Cache) -> None:
+    """Once per round, before the queue: each pending status once; kept on 5xx, 408, 429 or no answer (then stop)."""
+    for code, body in cache.pending_statuses():
+        try:
+            client.post_json(f"/agent/reports/{code}/status", json.loads(body))
+        except WorkerError as exc:
+            if exc.status is None or exc.status >= 500 or exc.status in (408, 429):
+                log("status still pending", code=code, status=exc.status or "none")
+                if exc.status is None:  # unreachable: every other try would wait its own timeout
+                    break
+                continue
+            log("status dropped", code=code, status=exc.status)  # the worker refuses it: resending cannot help
+        else:
+            log("status sent", code=code)
+        cache.drop_pending_status(code)
 
 
 def attempt(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any], stage_b: dict[str, Any],
@@ -78,15 +108,18 @@ def attempt(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any]
     branch = f"bugfix/{code.lower()}"
     brief = tmp / "fix-brief.md"  # the builder's brief is also the red teams' brief: one acceptance for both
     brief.write_text(prompt(code, stage_a, stage_b), encoding="utf-8")
+    # rc 1: absent, so this attempt creates it and every way out deletes it; an existing one is not ours (a person's).
+    if triage.git(cfg, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") != 1:
+        raise FixFailed("worktree_failed")
+    wt: Path | None = None
     try:
-        wt = triage.add_worktree(cfg, "c", code, branch=branch)
-    except triage.GitError:
-        # Not ours to delete: the branch may already exist (a person's, or a killed round's), which is why it failed.
-        raise FixFailed("worktree_failed") from None
-    try:
+        wt = triage.add_worktree(cfg, "c", code, branch=branch)  # a failed add removes its half-made worktree itself
         return build_and_open(cfg, code, row, stage_a, stage_b, wt, brief, tmp, branch)
+    except triage.GitError:  # raised only by add_worktree: build_and_open's git calls return codes
+        raise FixFailed("worktree_failed") from None
     finally:
-        triage.remove_worktree(cfg, wt)
+        if wt is not None:
+            triage.remove_worktree(cfg, wt)
         # On success too: the branch lives on the fork now, and the shared clone keeps no stale bugfix/* branches.
         triage.git(cfg, "branch", "-D", branch)
 

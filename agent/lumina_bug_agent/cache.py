@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS dry_runs(code TEXT PRIMARY KEY, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS reports(code TEXT PRIMARY KEY, title TEXT, summary TEXT, verdict TEXT, status TEXT,
   at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+-- Status POSTs not delivered yet (fix.post_status), sent again at the start of each round.
+CREATE TABLE IF NOT EXISTS pending_status(code TEXT PRIMARY KEY, body TEXT NOT NULL, at INTEGER NOT NULL);
 """
 KEEP_REPORTS = 200
 
@@ -61,7 +63,7 @@ class Cache:
     def mark_dry_run(self, code: str) -> None:
         self._db.execute("INSERT OR REPLACE INTO dry_runs(code, at) VALUES(?, ?)", (code, int(time.time())))
 
-    def remember(self, code: str, title: str, summary: str, verdict: str, status: str) -> None:
+    def remember(self, code: str, title: str, summary: str, verdict: str | None, status: str | None) -> None:
         self._db.execute(
             "INSERT OR REPLACE INTO reports(code, title, summary, verdict, status, at) VALUES(?, ?, ?, ?, ?, ?)",
             (code, title, summary, verdict, status, int(time.time())),
@@ -71,7 +73,7 @@ class Cache:
             (KEEP_REPORTS,),
         )
 
-    def recent(self, exclude: str) -> list[dict[str, str]]:
+    def recent(self, exclude: str) -> list[dict[str, str | None]]:
         rows = self._db.execute(
             "SELECT code, title, summary, verdict, status FROM reports WHERE code != ? ORDER BY at DESC, rowid DESC"
             " LIMIT ?",
@@ -79,9 +81,23 @@ class Cache:
         ).fetchall()
         return [dict(zip(("code", "title", "summary", "verdict", "status"), r)) for r in rows]
 
+    def knows(self, code: str) -> bool:
+        return self._db.execute("SELECT 1 FROM reports WHERE code = ?", (code,)).fetchone() is not None
+
     def set_status(self, code: str, status: str) -> None:
-        # Only reports already remembered: an event about an unknown report adds nothing to compare against.
+        # Only reports already remembered: run.py seeds unknown ones from created/triaged events first.
         self._db.execute("UPDATE reports SET status = ? WHERE code = ?", (status, code))
+
+    def add_pending_status(self, code: str, body: str) -> None:
+        # One per report: a newer status of the same report replaces an older one that never got through.
+        self._db.execute("INSERT OR REPLACE INTO pending_status(code, body, at) VALUES(?, ?, ?)",
+                         (code, body, int(time.time())))  # fmt: skip
+
+    def pending_statuses(self) -> list[tuple[str, str]]:
+        return [(str(c), str(b)) for c, b in self._db.execute("SELECT code, body FROM pending_status ORDER BY at")]
+
+    def drop_pending_status(self, code: str) -> None:
+        self._db.execute("DELETE FROM pending_status WHERE code = ?", (code,))
 
     def meta(self, key: str) -> str | None:
         row = self._db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()

@@ -26,6 +26,7 @@ MAX_FAILURES = 3
 PLAYER_FIELDS = ("source", "title", "what", "where_area", "device", "lang")
 STATUSES = ("received", "looking", "fixed", "duplicate", "not_bug", "closed")
 EVENT_PAGES = 10
+MAX_SEEDS = 50  # GET /agent/reports/{code} per round for codes the cache does not know (sync_events)
 
 
 def _terminate(signum: int, _frame: Any) -> None:
@@ -83,8 +84,11 @@ class Round:
     def __init__(self, cfg: Config, client: Client, cache: Cache) -> None:
         self.cfg, self.client, self.cache = cfg, client, cache
         self.fetched = False  # `git fetch` once per round, on the first stage B
+        self.seeds = 0  # reports fetched this round to fill the duplicate list (sync_events)
 
     def run(self) -> None:
+        if not self.cfg.dry_run:
+            fix.send_pending(self.client, self.cache)  # status POSTs an earlier round could not deliver
         try:
             answer = self.client.get_json(f"/agent/queue?limit={self.cfg.max_reports_per_round}")
         except WorkerError as exc:
@@ -157,8 +161,10 @@ class Round:
             headers = {"Content-Type": "image/jpeg", "X-Filename": f"frames-{att_id}-{n}.jpg"}
             try:
                 self.client.post_bytes(f"/agent/reports/{code}/frames", sheet.read_bytes(), headers)
-            except WorkerError as exc:  # the sheets help a person; the triage does not depend on them
+            except WorkerError as exc:
+                # A failed attempt, before stage A: once triaged the report leaves the queue, its sheets unsent.
                 log("frames upload failed", code=code, attachment=att_id, status=exc.status or "none")
+                raise
         if dry:
             for step in ("run stage A", "run stage B", "post triage"):
                 log(f"dry run: would {step}", code=code, images=len(images))
@@ -194,7 +200,7 @@ class Round:
         return triage.run(self.cfg, code, stage_a, _game_context(row), self.cache.recent(exclude=code))
 
     def sync_events(self) -> None:
-        """Statuses of remembered reports from GET /agent/events; a failure only leaves them a little stale."""
+        """Statuses of remembered reports, and unknown ones (seed), from GET /agent/events; a failure is not fatal."""
         cursor = self.cache.meta("events_cursor") or "0"
         try:
             for _ in range(EVENT_PAGES):
@@ -217,6 +223,8 @@ class Round:
     def apply_event(self, ev: Any) -> None:
         if not isinstance(ev, dict) or not isinstance(ev.get("code"), str):
             return
+        if ev.get("type") in ("created", "triaged"):
+            self.seed(ev["code"])
         data = ev.get("data")
         if isinstance(data, str):
             try:
@@ -228,6 +236,34 @@ class Round:
             status = "duplicate"
         if status in STATUSES:
             self.cache.set_status(ev["code"], status)
+
+    def seed(self, code: str) -> None:
+        """An unknown report joins the duplicate list: its title and the triage's summary, never the player's text."""
+        if self.seeds >= MAX_SEEDS or not CODE_RX.fullmatch(code) or self.cache.knows(code):
+            return
+        self.seeds += 1
+        try:
+            answer = self.client.get_json(f"/agent/reports/{code}")
+        except WorkerError as exc:
+            log("seed failed", code=code, status=exc.status or "none")
+            return
+        row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
+        if not isinstance(row, dict):
+            log("seed failed", code=code, status="bad_answer")
+            return
+        found = row.get("triage")  # a JSON string in D1, null until triaged
+        if isinstance(found, str):
+            try:
+                found = json.loads(found)
+            except ValueError:
+                found = None
+        stage_b = found.get("stage_b") if isinstance(found, dict) else None
+        summary = stage_b.get("summary") if isinstance(stage_b, dict) else None
+        title, verdict, status = row.get("title"), row.get("verdict"), row.get("status")
+        self.cache.remember(code, title[:200] if isinstance(title, str) else "",
+                            summary[:300] if isinstance(summary, str) else "",
+                            verdict if isinstance(verdict, str) else None,  # None: not triaged yet, not a verdict
+                            status if status in STATUSES else None)  # fmt: skip
 
     def stage_a_prompt(self, row: dict[str, Any]) -> str:
         data: dict[str, Any] = {k: row.get(k) for k in PLAYER_FIELDS}
