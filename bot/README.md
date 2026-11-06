@@ -7,14 +7,18 @@ worker (with the bearer `AGENT_KEY`). See `../CONTRACT.md` for the worker API.
 
 - **`/bug`** (guild command): opens a form with "What happened?", "Where in the game?" and one video or picture.
   On submit it creates the report, opens a post in the bug forum with the player's text (and the file when it fits
-  the server's upload limit), replies in that post with "We have it · LUM-xxxxxx", copies the file into the
-  archive, and answers the player privately with the code and the "Add a bigger video" link.
+  the server's upload limit and 25 MiB, one such re-post at a time, for the 300 MB memory cap), replies in that post
+  with "We have it · LUM-xxxxxx", answers the player privately with the code and the "Add a bigger video" link, then
+  copies the file into the archive. "Where in the game?" is free text: Match, Lobby, Shop, Crate(s), Clan, Something
+  else or Other become the report's area; anything else becomes "other" and the typed words are kept in the text.
 - **New posts in the bug forum** by players (not bots, not webhooks): creates a report from the title and first
   message, replies "We have it · LUM-xxxxxx" with the "Add a bigger video" and "See status" buttons, and copies each
   video or picture (at most 3, up to 2 GiB, streamed part by part) into the archive. Other files (an `.exe`, for
   example) are not copied.
 - **Events** (every 20 s, cursor in `~/.local/state/lumina-bug-bot/cursor`): "Fixed" and "Same bug" posts in the
-  report's thread; reports from the game get their own forum post "Bug report: …" with the game context.
+  report's thread; reports from the game get their own forum post "Bug report: …" with the game context. An event
+  Discord or the worker refuses for good (deleted or locked thread, missing permission, report gone) is skipped
+  with a log line; a temporary failure is retried for 5 rounds, then skipped with an error line.
 - Every message refuses to ping anyone (`allowedMentions: { parse: [] }`), and player text is shown literally.
 - If the worker is down, the player reads "Couldn't send it. Try again in a minute." and the bot keeps running.
 
@@ -37,6 +41,10 @@ worker (with the bearer `AGENT_KEY`). See `../CONTRACT.md` for the worker API.
 `~/.config/lumina-bug-portal/bot.env`, mode 600, never in the repository. Names and placeholders are in
 `bot.env.example`: `DISCORD_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`, `BUG_FORUM_CHANNEL_ID`,
 `PORTAL_API_BASE` (including `/api/v1`), `AGENT_KEY`, `SITE_BASE`, optional `LUMINA_BOT_STATE_DIR`.
+
+When the cursor file is missing (first start, or a lost state dir) or unreadable, the bot skips the event history
+and starts from the newest event, so past "Fixed" and "Same bug" posts are not repeated. To post every past event
+instead, start it once with `LUMINA_BOT_REPLAY=1` in `bot.env`, then remove the line.
 
 ## Register the command
 

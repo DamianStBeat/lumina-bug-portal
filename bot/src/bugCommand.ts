@@ -18,13 +18,47 @@ import {
 } from 'discord.js';
 import type { Config, Logger } from './config.ts';
 import { copyAttachments, sanitiseFilename } from './files.ts';
-import { errorTag, type FetchLike, type PortalApi } from './portal.ts';
-import { type BotReply, bugForumPost, sentReply, tryAgain, weHaveIt } from './text.ts';
+import { errorTag, type FetchLike, type PortalApi, type WhereArea } from './portal.ts';
+import { type BotReply, bugForumPost, cut, sentReply, tryAgain, weHaveIt } from './text.ts';
 
 export type BotDeps = { api: PortalApi; config: Config; log: Logger };
 export type FileDeps = BotDeps & { fetchImpl: FetchLike };
 
 export const BUG_MODAL_ID = 'bug-modal';
+
+const WHAT_MAX = 2000; // CONTRACT.md: what <= 2000
+// Discord's re-upload holds about twice the file in memory and the service has MemoryMax=300M: above this the
+// post carries the text only, the archive copy (streamed) keeps the file.
+const REPOST_MAX_BYTES = 25 * 1024 * 1024;
+// One re-post at a time for the same reason; module state, so it covers every interaction of this process.
+let repostInFlight = false;
+
+// The approved modal has a free text field (its placeholder lists the areas); the worker takes only CONTRACT's
+// where_area values, so the typed text is mapped on the whole field. A Map, not an object: a player typing
+// "constructor" must not find a prototype property.
+const WHERE_AREAS = new Map<string, WhereArea>([
+  ['match', 'match'],
+  ['lobby', 'lobby'],
+  ['shop', 'shop'],
+  ['clan', 'clan'],
+  ['crate', 'crates'],
+  ['crates', 'crates'],
+  ['something else', 'other'],
+  ['other', 'other'],
+]);
+
+/**
+ * The report's `what` and `where` from the two fields. A place that is not an area becomes `other`, and the typed
+ * words are kept at the end of `what` so the team still reads them; only that suffix is cut to fit, never the
+ * player's own text. Empty means "not said": no `where` at all.
+ */
+export function placeReport(what: string, typedWhere: string): { what: string; where?: WhereArea } {
+  const typed = typedWhere.trim();
+  if (!typed) return { what };
+  const area = WHERE_AREAS.get(typed.toLowerCase().replace(/\.$/, ''));
+  if (area) return { what, where: area };
+  return { what: what + cut(`\n\nWhere: ${typed}`, WHAT_MAX - what.length), where: 'other' };
+}
 
 export function bugCommandData(): RESTPostAPIChatInputApplicationCommandsJSONBody {
   return new SlashCommandBuilder().setName('bug').setDescription('Report a bug in Lumina').toJSON();
@@ -96,7 +130,7 @@ export async function handleBugModalSubmit(i: ModalSubmitInteraction, deps: File
 
   // Optional fields Discord leaves out read as empty; a missing `what` fails the create below like a worker refusal.
   const what = readField(() => i.fields.getTextInputValue('what'), '');
-  const where = readField(() => i.fields.getTextInputValue('where'), '').trim();
+  const where = readField(() => i.fields.getTextInputValue('where'), '');
   const file: Attachment | undefined = readField(() => i.fields.getUploadedFiles('file', false)?.first(), undefined);
 
   let created: { code: string; reportToken: string };
@@ -105,8 +139,7 @@ export async function handleBugModalSubmit(i: ModalSubmitInteraction, deps: File
     created = await api.createDiscordReport({
       discordUserId: i.user.id,
       discordName: playerName(i.user, i.member),
-      what,
-      ...(where ? { where } : {}),
+      ...placeReport(what, where),
     });
   } catch (err) {
     log.warn('bug report not created', { user: i.user.id, error: errorTag(err) });
@@ -130,7 +163,7 @@ export async function handleBugModalSubmit(i: ModalSubmitInteraction, deps: File
 
   // After the answer: a large video can take minutes, and the player should not wait on it.
   if (file) {
-    const res = await copyAttachments(api, code, reportToken, [file], deps.fetchImpl).catch(() => undefined);
+    const res = await copyAttachments(api, code, reportToken, [file], deps.fetchImpl, log).catch(() => undefined);
     log.info('bug file copy', { code, ...res });
   }
 }
@@ -145,8 +178,12 @@ async function postToForum(
 ): Promise<string> {
   const forum = await i.client.channels.fetch(deps.config.forumChannelId);
   if (!forum || forum.type !== ChannelType.GuildForum) throw new Error('forum channel unavailable');
-  // A file over this server's upload limit stays in the archive only; the post carries the text.
-  const files = file && file.size <= i.attachmentSizeLimit ? [{ attachment: file.url, name: sanitiseFilename(file.name) }] : [];
+  // A file over this server's upload limit or the memory ceiling stays in the archive only; the post carries the text.
+  const fits = file !== undefined && file.size <= Math.min(i.attachmentSizeLimit, REPOST_MAX_BYTES);
+  const repost = fits && !repostInFlight;
+  if (fits && !repost) deps.log.info('bug file not re-posted, another re-post in flight', { code });
+  const files = repost ? [{ attachment: file.url, name: sanitiseFilename(file.name) }] : [];
+  if (repost) repostInFlight = true;
   let thread;
   try {
     thread = await forum.threads.create(bugForumPost(what, files));
@@ -154,6 +191,8 @@ async function postToForum(
     if (files.length === 0) throw err;
     deps.log.warn('bug post with file refused, posting text only', { code, error: errorTag(err) });
     thread = await forum.threads.create(bugForumPost(what));
+  } finally {
+    if (repost) repostInFlight = false;
   }
   try {
     await thread.send(weHaveIt(code, deps.config.siteBase));

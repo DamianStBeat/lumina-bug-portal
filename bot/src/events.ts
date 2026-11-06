@@ -1,10 +1,30 @@
 // Follows the worker's event log and tells Discord what changed (brief rows 5 and 6). The cursor is written after
-// every handled event, so a restart never posts one twice; a failure stops the batch and the next tick retries it.
+// every handled event, so a restart never posts one twice. A transient failure stops the batch (order matters) for at
+// most MAX_ATTEMPTS ticks; a permanent one, or the last attempt, skips the event so the stream behind it moves on.
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { DiscordAPIError } from 'discord.js';
 import type { Config, Logger } from './config.ts';
 import { errorTag, type PortalApi, PortalError, type PortalEvent, type PublicStatus, toPublicStatus } from './portal.ts';
 import { type BotMessage, fixed, gameReportPost, sameBug } from './text.ts';
+
+const MAX_ATTEMPTS = 5;
+
+/** "missing" is "never polled here" and "unparsable" a damaged file: neither is a cursor of 0. */
+export type CursorState = number | 'missing' | 'unparsable';
+
+type CodedEvent = PortalEvent & { code: string };
+
+/**
+ * A refusal that the same event would get on every retry. Worker: the report is gone (404). Discord: every 4xx but a
+ * rate limit (10003 Unknown Channel, 10008 Unknown Message, 50001 Missing Access, 50013 Missing Permissions, 50083
+ * archived thread, 40058/40067 forum tag rules, ...). Timeouts, network errors and 5xx are transient.
+ */
+export function isPermanent(err: unknown): boolean {
+  if (err instanceof PortalError) return err.status === 404;
+  if (err instanceof DiscordAPIError) return err.status >= 400 && err.status < 500 && err.status !== 429;
+  return false;
+}
 
 export class CursorStore {
   private readonly file: string;
@@ -13,17 +33,17 @@ export class CursorStore {
     this.file = file;
   }
 
-  /** 0 when the file is missing or unparsable ("never polled"); any other read error is thrown, not guessed. */
-  async read(): Promise<number> {
+  /** Any read error other than a missing file is thrown, not guessed. */
+  async read(): Promise<CursorState> {
     let text: string;
     try {
       text = await readFile(this.file, 'utf8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'missing';
       throw err;
     }
     const t = text.trim();
-    return /^\d+$/.test(t) ? Number(t) : 0;
+    return /^\d+$/.test(t) ? Number(t) : 'unparsable';
   }
 
   /** Temp file + rename: a crash leaves the old cursor or the new one, never half a number. */
@@ -65,9 +85,14 @@ export class EventPoller {
   // Forum posts made for game reports whose link to the worker failed: the retry links instead of posting again.
   // In memory only, so a restart in that window can still repeat one post.
   private readonly unlinked = new Map<string, string>();
+  // Failed attempts per seq, in memory: a restart gives an event a fresh 5, which is the safe side.
+  private readonly attempts = new Map<number, number>();
+  // Highest seq handled or skipped by this process. The cursor file may lag behind it (a failed write), and an
+  // event at or below it is never handled twice; undefined until the first one.
+  private handled: number | undefined;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
-  private ticking = false;
+  private inFlight: Promise<void> | undefined;
 
   constructor(opts: EventPollerOptions) {
     this.api = opts.api;
@@ -78,20 +103,75 @@ export class EventPoller {
     this.intervalMs = opts.intervalMs ?? 20000;
   }
 
-  /** One pass over the new events; rejects on the first failure, after recording every event handled before it. */
+  /** One pass over the new events; rejects on a transient failure, after recording every event handled before it. */
   async tick(): Promise<void> {
-    const cursor = await this.store.read();
+    const cursor = await this.startCursor();
+    if (cursor === undefined) return;
     const { events } = await this.api.getEvents(cursor);
     const ordered = events.filter((e) => e.seq > cursor).sort((a, b) => a.seq - b.seq);
     for (const event of ordered) {
-      try {
-        await this.handle(event);
-      } catch (err) {
-        this.log.warn('event not handled, retried next tick', { seq: event.seq, code: event.code, error: errorTag(err) });
-        throw err;
-      }
-      await this.store.write(event.seq);
+      await this.handleOrSkip(event);
+      await this.advance(event.seq);
     }
+  }
+
+  /** Where to read from; undefined when this tick skipped the history instead (no usable cursor file). */
+  private async startCursor(): Promise<number | undefined> {
+    const stored = await this.store.read();
+    if (typeof stored === 'number') return Math.max(stored, this.handled ?? 0);
+    // The file could not be written earlier in this process: memory knows where the stream is.
+    if (this.handled !== undefined) return this.handled;
+    if (stored === 'unparsable') this.log.error('cursor file unparsable', { state: stored });
+    if (this.config.replay) {
+      this.log.warn('no cursor: replaying every event from 0 (LUMINA_BOT_REPLAY=1)');
+      return 0;
+    }
+    // A lost or new state dir would otherwise repost every past "Fixed" and "Same bug" in its thread.
+    let after = 0;
+    for (;;) {
+      const { events } = await this.api.getEvents(after);
+      const top = Math.max(after, ...events.map((e) => e.seq));
+      if (top === after) break;
+      after = top;
+    }
+    this.log.warn('no cursor: event history skipped', { seq: after });
+    await this.advance(after);
+    return undefined;
+  }
+
+  private async advance(seq: number): Promise<void> {
+    this.handled = Math.max(this.handled ?? 0, seq);
+    try {
+      await this.store.write(this.handled);
+    } catch (err) {
+      this.log.error('cursor not written, kept in memory', { seq, error: errorTag(err) });
+    }
+  }
+
+  /** Returns when the event is done with (handled or skipped); throws when it should be retried next tick. */
+  private async handleOrSkip(event: PortalEvent): Promise<void> {
+    const ids = { seq: event.seq, code: event.code, type: event.type };
+    if (event.code === null) {
+      this.log.info('event of a removed report skipped', ids);
+      return;
+    }
+    try {
+      await this.handle({ ...event, code: event.code });
+    } catch (err) {
+      const failed = { ...ids, error: errorTag(err) };
+      if (isPermanent(err)) {
+        this.log.warn('event refused for good, skipped', failed);
+      } else {
+        const attempts = (this.attempts.get(event.seq) ?? 0) + 1;
+        if (attempts < MAX_ATTEMPTS) {
+          this.attempts.set(event.seq, attempts);
+          this.log.warn('event not handled, retried next tick', { ...failed, attempts });
+          throw err;
+        }
+        this.log.error('event skipped after the last attempt', { ...failed, attempts });
+      }
+    }
+    this.attempts.delete(event.seq);
   }
 
   /** Polls every intervalMs; the next tick is scheduled only after the previous one ends, so two never overlap. */
@@ -101,10 +181,12 @@ export class EventPoller {
     this.schedule(0);
   }
 
-  stop(): void {
+  /** Resolves when a running tick has ended (it writes its cursor first), at once when none runs. */
+  async stop(): Promise<void> {
     this.running = false;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    await this.inFlight;
   }
 
   private schedule(delayMs: number): void {
@@ -117,19 +199,18 @@ export class EventPoller {
   private async loop(): Promise<void> {
     this.timer = undefined;
     // A stop() and start() during a slow tick must not start a second one beside it.
-    if (this.ticking) return;
-    this.ticking = true;
+    if (this.inFlight) return;
+    const run = this.tick().catch((err: unknown) => this.log.warn('event poll failed', { error: errorTag(err) }));
+    this.inFlight = run;
     try {
-      await this.tick();
-    } catch (err) {
-      this.log.warn('event poll failed', { error: errorTag(err) });
+      await run;
     } finally {
-      this.ticking = false;
+      this.inFlight = undefined;
       this.schedule(this.intervalMs);
     }
   }
 
-  private async handle(event: PortalEvent): Promise<void> {
+  private async handle(event: CodedEvent): Promise<void> {
     switch (event.type) {
       case 'status_changed':
         return this.onStatusChanged(event);
@@ -142,9 +223,11 @@ export class EventPoller {
     }
   }
 
-  private async onStatusChanged(event: PortalEvent): Promise<void> {
-    const status = event.data['status'];
-    // An event that names its status is trusted; only one without it costs a lookup to learn whether it is fixed.
+  private async onStatusChanged(event: CodedEvent): Promise<void> {
+    // The worker writes `{ from, to, note?, prUrl? }`; `status` is read too for tolerance. An event that names its
+    // new status is trusted; only one without it costs a lookup to learn whether it is fixed.
+    const { to, status: named } = event.data;
+    const status = typeof to === 'string' ? to : named;
     if (typeof status === 'string' && status !== 'fixed') return;
     const report = await this.api.getReport(event.code);
     if (typeof status !== 'string' && report.status !== 'fixed') return;
@@ -155,10 +238,12 @@ export class EventPoller {
     this.log.info('fixed posted', { code: event.code, threadId });
   }
 
-  private async onDuplicateLinked(event: PortalEvent): Promise<void> {
+  private async onDuplicateLinked(event: CodedEvent): Promise<void> {
     const report = await this.api.getReport(event.code);
     const threadId = report.discord_thread_id;
-    const original = report.duplicate_of ?? (typeof event.data['duplicateOf'] === 'string' ? event.data['duplicateOf'] : null);
+    // CONTRACT.md does not name the data key: both spellings are read.
+    const named = event.data['duplicateOf'] ?? event.data['duplicate_of'];
+    const original = report.duplicate_of ?? (typeof named === 'string' ? named : null);
     if (!threadId || !original) return;
     await this.discord.sendToThread(threadId, sameBug(event.code, original, await this.originalStatus(original)));
     this.log.info('same bug posted', { code: event.code, threadId });
@@ -176,7 +261,7 @@ export class EventPoller {
     }
   }
 
-  private async onCreated(event: PortalEvent): Promise<void> {
+  private async onCreated(event: CodedEvent): Promise<void> {
     const pending = this.unlinked.get(event.code);
     if (pending !== undefined) {
       await this.api.linkThread(event.code, pending);

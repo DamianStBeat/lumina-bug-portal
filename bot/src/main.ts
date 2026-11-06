@@ -1,21 +1,14 @@
 // The running bot: one gateway connection (outbound only), the handlers, and the event poller. Logs go to stdout
 // (journald under systemd); they carry codes, ids and error names only.
 import path from 'node:path';
-import {
-  ChannelType,
-  Client,
-  DiscordAPIError,
-  Events,
-  GatewayIntentBits,
-  type Interaction,
-  RESTJSONErrorCodes,
-} from 'discord.js';
+import { ChannelType, Client, Events, GatewayIntentBits, type Interaction } from 'discord.js';
 import { type BotDeps, BUG_MODAL_ID, handleBugCommand, handleBugModalSubmit } from './bugCommand.ts';
 import { handleButton } from './buttons.ts';
 import { type Config, ConfigError, type Logger, loadConfig } from './config.ts';
 import { CursorStore, type DiscordSeam, EventPoller } from './events.ts';
 import { handleThreadCreate } from './forumPost.ts';
 import { errorTag, PortalApi } from './portal.ts';
+import { stopThenDestroy } from './shutdown.ts';
 
 function line(level: string, msg: string, data?: unknown): void {
   let extra = '';
@@ -57,21 +50,11 @@ const client = new Client({
   allowedMentions: { parse: [] },
 });
 
-/** A thread deleted since the report was made would block the event stream forever: it is skipped, not retried. */
-function isGone(err: unknown): boolean {
-  return err instanceof DiscordAPIError && err.code === RESTJSONErrorCodes.UnknownChannel;
-}
-
+// A deleted, locked or forbidden thread throws a Discord 4xx here; the poller skips such an event (events.ts
+// isPermanent) instead of letting it block the stream.
 const discord: DiscordSeam = {
   async sendToThread(threadId, message) {
-    let channel;
-    try {
-      channel = await client.channels.fetch(threadId);
-    } catch (err) {
-      if (!isGone(err)) throw err;
-      log.warn('thread gone, event skipped', { threadId });
-      return undefined;
-    }
+    const channel = await client.channels.fetch(threadId);
     if (!channel?.isThread()) {
       log.warn('not a thread, event skipped', { threadId });
       return undefined;
@@ -122,8 +105,8 @@ async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   log.info('stopping', { signal });
-  poller.stop();
-  await client.destroy().catch(() => undefined);
+  // A running tick is let finish (it writes its cursor), at most 5 s: systemd's own stop timeout is longer.
+  await stopThenDestroy(() => poller.stop(), () => client.destroy(), 5000);
   process.exit(0);
 }
 process.on('SIGTERM', () => void shutdown('SIGTERM'));

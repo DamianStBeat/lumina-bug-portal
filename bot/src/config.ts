@@ -14,6 +14,11 @@ export type Config = {
   siteBase: string;
   /** Holds the event cursor; created with mode 700 on first write. */
   stateDir: string;
+  /**
+   * LUMINA_BOT_REPLAY=1: with no usable cursor file the poller handles every event from 0 instead of skipping the
+   * history. Absent means off: a lost state dir must not repost every past "Fixed" by default.
+   */
+  replay?: boolean;
 };
 
 /** Every module logs through this; callers pass codes, ids and error names only, never tokens or player text. */
@@ -63,5 +68,7 @@ export function loadConfig(env: Env): Config {
     agentKey: required(env, 'AGENT_KEY'),
     siteBase: noTrailingSlash(required(env, 'SITE_BASE')),
     stateDir,
+    // Only "1" turns it on: a blank line in bot.env is "not set yet", and "0" or "false" must not mean yes.
+    replay: optional(env, 'LUMINA_BOT_REPLAY') === '1',
   };
 }

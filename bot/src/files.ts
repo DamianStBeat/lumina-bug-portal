@@ -1,6 +1,7 @@
 // Copies a Discord post's videos and pictures into the report's archive (CONTRACT.md "Limits": video/* or image/*,
 // at most 3, each <= 2 GiB). Anything else is never downloaded. One bad file never stops the others or the report.
-import type { FetchLike, PortalApi } from './portal.ts';
+import type { Logger } from './config.ts';
+import { errorTag, type FetchLike, type PortalApi } from './portal.ts';
 
 /** The fields of a discord.js Attachment this module reads (a real Attachment fits). */
 export type MediaAttachment = { name: string; size: number; contentType: string | null; url: string };
@@ -34,6 +35,7 @@ export async function copyAttachments(
   reportToken: string,
   attachments: Iterable<MediaAttachment>,
   fetchImpl: FetchLike,
+  log?: Logger,
 ): Promise<CopyResult> {
   const result: CopyResult = { copied: 0, skipped: 0, failed: 0 };
   let attempted = 0;
@@ -58,8 +60,10 @@ export async function copyAttachments(
         body: res.body,
       });
       result.copied += 1;
-    } catch {
+    } catch (err) {
       result.failed += 1;
+      // The count alone cannot tell a CDN refusal from a worker size_mismatch; the tag can, and carries no secret.
+      log?.warn('file copy failed', { code, error: errorTag(err) });
     } finally {
       // A body never read (the create failed) would hold its connection open.
       if (res?.body && !res.bodyUsed) await res.body.cancel().catch(() => undefined);

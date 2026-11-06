@@ -53,7 +53,11 @@ export type ReportRow = {
   [column: string]: unknown;
 };
 
-export type PortalEvent = { seq: number; code: string; at: number; type: string; data: Record<string, unknown> };
+/** `code` is null when retention removed the report: the worker keeps the event's place in the sequence. */
+export type PortalEvent = { seq: number; code: string | null; at: number; type: string; data: Record<string, unknown> };
+
+/** CONTRACT.md `where_area`: the worker refuses any other value with 400 invalid_where. */
+export type WhereArea = 'lobby' | 'match' | 'shop' | 'crates' | 'clan' | 'other';
 
 export type NewDiscordReport = {
   discordUserId: string;
@@ -61,7 +65,7 @@ export type NewDiscordReport = {
   threadId?: string;
   what: string;
   title?: string;
-  where?: string;
+  where?: WhereArea;
 };
 
 /**
@@ -116,8 +120,11 @@ export class PortalApi {
 
   async getReport(code: string): Promise<ReportRow> {
     const body = await this.call('GET', `/agent/reports/${enc(code)}`, { auth: { kind: 'agent' } });
-    if (!isObject(body) || typeof body['code'] !== 'string') throw new PortalError('bad_response');
-    return body as ReportRow;
+    // CONTRACT.md says "the full report row + attachments" without pinning the shape: a flat row and
+    // `{ report, attachments }` are both read (the agent slice accepts both too).
+    const row = isObject(body) && isObject(body['report']) ? body['report'] : body;
+    if (!isObject(row) || typeof row['code'] !== 'string') throw new PortalError('bad_response');
+    return row as ReportRow;
   }
 
   async getEvents(after: number, limit = 50): Promise<{ events: PortalEvent[]; last: number }> {
@@ -126,12 +133,12 @@ export class PortalApi {
     if (!isObject(body) || !Array.isArray(body['events'])) throw new PortalError('bad_response');
     const events: PortalEvent[] = [];
     for (const e of body['events']) {
-      if (!isObject(e) || !Number.isInteger(e['seq']) || typeof e['code'] !== 'string' || typeof e['type'] !== 'string') {
-        throw new PortalError('bad_response');
-      }
+      // A null code (report removed by retention) is a real event to step over, not a broken page.
+      if (!isObject(e) || !Number.isInteger(e['seq']) || typeof e['type'] !== 'string') throw new PortalError('bad_response');
+      if (e['code'] !== null && typeof e['code'] !== 'string') throw new PortalError('bad_response');
       events.push({
         seq: e['seq'] as number,
-        code: e['code'],
+        code: e['code'] as string | null,
         at: typeof e['at'] === 'number' ? e['at'] : 0,
         type: e['type'],
         data: normaliseData(e['data']),

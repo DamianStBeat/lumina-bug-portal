@@ -1,6 +1,6 @@
 // Every message the bot sends, as plain option objects (texts from plan/preview/shots/discord-thread.png, voice of
-// CONTRACT.md "Player-facing text"). Player text is always escaped and cut to the field it lands in, never put in
-// an embed title, and every message refuses to ping anyone, whatever the text says.
+// CONTRACT.md "Player-facing text"). Player text is escaped in content and embeds (thread names: see threadName) and
+// cut to the field it lands in, never put in an embed title, and every message refuses to ping anyone.
 import {
   ActionRowBuilder,
   type BaseMessageOptions,
@@ -121,10 +121,24 @@ export function tryAgain(): BotReply {
   return { content: "Couldn't send it. Try again in a minute.", allowedMentions: noMentions(), flags: MessageFlags.Ephemeral };
 }
 
+/** Cut by UTF-16 length, as the worker and Discord count, without splitting an emoji in two. */
+export function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const head = text.slice(0, Math.max(0, max));
+  return /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
+}
+
+// C0 and C1 control characters: a name is one line of plain text.
+const CONTROL = /[\u0000-\u001f\u007f-\u009f]/g;
+
+/**
+ * Not escaped: Discord renders no markdown in a post title, so a backslash would show, and a mention in a name never
+ * notifies. Only the first line, without control characters.
+ */
 function threadName(prefix: string, text: string | null | undefined, fallback: string): string {
-  const firstLine = (text ?? '').split('\n')[0]!.trim();
+  const firstLine = (text ?? '').split('\n')[0]!.replace(CONTROL, '').trim();
   if (!firstLine) return fallback;
-  return prefix + escapeCut(firstLine, THREAD_NAME_MAX - prefix.length);
+  return prefix + cut(firstLine, THREAD_NAME_MAX - prefix.length);
 }
 
 /** The forum post `/bug` makes: first line as the name, the whole text as the starter, the file when it fits. */

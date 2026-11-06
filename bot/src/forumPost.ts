@@ -4,17 +4,10 @@ import type { AnyThreadChannel, Message } from 'discord.js';
 import { type FileDeps, playerName } from './bugCommand.ts';
 import { copyAttachments } from './files.ts';
 import { errorTag } from './portal.ts';
-import { tryAgain, weHaveIt } from './text.ts';
+import { cut, tryAgain, weHaveIt } from './text.ts';
 
 const WHAT_MAX = 2000; // CONTRACT.md: what <= 2000; a Nitro message can carry 4000
 const STARTER_RETRY_MS = 1500;
-
-/** Cut by UTF-16 length, as the worker counts, without splitting an emoji in two. */
-function cut(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const head = text.slice(0, max);
-  return /[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head;
-}
 
 /**
  * A forum post's starter message can arrive a moment after the thread (Discord answers Unknown Message meanwhile),
@@ -69,7 +62,7 @@ export async function handleThreadCreate(thread: AnyThreadChannel, newlyCreated:
       log.warn('forum reply not sent', { code, threadId: thread.id, error: errorTag(e) });
     });
     if (starter.attachments.size > 0) {
-      const res = await copyAttachments(api, code, reportToken, starter.attachments.values(), deps.fetchImpl);
+      const res = await copyAttachments(api, code, reportToken, starter.attachments.values(), deps.fetchImpl, log);
       log.info('forum file copy', { code, ...res });
     }
   } catch (err) {
