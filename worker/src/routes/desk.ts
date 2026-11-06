@@ -2,7 +2,9 @@
 // and a status change. Every one of them passes requireDeskAccess first; none sends CORS headers.
 import { type DeskIdentity, requireDeskAccess } from "../lib/access";
 import { CODE_PATTERN } from "../lib/codes";
+import { duplicateTarget, linkDuplicate } from "../lib/duplicates";
 import { apiPath, dispatch, errorResponse, HttpError, json, readJson, type Route, type RouteHandler } from "../lib/http";
+import { reportOf } from "../lib/reports";
 import * as v from "../lib/validate";
 
 const PAGE_SIZE = 50;
@@ -156,24 +158,39 @@ async function setStatus(req: Request, env: Env, code: string, who: DeskIdentity
   if (!status) throw new HttpError(400, "invalid_status");
   const pr = v.prUrl(body.prUrl);
   const note = v.text(body.note, "note", 0, 2000);
-  const report = await env.DB.prepare("SELECT id FROM reports WHERE code = ?").bind(code).first<{ id: string }>();
-  if (!report) throw new HttpError(404, "not_found");
+  // `duplicate` by hand goes through triage's guarded link write (lib/duplicates.ts); any other status clears it below.
+  const dup = duplicateTarget(status === "duplicate", body.duplicateOf, code);
+  if (dup !== null) {
+    await linkDuplicate(env, code, dup, {
+      set: "pr_url = COALESCE(?, pr_url), ",
+      setBinds: [pr],
+      eventPairs: ", 'note', ?, 'prUrl', ?, 'by', 'desk', 'email', ?",
+      eventBinds: [note, pr, who.email],
+      onlyOnChange: false,
+      events: [],
+    });
+    return json({ ok: true });
+  }
+  const report = await reportOf(env, code);
   const now = Date.now();
   // One transaction, the event first: its `from` is read from the row inside the transaction, so a change landing
-  // between our lookup and this batch can never be recorded with a stale previous status.
-  await env.DB.batch([
+  // between our lookup and this batch can never be recorded with a stale previous status. Leaving `duplicate` clears
+  // the link: a stale one would come back, unguarded, if the report were set back later.
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
        SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5, 'by', 'desk', 'email', ?6)
        FROM reports WHERE id = ?1`,
     ).bind(report.id, now, status, note, pr, who.email),
-    env.DB.prepare("UPDATE reports SET status = ?2, pr_url = COALESCE(?3, pr_url), updated_at = ?4 WHERE id = ?1").bind(
+    env.DB.prepare("UPDATE reports SET status = ?2, pr_url = COALESCE(?3, pr_url), duplicate_of = NULL, updated_at = ?4 WHERE id = ?1").bind(
       report.id,
       status,
       pr,
       now,
     ),
   ]);
+  // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
   return json({ ok: true });
 }
 

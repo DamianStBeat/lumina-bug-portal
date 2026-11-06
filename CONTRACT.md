@@ -135,8 +135,8 @@ Header `Authorization: Bearer <AGENT_KEY>`.
 | `GET /agent/reports/{code}` | | the full report row (minus token and ip hashes) + attachments |
 | `GET /agent/attachments/{id}/download` | | the R2 object, streamed |
 | `POST /agent/reports/{code}/frames` | raw `image/jpeg` or `image/png` <= 10 MB, header `X-Filename` | `201 {attachmentId}` (kind `frames`) |
-| `POST /agent/reports/{code}/triage` | `{verdict, triage, duplicateOf?}` | `200`; sets `status=looking` (or `duplicate`/`not_bug`) |
-| `POST /agent/reports/{code}/status` | `{status, prUrl?, note?}` | `200` |
+| `POST /agent/reports/{code}/triage` | `{verdict, triage, duplicateOf?}` | `200`; sets `status=looking` (or `duplicate`/`not_bug`); 400 `invalid_duplicate_of`; 404 `not_found`; 409 `duplicate_cycle`; 409 `duplicate_busy {retryAfter}` (retry after that many seconds) |
+| `POST /agent/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?}` | `200`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link |
 | `POST /agent/reports` | `{source:"discord", discordUserId, discordName, threadId?, what, title?, where?}` | `201 {code, reportToken}` |
 | `POST /agent/reports/{code}/discord` | `{threadId}` | `200` |
 | `GET /agent/events?after=<seq>&limit=n` | | `200 {events:[{seq, code, at, type, data}], last}` |
@@ -152,7 +152,7 @@ Path prefix `/api/v1/desk/*`, protected by Cloudflare Access; the worker also ve
 | `GET /desk/reports?filter=all|fix_ready|needs_person|duplicate|not_bug|waiting&cursor=` | page of 50 |
 | `GET /desk/reports/{code}` | full report, triage, attachments, frames, linked duplicates |
 | `GET /desk/attachments/{id}/stream` | the object, with HTTP Range support (video playback) |
-| `POST /desk/reports/{code}/status` | `{status, prUrl?, note?}` |
+| `POST /desk/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?}`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link |
 
 ## Worker bindings and secrets
 

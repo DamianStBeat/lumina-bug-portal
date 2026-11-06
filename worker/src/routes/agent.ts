@@ -1,11 +1,10 @@
 // Agent and bot routes (CONTRACT.md "Agent and bot"): the Valor1 triage agent and the Discord bot, bearer AGENT_KEY.
 import { requireAgentKey } from "../lib/auth";
 import { CODE_PATTERN, ulid } from "../lib/codes";
-import { eventStatement, type EventType } from "../lib/events";
+import { duplicateTarget, linkDuplicate } from "../lib/duplicates";
 import { apiPath, dispatch, HttpError, json, readBody, readJson, type Route, type RouteHandler } from "../lib/http";
 import { enforceRate } from "../lib/rate";
-import { insertReport } from "../lib/reports";
-import { MAX_DUPLICATE_DEPTH } from "../lib/status";
+import { insertReport, reportOf } from "../lib/reports";
 import * as v from "../lib/validate";
 
 const MINUTE = 60_000;
@@ -15,7 +14,6 @@ const MAX_FRAME_BYTES = 10 * 1024 * 1024;
 const MAX_TRIAGE_BYTES = 32 * 1024;
 // The first bytes of each accepted frame type: the desk serves frames to browsers under the declared type.
 const FRAME_MAGIC: Record<string, number[]> = { "image/jpeg": [0xff, 0xd8, 0xff], "image/png": [0x89, 0x50, 0x4e, 0x47] };
-const CODE_RE = new RegExp(`^${CODE_PATTERN}$`);
 // Discord ids are 64-bit snowflakes: strings, since they do not fit a JS number.
 const SNOWFLAKE = /^\d{1,20}$/;
 
@@ -42,12 +40,6 @@ function parseStored(text: string | null): unknown {
   } catch {
     return null;
   }
-}
-
-async function reportOf(env: Env, code: string): Promise<{ id: string; status: string }> {
-  const row = await env.DB.prepare("SELECT id, status FROM reports WHERE code = ?").bind(code).first<{ id: string; status: string }>();
-  if (!row) throw new HttpError(404, "not_found");
-  return row;
 }
 
 async function queue(env: Env, url: URL): Promise<Response> {
@@ -170,138 +162,37 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
   const triageText = JSON.stringify(body.triage ?? null);
   if (!isObject || new TextEncoder().encode(triageText).byteLength > MAX_TRIAGE_BYTES) throw new HttpError(400, "invalid_triage");
   // A link only on a duplicate verdict, to an existing other report: a stray duplicateOf is an agent bug, refused.
-  const dup = body.duplicateOf;
-  if (verdict !== "duplicate" && dup !== undefined && dup !== null) throw new HttpError(400, "invalid_duplicate_of");
-  if (verdict === "duplicate" && (typeof dup !== "string" || !CODE_RE.test(dup) || dup === code)) {
-    throw new HttpError(400, "invalid_duplicate_of");
-  }
-  const status = verdict === "duplicate" ? "duplicate" : verdict === "not_bug" ? "not_bug" : "looking";
-  if (verdict !== "duplicate") {
-    const report = await reportOf(env, code);
-    const now = Date.now();
-    await env.DB.batch([
-      ...triageWrites(env, report.id, verdict, triageText, status, null, now, null),
-      eventStatement(env, report.id, "triaged", { verdict }, now),
-    ]);
+  const dup = duplicateTarget(verdict === "duplicate", body.duplicateOf, code);
+  if (dup !== null) {
+    await linkDuplicate(env, code, dup, {
+      set: "verdict = ?, triage = ?, ",
+      setBinds: [verdict, triageText],
+      eventPairs: "",
+      eventBinds: [],
+      onlyOnChange: true,
+      events: [{ type: "triaged", data: { verdict } }],
+    });
     return json({ ok: true });
   }
-  // The chain is read first (rootOriginal), then written; another triage may link the same reports in between (B -> A
-  // landing while A -> B is between its read and its write would store A -> B -> A). So every statement of the batch
-  // re-checks what the read decided, inside the transaction: a stale read writes nothing. It is then read again once,
-  // which turns into 409 duplicate_cycle when the other request closed the path, or links to the root it moved to.
-  for (let attempt = 1; ; attempt++) {
-    const report = await reportOf(env, code);
-    const root = await rootOriginal(env, dup as string, code);
-    const duplicateOf = root.code;
-    const guard = cycleGuard(root, code);
-    const now = Date.now();
-    const linked = JSON.stringify({ duplicateOf });
-    const [, updated] = await env.DB.batch([
-      ...triageWrites(env, report.id, verdict, triageText, status, duplicateOf, now, guard),
-      // After the report's own UPDATE the guard still answers the same: it reads the root's row and the chain from
-      // the root, and neither contains this report (the guard just said so), so changing this row moves neither.
-      guardedEvent(env, report.id, "triaged", JSON.stringify({ verdict }), now, guard),
-      guardedEvent(env, report.id, "duplicate_linked", linked, now, guard),
-      // Each report re-pointed below gets the event the bot posts "Same bug" from, as this one does: the same data
-      // string, written before the UPDATE moves them and while they still point here. Same row set as the UPDATE.
-      env.DB.prepare(
-        `INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'duplicate_linked', ? FROM reports
-         WHERE status = 'duplicate' AND duplicate_of = ? AND code <> ? AND ${guard.sql}`,
-      ).bind(now, linked, code, duplicateOf, ...guard.binds),
-      // Reports already linked to this one were linked while it was an original; now that it points at a root, they
-      // point there too. Storing the root covers links made later, this covers the ones made earlier, so every chain
-      // stays one hop whatever order the links are made in, and the read guard's depth limit is never reached.
-      // Only rows still in `duplicate` move: a report a person un-duplicated keeps its stored duplicate_of, untouched.
-      // The root itself is never one of them: it may still point here from before a person un-duplicated it, and
-      // moving it would link it to itself.
-      env.DB.prepare(
-        `UPDATE reports SET duplicate_of = ? WHERE status = 'duplicate' AND duplicate_of = ? AND code <> ? AND ${guard.sql}`,
-      ).bind(duplicateOf, code, duplicateOf, ...guard.binds),
-    ]);
-    if (updated!.meta.changes === 1) return json({ ok: true });
-    if (attempt === 2) {
-      // A report retention removed meanwhile is 404, as on the first lookup; anything else is a chain still moving.
-      await reportOf(env, code);
-      throw new HttpError(409, "duplicate_cycle");
-    }
-  }
-}
-
-type Guard = { sql: string; binds: (string | null)[] };
-
-// The status change and the verdict, only while `guard` holds (always, without one). One batch is one transaction: the
-// new status and its events land together or not at all. The status_changed event goes first and reads `from` from
-// the row inside the transaction, written only when the stored status differs: a desk change landing after our lookup
-// is never lost from the history the bot follows.
-function triageWrites(env: Env, reportId: string, verdict: string, triageText: string, status: string,
-  duplicateOf: string | null, now: number, guard: Guard | null): D1PreparedStatement[] {
-  const where = guard ? ` AND ${guard.sql}` : "";
-  const binds = guard?.binds ?? [];
-  return [
+  const status = verdict === "not_bug" ? "not_bug" : "looking";
+  const report = await reportOf(env, code);
+  const now = Date.now();
+  // One batch is one transaction: the new status and its events land together or not at all. The status_changed
+  // event goes first and reads `from` from the row inside the transaction, written only when the stored status
+  // differs: a desk change landing after our lookup is never lost from the history the bot follows. Every statement
+  // writes only while the row exists: retention may delete it after the lookup, and an event on its id is an orphan.
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
-       SELECT id, ?, 'status_changed', json_object('from', status, 'to', ?) FROM reports WHERE id = ? AND status <> ?${where}`,
-    ).bind(now, status, reportId, status, ...binds),
-    env.DB.prepare(`UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = ?, updated_at = ? WHERE id = ?${where}`)
-      .bind(verdict, triageText, status, duplicateOf, now, reportId, ...binds),
-  ];
-}
-
-/** eventStatement's row, written only while `guard` holds; `data` is the JSON string eventStatement would store. */
-function guardedEvent(env: Env, reportId: string, type: EventType, data: string, at: number, guard: Guard): D1PreparedStatement {
-  return env.DB.prepare(`INSERT INTO events (report_id, at, type, data) SELECT ?, ?, ?, ? WHERE ${guard.sql}`)
-    .bind(reportId, at, type, data, ...guard.binds);
-}
-
-/**
- * What rootOriginal decided, as one SQL condition every statement of the write repeats: the root's row still points
- * where it did (nowhere, for an original: a root that became a duplicate meanwhile would make the chain two hops), and
- * the chain from the root, through duplicate rows only, never reaches `self` (the link would close a loop). The walk
- * goes one step past the read limit, so a long chain that loops back to `self` is still seen; the depth bound also
- * stops it on a loop that does not.
- */
-function cycleGuard(root: Root, self: string): Guard {
-  return {
-    sql: `EXISTS (SELECT 1 FROM reports WHERE code = ? AND (CASE WHEN status = 'duplicate' THEN duplicate_of END) IS ?)
-      AND NOT EXISTS (
-        WITH RECURSIVE chain(code, depth) AS (
-          SELECT ?, 0
-          UNION ALL
-          SELECT r.duplicate_of, c.depth + 1 FROM chain c JOIN reports r ON r.code = c.code
-          WHERE r.status = 'duplicate' AND r.duplicate_of IS NOT NULL AND c.depth < ${MAX_DUPLICATE_DEPTH + 1}
-        )
-        SELECT 1 FROM chain WHERE code = ?)`,
-    binds: [root.code, root.next, root.code, self],
-  };
-}
-
-/** The report a duplicate link stores, and where its row pointed when read (null for an original). */
-type Root = { code: string; next: string | null };
-
-/**
- * The original a duplicate link stores: `target`, or the report its own duplicate chain ends at, so a player's status
- * is one hop away. 400 `invalid_duplicate_of` when `target` does not exist; 409 `duplicate_cycle` when the chain
- * comes back to `self` (the link would close a loop) or already loops. A chain broken by a missing original, or
- * longer than the read-time limit, stops at the last report found.
- */
-async function rootOriginal(env: Env, target: string, self: string): Promise<Root> {
-  const seen = new Set([self, target]);
-  let found: Root | null = null;
-  let code = target;
-  for (let depth = 0; depth < MAX_DUPLICATE_DEPTH; depth++) {
-    const row = await env.DB.prepare("SELECT status, duplicate_of FROM reports WHERE code = ?")
-      .bind(code)
-      .first<{ status: string; duplicate_of: string | null }>();
-    if (!row) break;
-    const next = row.status === "duplicate" ? row.duplicate_of : null;
-    found = { code, next };
-    if (!next) break;
-    if (seen.has(next)) throw new HttpError(409, "duplicate_cycle");
-    seen.add(next);
-    code = next;
-  }
-  if (found === null) throw new HttpError(400, "invalid_duplicate_of");
-  return found;
+       SELECT id, ?, 'status_changed', json_object('from', status, 'to', ?) FROM reports WHERE id = ? AND status <> ?`,
+    ).bind(now, status, report.id, status),
+    env.DB.prepare("UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = NULL, updated_at = ? WHERE id = ?")
+      .bind(verdict, triageText, status, now, report.id),
+    env.DB.prepare("INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'triaged', ? FROM reports WHERE id = ?")
+      .bind(now, JSON.stringify({ verdict }), report.id),
+  ]);
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
+  return json({ ok: true });
 }
 
 async function setStatus(req: Request, env: Env, code: string): Promise<Response> {
@@ -310,16 +201,33 @@ async function setStatus(req: Request, env: Env, code: string): Promise<Response
   if (!status) throw new HttpError(400, "invalid_status");
   const prUrl = v.prUrl(body.prUrl);
   const note = v.text(body.note, "note", 0, 2000);
+  // `duplicate` by hand is a link like triage's, through the same guarded write; any other status clears it below.
+  const dup = duplicateTarget(status === "duplicate", body.duplicateOf, code);
+  if (dup !== null) {
+    await linkDuplicate(env, code, dup, {
+      set: "pr_url = COALESCE(?, pr_url), ",
+      setBinds: [prUrl],
+      eventPairs: ", 'note', ?, 'prUrl', ?",
+      eventBinds: [note, prUrl],
+      onlyOnChange: false,
+      events: [],
+    });
+    return json({ ok: true });
+  }
   const report = await reportOf(env, code);
   const now = Date.now();
   // The event first, its `from` read from the row inside the same transaction, as the desk's status route does.
-  await env.DB.batch([
+  // Leaving `duplicate` clears the link: a stale one would come back, unguarded, if the report were set back later.
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
        SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5) FROM reports WHERE id = ?1`,
     ).bind(report.id, now, status, note, prUrl),
-    env.DB.prepare("UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), updated_at = ? WHERE id = ?").bind(status, prUrl, now, report.id),
+    env.DB.prepare("UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), duplicate_of = NULL, updated_at = ? WHERE id = ?")
+      .bind(status, prUrl, now, report.id),
   ]);
+  // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
   return json({ ok: true });
 }
 
