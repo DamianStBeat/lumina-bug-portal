@@ -1,0 +1,82 @@
+// design.md "buttons.ts": the "See status" button answers only the player who pressed it.
+import { after, before, beforeEach, describe, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { handleButton } from '../src/buttons.ts';
+import { PortalApi } from '../src/portal.ts';
+import { AGENT_KEY, deadBase, FakeWorker } from './fakes/worker.ts';
+import { buttonInteraction, FakeForum, makeUser, mentionsNobody, readMessage } from './fakes/discord.ts';
+import { makeConfig, makeLogger, makeTempDir, removeDir, TRY_AGAIN } from './fakes/common.ts';
+
+const CODE = 'LUM-482193';
+const PLAYER = makeUser('123456789012345678', 'skyler_77');
+
+let worker: FakeWorker;
+let stateDir: string;
+
+before(async () => {
+  worker = await FakeWorker.start();
+  stateDir = await makeTempDir();
+});
+after(async () => {
+  await worker.stop();
+  await removeDir(stateDir);
+});
+beforeEach(() => {
+  worker.requests.length = 0;
+  worker.mode = 'ok';
+  worker.override = undefined;
+  worker.reports.clear();
+});
+
+type Interaction = Parameters<typeof handleButton>[0];
+
+async function press(customId: string, base = worker.base) {
+  const i = buttonInteraction(PLAYER, new FakeForum(), customId);
+  const d = { api: new PortalApi({ base, agentKey: AGENT_KEY, timeoutMs: 2000 }), config: makeConfig(base, stateDir), log: makeLogger() };
+  await assert.doesNotReject(handleButton(i as unknown as Interaction, d));
+  return i;
+}
+
+describe('See status button', () => {
+  const cases: Array<[string, string]> = [
+    ['received', `${CODE}: Received.`],
+    ['looking', `${CODE}: We're looking.`],
+    ['fixed', `${CODE}: Fixed. It is in the game.`],
+    ['not_bug', `${CODE}: Checked.`],
+    ['closed', `${CODE}: Checked.`],
+  ];
+  for (const [status, text] of cases) {
+    test(`design: internal status ${status} -> ephemeral "${text}"`, async () => {
+      worker.reports.set(CODE, { code: CODE, status, source: 'discord' });
+      const i = await press(`status:${CODE}`);
+      const final = i.finalAnswer();
+      assert.ok(final);
+      assert.equal(readMessage(final.options).content, text);
+      assert.equal(final.ephemeral, true);
+      assert.ok(mentionsNobody(final.options));
+      assert.equal(worker.find('GET', `/agent/reports/${CODE}`).length >= 1, true);
+    });
+  }
+
+  test('design: a duplicate never shows "duplicate"; it shows a public status', async () => {
+    worker.reports.set(CODE, { code: CODE, status: 'duplicate', duplicate_of: 'LUM-111111', source: 'discord' });
+    worker.reports.set('LUM-111111', { code: 'LUM-111111', status: 'looking', source: 'web' });
+    const i = await press(`status:${CODE}`);
+    assert.equal(readMessage(i.finalAnswer()!.options).content, `${CODE}: We're looking.`);
+  });
+
+  test('row 7: worker down -> ephemeral "Couldn\'t send it. Try again in a minute."', async () => {
+    const i = await press(`status:${CODE}`, await deadBase());
+    const final = i.finalAnswer();
+    assert.ok(final);
+    assert.equal(readMessage(final.options).content, TRY_AGAIN);
+    assert.equal(final.ephemeral, true);
+  });
+
+  for (const bad of ['status:LUM-12345', 'status:LUM-1234567', 'status:../agent/queue', 'status:lum-123456', 'other:LUM-123456']) {
+    test(`design: custom id "${bad}" is ignored, nothing reaches the worker`, async () => {
+      await press(bad);
+      assert.equal(worker.requests.length, 0);
+    });
+  }
+});
