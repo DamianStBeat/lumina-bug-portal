@@ -294,9 +294,14 @@ export async function reportByCode(code: string): Promise<ReportRow | null> {
   return env.DB.prepare("SELECT * FROM reports WHERE code = ?").bind(code).first<ReportRow>();
 }
 
-export async function reportsWithWhatLike(prefix: string): Promise<number> {
-  const r = await env.DB.prepare("SELECT count(*) AS n FROM reports WHERE what LIKE ?")
-    .bind(`${prefix}%`)
+// Counts reports whose `what` starts with `prefix`. Not `LIKE ?%`: D1 refuses a LIKE pattern over 50 bytes
+// ("LIKE or GLOB pattern too complex") and uniqueText markers are longer. lower() on both sides keeps LIKE's
+// ASCII case folding, so the "stored nothing" assertions stay as broad as they were.
+export async function reportsWithWhatPrefix(prefix: string): Promise<number> {
+  const r = await env.DB.prepare(
+    "SELECT count(*) AS n FROM reports WHERE lower(substr(what, 1, length(?1))) = lower(?1)",
+  )
+    .bind(prefix)
     .first<{ n: number }>();
   return r!.n;
 }

@@ -10,7 +10,7 @@ import {
   gameHeaders,
   jsonInit,
   reportByCode,
-  reportsWithWhatLike,
+  reportsWithWhatPrefix,
   uniqueText,
 } from "./helpers";
 
@@ -115,6 +115,6 @@ describe("POST /game/reports", () => {
   ])("row 12: %s gives 401 and stores nothing", async (_label, headersFor) => {
     const what = uniqueText("row12");
     await expectError(await postGame(gameReport({ map: "Forest" }, what), headersFor(env.GAME_KEY)), 401);
-    expect(await reportsWithWhatLike(what)).toBe(0);
+    expect(await reportsWithWhatPrefix(what)).toBe(0);
   });
 });

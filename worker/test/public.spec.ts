@@ -25,7 +25,7 @@ import {
   postReport,
   putPart,
   reportByCode,
-  reportsWithWhatLike,
+  reportsWithWhatPrefix,
   seedReport,
   sha256Hex,
   sha256OfParts,
@@ -100,7 +100,7 @@ describe("POST /reports", () => {
     await expectError(res, 400, ERRORS.invalidWhat);
     const after = await env.DB.prepare("SELECT count(*) AS n FROM reports").first<{ n: number }>();
     expect(after!.n).toBe(before!.n);
-    expect(await reportsWithWhatLike(marker)).toBe(0);
+    expect(await reportsWithWhatPrefix(marker)).toBe(0);
   });
 
   it("row 2 (missing): a body without `what` is refused with 400 invalid_what", async () => {
@@ -113,14 +113,14 @@ describe("POST /reports", () => {
     const res = await postReport({ what, turnstileToken: TURNSTILE_FAIL });
     await expectError(res, 403, ERRORS.turnstileFailed);
     expect(outbound.turnstileCalls).toBeGreaterThanOrEqual(1);
-    expect(await reportsWithWhatLike(what)).toBe(0);
+    expect(await reportsWithWhatPrefix(what)).toBe(0);
   });
 
   it("row 3 (missing): a request without a Turnstile token is refused and stores nothing", async () => {
     const what = uniqueText("row3 no token");
     const res = await postReport({ what });
     expect([400, 403]).toContain(res.status);
-    expect(await reportsWithWhatLike(what)).toBe(0);
+    expect(await reportsWithWhatPrefix(what)).toBe(0);
   });
 
   it("row 4: the sixth report in the same hour from the same ip gets 429 rate_limited; another ip still passes", async () => {
@@ -131,7 +131,7 @@ describe("POST /reports", () => {
     }
     const sixth = uniqueText("row4 #6");
     await expectError(await postReport({ what: sixth, turnstileToken: TURNSTILE_PASS }, ip), 429, ERRORS.rateLimited);
-    expect(await reportsWithWhatLike(sixth)).toBe(0);
+    expect(await reportsWithWhatPrefix(sixth)).toBe(0);
 
     const other = await postReport({ what: uniqueText("row4 other ip"), turnstileToken: TURNSTILE_PASS }, nextIp());
     expect(other.status).toBe(201);
