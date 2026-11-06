@@ -191,21 +191,50 @@ describe('row 5: reload half way, pick the same file again, it carries on', () =
     expect(loadSession()).toBeNull()
   })
 
-  it('resume state: a file with the same name but another lastModified is not sent into the saved attachment', async () => {
+  // Rewritten for web-fix rows 1 and 2: the bytes of the first 1 MiB decide, not lastModified (iPhone Photos gives the
+  // same video a new one on every export).
+  it('resume state: a file with the same name and size but other bytes (and another lastModified) is not sent into the saved attachment', async () => {
     const token = server.addReport(CODE)
     server.holdPart = (_id, n) => (n > 2 ? never() : null)
     const h1 = mount()
-    act(() => h1.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 1000)]))
+    await act(async () => {
+      await Promise.resolve(h1.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 1000, { seed: 1 })]))
+    })
     await startThenReload(h1, { code: CODE, reportToken: token })
     const [saved] = server.attsOf(CODE)
 
     server.holdPart = () => null
     const mark = server.log.length
     const h2 = mount()
-    act(() => h2.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 2000)]))
+    await act(async () => {
+      await Promise.resolve(h2.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 2000, { seed: 2 })]))
+    })
     await startAll(h2)
     expect(putsAfter(mark).filter((r) => r.id === saved!.id)).toEqual([])
     expect([...saved!.parts.keys()].sort()).toEqual([1, 2])
+  })
+
+  it('resume state: the same bytes picked again with another lastModified carry on in the saved attachment', async () => {
+    const token = server.addReport(CODE)
+    server.holdPart = (_id, n) => (n > 2 ? never() : null)
+    const h1 = mount()
+    await act(async () => {
+      await Promise.resolve(h1.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 1000, { seed: 1 })]))
+    })
+    await startThenReload(h1, { code: CODE, reportToken: token })
+    const [saved] = server.attsOf(CODE)
+
+    server.holdPart = () => null
+    const mark = server.log.length
+    const h2 = mount()
+    await act(async () => {
+      await Promise.resolve(h2.result.current.addFiles([file('clip.mp4', 6 * PART, 'video/mp4', 2000, { seed: 1 })]))
+    })
+    expect(await startAll(h2)).toBe(true)
+    expect(putsAfter(mark).every((r) => r.id === saved!.id)).toBe(true)
+    expect(new Set(putsAfter(mark).map((r) => r.n))).toEqual(new Set([3, 4, 5, 6]))
+    expect(saved!.status).toBe('complete')
+    expect(loadSession()).toBeNull()
   })
 
   it('resume state: re-picking one of two saved files finishes it but keeps the session for the other', async () => {

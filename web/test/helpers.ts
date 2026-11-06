@@ -1,6 +1,7 @@
 // Test seams for the uploader specs: a fake worker (CONTRACT.md "HTTP API", public part), files whose bytes are
-// never allocated, and an in-memory sessionStorage. The fake keeps parts by length (and the file offset they came
-// from), never their bytes, so a 2 GiB upload costs a few kilobytes.
+// never stored, and an in-memory sessionStorage. The fake keeps parts by length (and the file offset they came
+// from), never their bytes, so a 2 GiB upload costs a few kilobytes. A file's bytes are computed from its content
+// seed only when a slice is read (arrayBuffer), so the client can hash the start of a file as the browser lets it.
 import { vi } from 'vitest'
 
 export const MiB = 1024 ** 2
@@ -11,19 +12,46 @@ const MAX_FILE = 2 * GiB
 const MAX_FILES = 3
 const MAX_PARTS = 128
 
-// A Blob stand-in: size and slice() behave as the browser's (clamped, end exclusive), the bytes do not exist.
+// What a fake file holds: the byte at file position p is a fixed function of (seed, p), so the same seed gives the
+// same bytes and another seed other bytes. `from`: the bytes before that position are the default content (seed 0)
+// and only the rest follows `seed`, for files that differ only after a given offset.
+export type Content = { seed: number; from?: number }
+export const SAME_BYTES: Content = { seed: 0 }
+// Reading more than this at once is a test asking for a whole part or file in memory, which the fake refuses.
+const MAX_READ = 64 * MiB
+
+function byteAt(c: Content, p: number): number {
+  const seed = p < (c.from ?? 0) ? 0 : c.seed
+  let x = Math.imul(p ^ Math.imul(seed + 1, 0x9e3779b1), 0x85ebca6b)
+  x ^= x >>> 13
+  x = Math.imul(x, 0xc2b2ae35)
+  x ^= x >>> 16
+  return x & 255
+}
+
+// A Blob stand-in: size and slice() behave as the browser's (clamped, end exclusive), the bytes exist only when read.
 // `offset` is where the slice starts in the original file, so the server can tell which bytes a part carried.
 export class SparseBlob {
   constructor(
     readonly size: number,
     readonly type = '',
     readonly offset = 0,
+    readonly content: Content = SAME_BYTES,
   ) {}
   slice(start = 0, end = this.size): SparseBlob {
     const clamp = (v: number) => Math.max(0, Math.min(this.size, v < 0 ? this.size + v : v))
     const s = clamp(start)
     const e = Math.max(s, clamp(end))
-    return new SparseBlob(e - s, '', this.offset + s)
+    return new SparseBlob(e - s, '', this.offset + s, this.content)
+  }
+  async bytes(): Promise<Uint8Array<ArrayBuffer>> {
+    if (this.size > MAX_READ) throw new Error(`SparseBlob: reading ${this.size} bytes at once is more than the fake allows`)
+    const out = new Uint8Array(this.size)
+    for (let i = 0; i < this.size; i++) out[i] = byteAt(this.content, this.offset + i)
+    return out
+  }
+  async arrayBuffer(): Promise<ArrayBuffer> {
+    return (await this.bytes()).buffer
   }
 }
 
@@ -33,14 +61,16 @@ export class SparseFile extends SparseBlob {
     size: number,
     type: string,
     readonly lastModified = 1_762_400_000_000,
+    content: Content = SAME_BYTES,
   ) {
-    super(size, type)
+    super(size, type, 0, content)
   }
 }
 
-// The hooks and pages are typed for File; the uploader only reads name, size, type, lastModified and slice().
-export function file(name: string, size: number, type = 'video/mp4', lastModified?: number): File {
-  return new SparseFile(name, size, type, lastModified) as unknown as File
+// The hooks and pages are typed for File; the uploader reads name, size, type, lastModified, slice() and the bytes of
+// a slice (arrayBuffer). Without `content` every file has the same bytes, so name and size alone tell two apart.
+export function file(name: string, size: number, type = 'video/mp4', lastModified?: number, content?: Content): File {
+  return new SparseFile(name, size, type, lastModified, content) as unknown as File
 }
 
 // 'cut': the server stored the request and its 200 headers arrived, then the connection dropped in the body.
