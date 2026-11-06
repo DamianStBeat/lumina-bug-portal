@@ -25,10 +25,11 @@ import {
 
 const CODE = 'LUM-482193'
 let server: FakeServer
+let store: Storage
 
 beforeEach(() => {
   useFakeClock()
-  installStorage()
+  store = installStorage()
   server = new FakeServer().install()
 })
 afterEach(() => {
@@ -119,7 +120,8 @@ function holdCreateAnswer(name: string, gate: Promise<void>): void {
 
 // Sends a.mp4 then b.mp4 (one at a time, so a.mp4's create is the one out), Removes a.mp4 while that create is held
 // unless `remove` is false, and closes the page before the create answers. `hold` holds the create: before the
-// server sees it ('request') or after the server made the attachment ('answer').
+// server sees it ('request') or after the server made the attachment ('answer'). `writes`: sessionStorage writes from
+// the close until the next visit (lead's decision, tests-commit 12: the late create answer writes nothing).
 async function closedWhileCreating(hold: 'request' | 'answer', remove = true) {
   const token = server.addReport(CODE)
   const gate = deferred()
@@ -137,6 +139,9 @@ async function closedWhileCreating(hold: 'request' | 'answer', remove = true) {
     void removeOn(h, 'a.mp4')
     await settle()
   }
+  const saved = structuredClone(loadSession())
+  const setItem = vi.spyOn(store, 'setItem')
+  const removeItem = vi.spyOn(store, 'removeItem')
   h.unmount()
   gate.resolve()
   server.holdCreate = null
@@ -144,9 +149,13 @@ async function closedWhileCreating(hold: 'request' | 'answer', remove = true) {
     await drive(sent)
   })
   await letRun()
+  const writes = setItem.mock.calls.length + removeItem.mock.calls.length
+  setItem.mockRestore()
+  removeItem.mockRestore()
+  expect(loadSession()).toEqual(saved)
   // Back to the plain fake for the next visit.
   server.install()
-  return { token, a: attOf('a.mp4') }
+  return { token, a: attOf('a.mp4'), writes }
 }
 
 // The next visit (any DELETE it sends again answered), and the rest sent from it: b.mp4 picked again and sent, which
@@ -169,9 +178,15 @@ async function sendTheRest(h2: Hook, token: string): Promise<boolean> {
 }
 
 describe('red team r1, finding 1 (Opus, queue.ts:396): Remove while the create is out, then the page closed', () => {
-  it('finding 1: the create never reached the server: on reopen a.mp4 is not asked for again, only b.mp4, and sending b.mp4 reaches done', async () => {
-    const { token, a } = await closedWhileCreating('request')
-    expect(a).toBeUndefined()
+  // Lead's decision (tests-commit 12): after the close a removed file's create is not aborted; when it answers, its
+  // attachment gets exactly one DELETE and nothing else is written.
+  it('finding 1: the create held before the server, the page closed: it is not aborted, its attachment reaches the server and gets exactly one DELETE, nothing is written to storage after the close, on reopen a.mp4 is not asked for again, and sending b.mp4 reaches done', async () => {
+    const { token, a, writes } = await closedWhileCreating('request')
+    expect(creates()[0]!.reached).toBe(true)
+    expect(a).toBeDefined()
+    expect(deletesOf(a!.id)).toHaveLength(1)
+    expect(a!.status).toBe('aborted')
+    expect(writes).toBe(0)
     const h2 = await reopen()
     expect(missing(h2)).toEqual(['b.mp4'])
     expect(line('a.mp4')).toBeUndefined()
@@ -180,16 +195,20 @@ describe('red team r1, finding 1 (Opus, queue.ts:396): Remove while the create i
     expect(h2.result.current.phase).toBe('done')
     expect(names(h2)).toEqual(['b.mp4'])
     expect(live()).toEqual([['b.mp4', 'complete']])
+    expect(deletesOf(a!.id)).toHaveLength(1)
+    expect(completesOf(a!.id)).toEqual([])
+    expect(server.puts(a!.id)).toEqual([])
     expect(h2.result.current.resume).toBeNull()
     expect(loadSession()).toBeNull()
   })
 
   it('finding 1: the create reached the server and its answer was lost to the close: that attachment gets a DELETE (on the closed page or on reopen), a.mp4 is not asked for again, and sending b.mp4 reaches done', async () => {
-    const { token, a } = await closedWhileCreating('answer')
+    const { token, a, writes } = await closedWhileCreating('answer')
     expect(a).toBeDefined()
+    expect(writes).toBe(0)
     const h2 = await reopen()
     // It would hold one of the 3 places of the report, for a video the player removed.
-    expect(deletesOf(a!.id).length).toBeGreaterThan(0)
+    expect(deletesOf(a!.id)).toHaveLength(1)
     expect(a!.status).toBe('aborted')
     expect(missing(h2)).toEqual(['b.mp4'])
 
@@ -197,12 +216,16 @@ describe('red team r1, finding 1 (Opus, queue.ts:396): Remove while the create i
     expect(h2.result.current.phase).toBe('done')
     expect(live()).toEqual([['b.mp4', 'complete']])
     expect(completesOf(a!.id)).toEqual([])
+    expect(deletesOf(a!.id)).toHaveLength(1)
     expect(h2.result.current.resume).toBeNull()
     expect(loadSession()).toBeNull()
   })
 
-  it('finding 1, the other side: not removed, the page closed while the create is out: on reopen both files are asked for again', async () => {
-    await closedWhileCreating('request', false)
+  it('finding 1, the other side: not removed, the page closed while the create is out: that create is aborted (no attachment made), and on reopen both files are asked for again', async () => {
+    const { a, writes } = await closedWhileCreating('request', false)
+    expect(creates()[0]!.reached).toBe(false)
+    expect(a).toBeUndefined()
+    expect(writes).toBe(0)
     const h2 = await reopen()
     expect(missing(h2)).toEqual(['a.mp4', 'b.mp4'])
   })

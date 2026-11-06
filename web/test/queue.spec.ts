@@ -304,7 +304,11 @@ describe('queue: Remove and Send together (rows 1 and 2)', () => {
     const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
     const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'a.mp4') })
     expect(item(s1, 'a.mp4')?.step).toBe('removing')
-    expect(s1.fx).toEqual([])
+    // Lead's decision (brief-build-4 item 1): its open line leaves storage at once, so no reload asks for it.
+    expect(line(s0, 'a.mp4')).toMatchObject({ attachmentId: null })
+    expect(line(s1, 'a.mp4')).toBeUndefined()
+    expect(s1.session?.files.map((f) => f.name)).toEqual(['b.mp4'])
+    expect(s1.fx).toEqual([{ t: 'save', session: s1.session }])
     const s2 = created(s1, 'A', s0)
     expect(fxOf(s2, 'upload')).toEqual([])
     expect(fxOf(s2, 'delete')[0]).toMatchObject({ id: 'A', by: { k: 'remove', gen: item(s1, 'a.mp4')!.gen + 1 } })

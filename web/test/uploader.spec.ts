@@ -400,3 +400,122 @@ describe('decided B5: an answer lost mid-body, and a complete that is not { ok: 
     expect(server.atts.get(a.attachmentId)!.status).toBe('uploading')
   })
 })
+
+// Red team r1 (Astra, queue.ts:31; tests-commit 12): the uploader reports where an upload is through `onStage`, and the
+// queue decides what it means. 'completing' once every part is confirmed and before the complete goes out, 'paused'
+// when the browser says the network is lost, back to where it was when it returns. The retries are the same either
+// way: one try and 5 retries per request. jsdom never fires 'offline' or 'online' by itself, so the specs fire them,
+// as the browser does, together with the fake server going offline.
+describe('red team r1: the stage of an upload (onStage), retries unchanged', () => {
+  type Seen = { stage: string; completes: number; parts: number }
+  function staged(f: File, a: Awaited<ReturnType<typeof attach>>) {
+    const stages: Seen[] = []
+    const p = uploadFile({
+      file: f,
+      attachmentId: a.attachmentId,
+      partSize: a.partSize,
+      partCount: a.partCount,
+      token: a.token,
+      onConfirmed: () => {},
+      // What the server had seen when the stage was told: completes asked, parts stored.
+      onStage: (stage) =>
+        stages.push({ stage, completes: server.requests('POST', '/complete').length, parts: server.atts.get(a.attachmentId)!.parts.size }),
+    })
+    return { p, stages, names: () => stages.map((x) => x.stage) }
+  }
+  const lose = () => {
+    server.offline = true
+    window.dispatchEvent(new Event('offline'))
+  }
+  // Every PUT of part n, those the lost network stopped before the server saw them included (they carry no `n`).
+  const putsOf = (n: number) => server.puts().filter((r) => r.path.endsWith(`/parts/${n}`))
+  const back = () => {
+    server.offline = false
+    window.dispatchEvent(new Event('online'))
+  }
+
+  it('onStage completing: told once every part is stored and before the complete POST goes out, and nothing else on a clean upload', async () => {
+    const f = file('clip.mp4', 3 * PART)
+    const a = await attach(f)
+    const { p, stages } = staged(f, a)
+    await drive(p)
+    expect(stages).toEqual([{ stage: 'completing', completes: 0, parts: 3 }])
+    expect(server.requests('POST', '/complete')).toHaveLength(1)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+  })
+
+  it('onStage: a complete answered missing_parts goes back to uploading for the lost part, then completing again', async () => {
+    server.beforeComplete = (att, k) => {
+      if (k === 1) att.parts.delete(2)
+    }
+    const f = file('clip.mp4', 3 * PART)
+    const a = await attach(f)
+    const { p, stages } = staged(f, a)
+    await drive(p)
+    expect(stages).toEqual([
+      { stage: 'completing', completes: 0, parts: 3 },
+      { stage: 'uploading', completes: 1, parts: 2 },
+      { stage: 'completing', completes: 1, parts: 3 },
+    ])
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+  })
+
+  it('onStage paused: the network lost with a part in flight is paused once (not once per retry), back to uploading when it returns, then completing', async () => {
+    const f = file('clip.mp4', 2 * PART)
+    const a = await attach(f)
+    const gate = deferred()
+    server.holdPart = (_id, n) => (n === 2 ? gate.promise : null)
+    const { p, stages, names } = staged(f, a)
+    for (let i = 0; i < 20 && !server.puts().some((r) => r.n === 2); i++) await flush()
+    expect(names()).toEqual([])
+    lose()
+    await flush()
+    expect(names()).toEqual(['paused'])
+    // Retries meet the lost network meanwhile: still one pause.
+    await vi.advanceTimersByTimeAsync(4_000)
+    expect(putsOf(2).length).toBeGreaterThan(1)
+    expect(names()).toEqual(['paused'])
+    server.holdPart = () => null
+    back()
+    await drive(p)
+    expect(names()).toEqual(['paused', 'uploading', 'completing'])
+    expect(stages.at(-1)).toEqual({ stage: 'completing', completes: 0, parts: 2 })
+    expect(putsOf(2).length).toBeLessThanOrEqual(6)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+  })
+
+  it('onStage paused while completing: the complete in flight is cancelled, and when the network returns it is completing again, not uploading', async () => {
+    const f = file('clip.mp4', PART)
+    const a = await attach(f)
+    const gate = deferred()
+    server.holdRoute = (m, path) => (m === 'POST' && path.endsWith('/complete') ? gate.promise : null)
+    const { p, names } = staged(f, a)
+    for (let i = 0; i < 20 && server.requests('POST', '/complete').length === 0; i++) await flush()
+    expect(names()).toEqual(['completing'])
+    lose()
+    await flush()
+    expect(names()).toEqual(['completing', 'paused'])
+    server.holdRoute = () => null
+    back()
+    await drive(p)
+    expect(names()).toEqual(['completing', 'paused', 'completing'])
+    expect(server.requests('POST', '/complete')[0]!.reached).toBe(false)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+  })
+
+  it('limit retries while paused: a network that never returns gives up after exactly 6 PUTs of the part, as before, with a network error and no complete', async () => {
+    const f = file('clip.mp4', PART)
+    const a = await attach(f)
+    const gate = deferred()
+    server.holdPart = () => gate.promise
+    const { p, names } = staged(f, a)
+    for (let i = 0; i < 20 && server.puts().length === 0; i++) await flush()
+    lose()
+    const err = await drive(p).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).code).toBe('network')
+    expect(putsOf(1)).toHaveLength(6)
+    expect(server.requests('POST', '/complete')).toHaveLength(0)
+    expect(names()).toEqual(['paused'])
+  })
+})
