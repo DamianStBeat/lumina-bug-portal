@@ -1543,3 +1543,109 @@ describe("redteam-4: a chain still moving after the two attempts is duplicate_bu
     await expectNoLoopFrom(c.code);
   });
 });
+
+// ===============================================================================================================
+// Round 4, audit round 1 (audit.md findings 1 and 2, brief-tests-fix-1.md). Lead's decision: after the second guarded
+// write fails and the report still exists, the chain is read once more before answering: a loop found then is 409
+// duplicate_cycle, the target gone is 400 invalid_duplicate_of, and only otherwise 409 duplicate_busy. A definite "no"
+// that appeared during the second attempt is never answered as "not yet". And the desk's status_changed on the link
+// path keeps who changed it, as on its other path.
+// ===============================================================================================================
+
+describe("redteam-4 (audit): the chain is read once more before duplicate_busy, and the desk link event", () => {
+  it("redteam-4 (audit): a loop closing before the second guarded write of C -> A (A -> X, then X -> C) is 409 duplicate_cycle, C unchanged, no event", async () => {
+    const a = await seedReport({ status: "looking" });
+    const x = await seedReport({ status: "looking" });
+    const c = await seedReport();
+    const beforeC = await fullSnapshot(c);
+    let seq = 0;
+    let step = 0;
+    const { db, gaps } = dbWithGapBeforeEveryWrite(async () => {
+      step += 1;
+      if (step === 1) {
+        // The root moves, no loop yet: the first write finds a stale root and the triage reads again (root X).
+        expect((await linkDuplicate(a.code, x.code)).status, "gap 1: A -> X").toBe(200);
+      } else {
+        // The new root links back to the triaged report: C -> A -> X -> C would be a loop, a definite "no".
+        expect((await linkDuplicate(x.code, c.code)).status, "gap 2: X -> C").toBe(200);
+        seq = await maxSeq();
+      }
+    }, 2);
+
+    const res = await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: a.code }, { DB: db });
+
+    expect(gaps(), "a gap before each of the two guarded writes").toBe(2);
+    const b = await expectError(res, 409, "duplicate_cycle");
+    expect(b, "a loop, not busy: no retryAfter").toEqual({ error: "duplicate_cycle" });
+    expect(res.headers.get("Retry-After"), "no Retry-After on a definite no").toBeNull();
+    expect(await fullSnapshot(c), "C unchanged, no event").toEqual(beforeC);
+    expect(await eventsSince(seq, [c.id, a.id, x.id]), "the refused triage writes no event").toEqual([]);
+    for (const code of [a.code, x.code, c.code]) await expectNoLoopFrom(code);
+  });
+
+  it("redteam-4 (audit): target A deleted before the second guarded write of C -> A, the chain having moved first, is 400 invalid_duplicate_of, nothing written", async () => {
+    const x = await seedReport({ status: "looking" });
+    const y = await seedReport({ status: "looking" });
+    const a = await seedReport();
+    const c = await seedReport();
+    expect((await linkDuplicate(a.code, x.code)).status, "A -> X").toBe(200);
+    const beforeC = await fullSnapshot(c);
+    let seq = 0;
+    let afterGaps: [FullSnapshot, FullSnapshot] | null = null;
+    let step = 0;
+    const { db, gaps } = dbWithGapBeforeEveryWrite(async () => {
+      step += 1;
+      if (step === 1) {
+        // The chain moves: a person takes A out of duplicate (A is its own root now) and the old root X moves to Y,
+        // so the first write, guarded on root X, writes nothing and the triage reads again (root A).
+        expect((await deskStatus(a.code, { status: "looking" })).status, "gap 1: A back to looking").toBe(200);
+        expect((await linkDuplicate(x.code, y.code)).status, "gap 1: X -> Y").toBe(200);
+      } else {
+        // Retention deletes the target, now the root: the second write writes nothing, the target is gone for good.
+        await deleteAsRetention(a);
+        seq = await maxSeq();
+        afterGaps = [await fullSnapshot(x), await fullSnapshot(y)];
+      }
+    }, 2);
+
+    const res = await triage(c.code, { verdict: "duplicate", triage: { summary: "same bug" }, duplicateOf: a.code }, { DB: db });
+
+    expect(gaps(), "a gap before each of the two guarded writes").toBe(2);
+    const b = await expectError(res, 400, "invalid_duplicate_of");
+    expect(b, "the target is gone, not busy: no retryAfter").toEqual({ error: "invalid_duplicate_of" });
+    expect(res.headers.get("Retry-After")).toBeNull();
+    expect(await fullSnapshot(c), "C unchanged").toEqual(beforeC);
+    expect(await eventsSince(seq, [c.id, a.id, x.id, y.id]), "no event for C, A's id, X or Y").toEqual([]);
+    expect(await reportByCode(a.code), "A stays deleted").toBeNull();
+    expect([await fullSnapshot(x), await fullSnapshot(y)], "X and Y as the gaps left them").toEqual(afterGaps);
+  });
+
+  it("redteam-4 (audit): desk B set to duplicate of A with note and prUrl records status_changed with from, to, note, prUrl, by desk and email", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    const before = await eventsOf(b.id);
+    const note = uniqueText("same crash as the original");
+
+    expect((await deskStatus(b.code, { status: "duplicate", duplicateOf: a.code, note, prUrl: VALID_PR })).status).toBe(200);
+
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(a.code);
+    const changes = (await eventsAfter(b, before)).filter((e) => e.type === "status_changed");
+    expect(changes.length, "B: one status_changed").toBe(1);
+    // email is null under the dev bypass (lib/access.ts), as on the desk's non-link path; the key must be there.
+    expect(changes[0]!.data).toEqual({ from: "looking", to: "duplicate", note, prUrl: VALID_PR, by: "desk", email: null });
+  });
+
+  it("redteam-4 (audit): agent B set to duplicate of A with note and prUrl records status_changed with note and prUrl, no by or email", async () => {
+    const a = await seedReport({ status: "looking" });
+    const b = await seedReport({ status: "looking" });
+    const before = await eventsOf(b.id);
+    const note = uniqueText("same crash as the original");
+
+    expect((await agentStatus(b.code, { status: "duplicate", duplicateOf: a.code, note, prUrl: VALID_PR })).status).toBe(200);
+
+    expect((await reportByCode(b.code))!.duplicate_of).toBe(a.code);
+    const changes = (await eventsAfter(b, before)).filter((e) => e.type === "status_changed");
+    expect(changes.length, "B: one status_changed").toBe(1);
+    expect(changes[0]!.data).toEqual({ from: "looking", to: "duplicate", note, prUrl: VALID_PR });
+  });
+});
