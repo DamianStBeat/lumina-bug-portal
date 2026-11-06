@@ -1025,3 +1025,186 @@ describe('fix round 1: events of removed reports (decision 13)', () => {
   });
 });
 
+// ---------------------------------------------------------------- fix round 3
+
+describe('fix round 3: cursor flush (decision 18)', () => {
+  /** A store whose first `failures` writes reject (EACCES), then work. */
+  class FlakyStore extends CursorStore {
+    failures: number;
+    constructor(file: string, failures: number) {
+      super(file);
+      this.failures = failures;
+    }
+    override async write(seq: number): Promise<void> {
+      if (this.failures > 0) {
+        this.failures -= 1;
+        throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+      }
+      return super.write(seq);
+    }
+  }
+
+  test('fix3-18: a cursor file left behind by a failed write is rewritten on the next tick, even with no new events', async () => {
+    worker.reports.set('LUM-000001', discordReport('LUM-000001', T1));
+    worker.events.push(fixedEvent(1, 'LUM-000001'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const { p } = poller(file, d, { store: new FlakyStore(file, 1) });
+    await p.tick().catch(() => undefined);
+    assert.equal(sentTo(d, T1), 1);
+    assert.equal(await cursorValue(file), 0, 'the write failed: the file is behind');
+    await p.tick().catch(() => undefined);
+    assert.equal(await cursorValue(file), 1, 'flushed on an empty tick');
+    assert.equal(sentTo(d, T1), 1, 'and nothing posted twice');
+    // A restart now starts from the flushed cursor: nothing is repeated.
+    const d2 = fakeDiscord();
+    await poller(file, d2).p.tick();
+    assert.equal(d2.sent.length, 0);
+  });
+
+  test('fix3-18: while the disk still refuses, every tick tries the write again', async () => {
+    worker.reports.set('LUM-000001', discordReport('LUM-000001', T1));
+    worker.events.push(fixedEvent(1, 'LUM-000001'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const store = new FlakyStore(file, 3);
+    const { p } = poller(file, d, { store });
+    await p.tick().catch(() => undefined); // handles event 1, write 1 fails
+    await p.tick().catch(() => undefined); // empty tick, write 2 fails
+    await p.tick().catch(() => undefined); // empty tick, write 3 fails
+    assert.equal(store.failures, 0, 'one write attempt per tick');
+    await p.tick().catch(() => undefined);
+    assert.equal(await cursorValue(file), 1);
+    assert.equal(sentTo(d, T1), 1);
+  });
+});
+
+describe('fix round 3: fast-forward keeps game reports (decision 19)', () => {
+  const gameReport = (code: string, thread: string | null = null) => ({
+    code, source: 'game', status: 'received', title: 'Boss stuck', what: 'The boss stopped.', discord_thread_id: thread,
+  });
+
+  test('fix3-19: no cursor file -> a game report with no thread still gets its forum post; old notifications are skipped', async () => {
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055', { status: 'duplicate', duplicate_of: 'LUM-111111' }));
+    worker.reports.set('LUM-111111', discordReport('LUM-111111', '770000000000000011', { status: 'fixed' }));
+    worker.reports.set('LUM-333333', gameReport('LUM-333333'));
+    // 70 events: two pages; the game report is on the second one.
+    for (let n = 1; n <= 68; n++) worker.events.push(fixedEvent(n, 'LUM-482193'));
+    worker.events.push({ seq: 69, code: 'LUM-482193', at: 69, type: 'duplicate_linked', data: { duplicateOf: 'LUM-111111' } });
+    worker.events.push({ seq: 70, code: 'LUM-333333', at: 70, type: 'created', data: { source: 'game' } });
+    const file = cursorPath();
+    const d = fakeDiscord();
+    await poller(file, d).p.tick();
+    assert.equal(d.sent.length, 0, 'no old "Fixed" or "Same bug"');
+    assert.equal(d.posts.length, 1, 'the game report is posted');
+    assert.equal(d.posts[0]!.name, 'Bug report: Boss stuck');
+    assert.equal(worker.find('POST', '/agent/reports/LUM-333333/discord').length, 1, 'and linked');
+    assert.equal(await cursorValue(file), 70);
+  });
+
+  test('fix3-19: during the fast-forward a game report that already has a thread, or a discord report, gets no post', async () => {
+    worker.reports.set('LUM-333334', gameReport('LUM-333334', '770000000000000077'));
+    worker.reports.set('LUM-333335', { code: 'LUM-333335', source: 'discord', status: 'received', discord_thread_id: null });
+    worker.events.push(
+      { seq: 1, code: 'LUM-333334', at: 1, type: 'created', data: {} },
+      { seq: 2, code: 'LUM-333335', at: 2, type: 'created', data: {} },
+    );
+    const file = cursorPath();
+    const d = fakeDiscord();
+    await poller(file, d).p.tick();
+    assert.equal(d.posts.length, 0);
+    assert.equal(await cursorValue(file), 2);
+  });
+});
+
+describe('fix round 3: report rows must carry code and status (decision 20)', () => {
+  test('fix3-20: a row without status is not a report: the "fixed" event is not posted from it, and kept for a retry', async () => {
+    worker.override = (r) =>
+      r.method === 'GET' && r.path === '/agent/reports/LUM-482193'
+        ? { status: 200, body: { code: 'LUM-482193', source: 'discord', discord_thread_id: '770000000000000055' } }
+        : undefined;
+    worker.events.push(fixedEvent(1, 'LUM-482193'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    await poller(file, d).p.tick().catch(() => undefined);
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 0, 'bad_response is transient: retried');
+  });
+});
+
+describe('fix round 3: a discord report not linked yet (decision 21)', () => {
+  const MIN = 60_000;
+  const T0 = 1_800_000_000_000;
+  const THREAD = '770000000000000099';
+
+  function unlinked(createdAgoMs: number, extra: Record<string, unknown> = {}) {
+    worker.reports.set('LUM-555555', {
+      code: 'LUM-555555', source: 'discord', status: 'fixed', discord_thread_id: null, discord_name: 'skyler_77',
+      created_at: T0 - createdAgoMs, ...extra,
+    });
+  }
+
+  test('fix3-21: fixed for a discord report created 9m59s ago without a thread is retried, and posted once linked', async () => {
+    unlinked(10 * MIN - 1000);
+    worker.events.push(fixedEvent(1, 'LUM-555555'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const clock = { t: T0 };
+    const { p } = poller(file, d, { now: () => clock.t });
+    await p.tick().catch(() => undefined);
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 0, 'kept: the thread link may be on its way');
+    worker.reports.get('LUM-555555')!['discord_thread_id'] = THREAD;
+    clock.t = T0 + 20_000;
+    await p.tick().catch(() => undefined);
+    assert.equal(d.sent.length, 1);
+    assert.equal(d.sent[0]!.threadId, THREAD);
+    assert.equal(await cursorValue(file), 1);
+  });
+
+  test('fix3-21: duplicate_linked for a recent discord report without a thread is retried too', async () => {
+    unlinked(2 * MIN, { status: 'duplicate', duplicate_of: 'LUM-482193' });
+    worker.reports.set('LUM-482193', discordReport('LUM-482193', '770000000000000055'));
+    worker.events.push({ seq: 1, code: 'LUM-555555', at: 1, type: 'duplicate_linked', data: { duplicateOf: 'LUM-482193' } });
+    const file = seededCursor();
+    const d = fakeDiscord();
+    await poller(file, d, { now: () => T0 }).p.tick().catch(() => undefined);
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 0);
+  });
+
+  test('fix3-21: created exactly 10 minutes ago without a thread -> skipped, the cursor moves on', async () => {
+    unlinked(10 * MIN);
+    worker.events.push(fixedEvent(1, 'LUM-555555'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    await poller(file, d, { now: () => T0 }).p.tick();
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 1);
+  });
+
+  test('fix3-21: a recent one still unlinked when it turns 10 minutes old is then skipped', async () => {
+    unlinked(5 * MIN);
+    worker.events.push(fixedEvent(1, 'LUM-555555'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const clock = { t: T0 };
+    const { p } = poller(file, d, { now: () => clock.t });
+    await p.tick().catch(() => undefined);
+    assert.equal(await cursorValue(file), 0);
+    clock.t = T0 + 5 * MIN;
+    await p.tick().catch(() => undefined);
+    assert.equal(d.sent.length, 0);
+    assert.equal(await cursorValue(file), 1);
+  });
+
+  test('fix3-21: a recent web report without a thread is skipped at once (it never gets one)', async () => {
+    unlinked(1 * MIN, { source: 'web' });
+    worker.events.push(fixedEvent(1, 'LUM-555555'));
+    const file = seededCursor();
+    const d = fakeDiscord();
+    await poller(file, d, { now: () => T0 }).p.tick();
+    assert.equal(await cursorValue(file), 1);
+  });
+});
+
