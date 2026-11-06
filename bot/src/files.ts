@@ -10,7 +10,8 @@ export type CopyResult = { copied: number; skipped: number; failed: number };
 const MAX_FILES = 3;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const FILENAME_MAX = 120;
-const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+// Covers the whole streamed copy (download and upload run together), so it is sized for a 2 GiB video.
+const DOWNLOAD_TIMEOUT_MS = 30 * 60 * 1000;
 
 /** The declared media type without parameters, or undefined when it is not a video or picture. */
 function mediaType(contentType: string | null): string | undefined {
@@ -43,21 +44,25 @@ export async function copyAttachments(
       continue;
     }
     attempted += 1;
+    let res: Response | undefined;
     try {
-      const res = await fetchImpl(a.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-      if (!res.ok) throw new Error(`download ${res.status}`);
-      const body = new Uint8Array(await res.arrayBuffer());
-      if (body.byteLength === 0 || body.byteLength > MAX_BYTES) throw new Error('download size');
-      // The size declared to the worker is what was downloaded, so the part plan matches the bytes sent.
+      res = await fetchImpl(a.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+      if (!res.ok || !res.body) throw new Error(`download ${res.status}`);
+      if (!(a.size > 0)) throw new Error('download size');
+      // Streamed part by part: the whole file is never in memory. The size Discord declared is the plan sent to
+      // the worker; a download that carries a different number of bytes aborts the upload.
       await api.uploadAttachment(code, reportToken, {
         filename: sanitiseFilename(a.name),
         mime,
-        size: body.byteLength,
-        body,
+        size: a.size,
+        body: res.body,
       });
       result.copied += 1;
     } catch {
       result.failed += 1;
+    } finally {
+      // A body never read (the create failed) would hold its connection open.
+      if (res?.body && !res.bodyUsed) await res.body.cancel().catch(() => undefined);
     }
   }
   return result;

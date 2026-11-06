@@ -64,7 +64,11 @@ export type NewDiscordReport = {
   where?: string;
 };
 
-export type UploadFile = { filename: string; mime: string; size: number; body: Uint8Array };
+/**
+ * `size` is declared to the worker before any byte is sent; `body` is the bytes in memory or a stream of them (a
+ * Discord download), and must carry exactly `size` bytes or the upload is aborted.
+ */
+export type UploadFile = { filename: string; mime: string; size: number; body: Uint8Array | AsyncIterable<Uint8Array> };
 
 type Auth = { kind: 'agent' } | { kind: 'report'; token: string };
 type CallOptions = { json?: unknown; bytes?: Uint8Array; auth: Auth };
@@ -152,10 +156,33 @@ export class PortalApi {
       if (!isPositiveInt(partSize) || !isPositiveInt(partCount) || partCount !== Math.ceil(file.size / partSize)) {
         throw new PortalError('bad_response');
       }
-      for (let n = 1; n <= partCount; n++) {
-        const bytes = file.body.subarray((n - 1) * partSize, Math.min(n * partSize, file.size));
-        await this.call('PUT', `/attachments/${id}/parts/${n}`, { bytes, auth });
+      // One part buffer, filled as the bytes arrive: a 2 GiB video never sits in memory (the service has 300 MB).
+      const part = new Uint8Array(Math.min(partSize, file.size));
+      let filled = 0;
+      let sent = 0;
+      let received = 0;
+      const chunks: AsyncIterable<Uint8Array> | Uint8Array[] = file.body instanceof Uint8Array ? [file.body] : file.body;
+      for await (const chunk of chunks) {
+        received += chunk.byteLength;
+        if (received > file.size) throw new PortalError('size_mismatch');
+        for (let off = 0; off < chunk.byteLength; ) {
+          const take = Math.min(part.byteLength - filled, chunk.byteLength - off);
+          part.set(chunk.subarray(off, off + take), filled);
+          filled += take;
+          off += take;
+          if (filled === part.byteLength) {
+            sent += 1;
+            await this.call('PUT', `/attachments/${id}/parts/${sent}`, { bytes: part, auth });
+            filled = 0;
+          }
+        }
       }
+      if (filled > 0) {
+        sent += 1;
+        await this.call('PUT', `/attachments/${id}/parts/${sent}`, { bytes: part.subarray(0, filled), auth });
+      }
+      // Fewer bytes than declared would complete a truncated file.
+      if (received !== file.size || sent !== partCount) throw new PortalError('size_mismatch');
       await this.call('POST', `/attachments/${id}/complete`, { auth });
     } catch (err) {
       // Best effort: a dangling upload is also aborted by the worker's retention cron after 7 days.
