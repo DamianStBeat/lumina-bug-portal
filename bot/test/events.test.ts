@@ -115,7 +115,14 @@ type PollerOptions = ConstructorParameters<typeof EventPoller>[0];
 function poller(
   file: string,
   discord: Discord,
-  opts: { base?: string; intervalMs?: number; timeoutMs?: number; replay?: boolean; store?: CursorStore } = {},
+  opts: {
+    base?: string;
+    intervalMs?: number;
+    timeoutMs?: number;
+    replay?: boolean;
+    store?: CursorStore;
+    now?: () => number;
+  } = {},
 ) {
   const base = opts.base ?? worker.base;
   const log = makeLogger();
@@ -129,6 +136,8 @@ function poller(
     config: opts.replay === undefined ? config : Object.assign(config, { replay: opts.replay }),
     log,
     intervalMs: opts.intervalMs ?? 20000,
+    // Decision 15: the clock that measures the 6 h retry window (default Date.now).
+    now: opts.now ?? Date.now,
   });
   return { p, log };
 }
@@ -577,49 +586,139 @@ describe('fix round 1: poison events (decision 3)', () => {
     });
   }
 
-  test('fix1-3: a Discord transient failure is tried 5 times (not 4, not 6), then skipped with an error log', async () => {
+  // Decision 15 (fix round 2): a transient failure is retried every tick until 6 hours have passed since its first
+  // failure, measured with the poller's `now()`; only then is it skipped with an error log.
+  const MIN = 60_000;
+  const HOUR = 60 * MIN;
+  const T0 = 1_800_000_000_000;
+
+  /** A clock the spec moves by hand. */
+  function fakeClock(start = T0) {
+    const c = { t: start, now: () => c.t };
+    return c;
+  }
+
+  test('fix2-15: a Discord transient failure is retried at every tick up to 5h59m, then skipped at 6h with an error log', async () => {
     twoFixedEvents();
     const file = seededCursor();
     const d = fakeDiscord();
     d.failThreads.set(T1, discord5xx(503));
-    const { p, log } = poller(file, d);
-    for (let n = 1; n <= 4; n++) await p.tick().catch(() => undefined);
-    assert.equal(sentTo(d, T1), 4);
-    assert.equal(sentTo(d, T2), 0, 'still waiting after 4 attempts');
+    const clock = fakeClock();
+    const { p, log } = poller(file, d, { now: clock.now });
+    // 12 ticks between the first failure and 5h59m: far more than any attempt count, all still retried.
+    const offsets = [0, 1, 2, 5, 10, 30, 60, 120, 180, 240, 300, 359].map((m) => m * MIN);
+    for (const off of offsets) {
+      clock.t = T0 + off;
+      await p.tick().catch(() => undefined);
+    }
+    assert.equal(sentTo(d, T1), offsets.length, 'tried at every tick');
+    assert.equal(sentTo(d, T2), 0, 'order kept: event 2 waits behind it');
     assert.equal(await cursorValue(file), 0);
-    for (let n = 5; n <= 8; n++) await p.tick().catch(() => undefined);
-    assert.equal(sentTo(d, T1), 5, 'exactly 5 attempts');
-    assert.equal(sentTo(d, T2), 1, 'the stream moves on, once');
+    assert.ok(!log.lines.some((l) => l.level === 'error'), log.text());
+
+    clock.t = T0 + 6 * HOUR;
+    await p.tick().catch(() => undefined);
+    assert.equal(sentTo(d, T2), 1, 'skipped at 6h: the stream moves on, once');
     assert.equal(await cursorValue(file), 2);
     assert.ok(hasLine(log, 'error', [1, 'LUM-000001']), log.text());
+    clock.t = T0 + 7 * HOUR;
+    await p.tick().catch(() => undefined);
+    assert.ok(sentTo(d, T1) <= offsets.length + 1, 'not tried again after the skip');
+    assert.equal(sentTo(d, T2), 1);
   });
 
-  test('fix1-3: a fifth attempt that succeeds posts the event (the cap is not reached early)', async () => {
+  test('fix2-15: a transient failure that clears at 5h59m posts the event once, no error log', async () => {
     twoFixedEvents();
     const file = seededCursor();
     const d = fakeDiscord();
     d.failThreads.set(T1, discord5xx(502));
-    const { p, log } = poller(file, d);
-    for (let n = 1; n <= 4; n++) await p.tick().catch(() => undefined);
+    const clock = fakeClock();
+    const { p, log } = poller(file, d, { now: clock.now });
+    for (let n = 0; n < 8; n++) {
+      clock.t = T0 + n * 45 * MIN; // 0 .. 5h15m, 8 failed ticks
+      await p.tick().catch(() => undefined);
+    }
     d.failThreads.clear();
+    clock.t = T0 + 6 * HOUR - MIN;
     await p.tick().catch(() => undefined);
-    assert.equal(sentTo(d, T1), 5, 'four failures and the post');
+    assert.equal(sentTo(d, T1), 9, 'eight failures and the post');
     assert.equal(sentTo(d, T2), 1);
     assert.equal(await cursorValue(file), 2);
     assert.ok(!log.lines.some((l) => l.level === 'error'), log.text());
   });
 
-  test('fix1-3: a worker transient failure on the report is tried 5 times, then skipped', async () => {
+  test('fix2-15: the 6h count from the first failure, not from when the poller started', async () => {
+    const file = seededCursor();
+    const d = fakeDiscord();
+    const clock = fakeClock();
+    const { p } = poller(file, d, { now: clock.now });
+    await p.tick(); // nothing to do yet
+    clock.t = T0 + 10 * HOUR;
+    twoFixedEvents();
+    d.failThreads.set(T1, discord5xx(503));
+    for (const m of [0, 60, 120, 180, 240, 300, 359]) {
+      clock.t = T0 + 10 * HOUR + m * MIN;
+      await p.tick().catch(() => undefined);
+    }
+    assert.equal(sentTo(d, T2), 0, 'still within 6h of its first failure');
+    clock.t = T0 + 16 * HOUR;
+    await p.tick().catch(() => undefined);
+    assert.equal(sentTo(d, T2), 1);
+  });
+
+  test('fix2-15: a restart resets the window (the event is retried again, never lost)', async () => {
+    twoFixedEvents();
+    const file = seededCursor();
+    const d = fakeDiscord();
+    d.failThreads.set(T1, discord5xx(503));
+    const clock = fakeClock();
+    const first = poller(file, d, { now: clock.now }).p;
+    for (const m of [0, 120, 359]) {
+      clock.t = T0 + m * MIN;
+      await first.tick().catch(() => undefined);
+    }
+    // Restart at 7h: a new process, a new first failure.
+    const second = poller(file, d, { now: clock.now }).p;
+    for (const h of [7, 8, 9, 10, 11, 12, 12.9]) {
+      clock.t = T0 + h * HOUR;
+      await second.tick().catch(() => undefined);
+    }
+    assert.equal(sentTo(d, T2), 0, 'retried after the restart, not skipped');
+    assert.equal(await cursorValue(file), 0);
+    clock.t = T0 + 13 * HOUR;
+    await second.tick().catch(() => undefined);
+    assert.equal(sentTo(d, T2), 1, '6h after the new first failure: skipped');
+  });
+
+  test('fix2-15: a permanent refusal is still skipped at once, whatever the clock', async () => {
+    twoFixedEvents();
+    const file = seededCursor();
+    const d = fakeDiscord();
+    d.failThreads.set(T1, discordError(50013, 403));
+    const clock = fakeClock();
+    const { p } = poller(file, d, { now: clock.now });
+    await p.tick().catch(() => undefined);
+    assert.equal(sentTo(d, T1), 1);
+    assert.equal(sentTo(d, T2), 1);
+    assert.equal(await cursorValue(file), 2);
+  });
+
+  test('fix2-15: a worker transient failure on the report is retried up to 5h59m, skipped at 6h', async () => {
     twoFixedEvents();
     const file = seededCursor();
     const d = fakeDiscord();
     worker.override = (r) => (r.path === '/agent/reports/LUM-000001' ? { status: 503, body: { error: 'unavailable' } } : undefined);
-    const { p, log } = poller(file, d);
-    for (let n = 1; n <= 4; n++) await p.tick().catch(() => undefined);
-    assert.equal(worker.find('GET', '/agent/reports/LUM-000001').length, 4);
+    const clock = fakeClock();
+    const { p, log } = poller(file, d, { now: clock.now });
+    const offsets = [0, 30, 60, 90, 120, 180, 240, 300, 359].map((m) => m * MIN);
+    for (const off of offsets) {
+      clock.t = T0 + off;
+      await p.tick().catch(() => undefined);
+    }
+    assert.equal(worker.find('GET', '/agent/reports/LUM-000001').length, offsets.length);
     assert.equal(sentTo(d, T2), 0);
-    for (let n = 5; n <= 8; n++) await p.tick().catch(() => undefined);
-    assert.equal(worker.find('GET', '/agent/reports/LUM-000001').length, 5);
+    clock.t = T0 + 6 * HOUR;
+    await p.tick().catch(() => undefined);
     assert.equal(sentTo(d, T2), 1);
     assert.equal(await cursorValue(file), 2);
     assert.ok(hasLine(log, 'error', [1, 'LUM-000001']), log.text());

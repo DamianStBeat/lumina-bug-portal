@@ -52,3 +52,17 @@ test('fix1-10: a stop that rejects, or a destroy that rejects, does not stop the
   );
   assert.equal(destroyed, true);
 });
+
+// Decision 16 (fix round 2): the shutdown waits for client.destroy() before it resolves (the process exits next).
+test('fix2-16: stopThenDestroy resolves only after destroy has finished', async () => {
+  let destroyed = false;
+  await stopThenDestroy(
+    async () => undefined,
+    async () => {
+      await pause(30);
+      destroyed = true;
+    },
+    1000,
+  );
+  assert.equal(destroyed, true);
+});
