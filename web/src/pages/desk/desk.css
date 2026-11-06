@@ -46,6 +46,8 @@
 .desk-meta{color:var(--slate);font-size:13px;margin-top:8px;overflow-wrap:anywhere}
 .frames button{display:block;padding:0;min-width:0;border-radius:6px}
 @media(max-width:479px){.frames{grid-template-columns:repeat(3,1fr)}}
+/* Three frames across a 320 px phone are 50 px tall: two keep each one a 56 px finger target. */
+@media(max-width:379px){.frames{grid-template-columns:repeat(2,1fr)}}
 .ai{overflow-wrap:anywhere}
 .actions{flex-wrap:wrap}
 .actions>*{flex:1 1 160px}

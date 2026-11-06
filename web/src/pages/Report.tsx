@@ -68,6 +68,8 @@ export default function Report() {
     if (sending) return
     setSending(true)
     setFailed(false)
+    // The page may be left or reset while createReport is out; its answer then belongs to nobody.
+    const still = up.guard()
     try {
       let target: Target | undefined
       // Once the report exists, sending again only continues its upload: never a second report.
@@ -81,11 +83,13 @@ export default function Report() {
           lang,
           turnstileToken: token,
         })
+        if (!still()) return
         setCode(target.code)
       }
       // start() keeps its own failures (phase 'error', screen 3e); only createReport throws here.
       await up.start(target)
     } catch {
+      if (!still()) return
       // Nothing typed or picked is lost; the used token is not valid twice, so the widget issues a new one.
       setFailed(true)
       widget.current?.reset()
@@ -177,7 +181,8 @@ export default function Report() {
     )
   }
 
-  const uploading = up.phase === 'uploading'
+  // A Remove waiting for the server locks the page as an upload does: the list is about to change.
+  const uploading = up.phase === 'uploading' || up.removing
   const missing = up.resume?.missing ?? []
   // A refused file is removed first (FilePicker's Remove), then Send goes on with the rest.
   const canSend = !up.refused && (code ? up.files.length > 0 : !!token && !!what.trim())
@@ -199,7 +204,7 @@ export default function Report() {
       {up.phase === 'error' ? (
         <>
           <div className="gap" />
-          <button type="button" className="btn gold-btn" onClick={() => void up.retry()}>
+          <button type="button" className="btn gold-btn" disabled={up.removing} onClick={() => void up.retry()}>
             {t.retry}
           </button>
         </>

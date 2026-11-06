@@ -140,6 +140,8 @@ header .lang{display:inline-flex;align-items:center;gap:8px;min-height:56px;padd
 button.chip{width:100%;text-align:left}
 .filters button{font-size:13px;padding:7px 12px;border-radius:999px;border:1px solid rgba(142,220,255,.22);color:var(--slate)}
 .filters button.on{color:#1a0f02;background:var(--warm-gold);border-color:var(--warm-gold);font-weight:700}
+/* Under 820 px the desk is a phone or a tablet: a finger needs 56 px. The approved PC look stays from 820 px up. */
+@media(max-width:819px){.filters button{min-height:56px;padding:0 16px;font-size:15px}}
 .frames img{display:block;width:100%;aspect-ratio:16/10;object-fit:cover;border-radius:6px;opacity:.85}
 .frames img.hit{outline:2px solid var(--warm-gold);opacity:1}
 .video video{display:block;width:100%;height:100%;background:#000}

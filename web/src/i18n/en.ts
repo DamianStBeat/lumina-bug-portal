@@ -52,7 +52,7 @@ export const en = {
   errType: 'This file is not a video or a picture. Choose another file.',
   errSize: 'This file is bigger than 2 GB. Choose a shorter video.',
   errCount: 'A report can have up to 3 files.',
-  errSend: 'The report did not go through. Check your Wi-Fi, then press Try again.',
+  errSend: 'The report did not go through. Check your Wi-Fi, then send it again.',
   errCode: "We can't find that code. Check it and try again.",
   statusH: 'Your report',
   statusLead: 'Here is where your report is now.',
@@ -73,4 +73,6 @@ export const en = {
   errRefused: "We can't add this file. Remove it, or press Back to start again.",
   errCheck: 'The safety check did not load. Check your Wi-Fi, then press Try again.',
   remove: 'Remove',
+  // Critical round: a Remove the server did not answer; the file stays listed until its place is given back.
+  errRemove: 'This file was not removed. Check your Wi-Fi, then press Remove again.',
 }

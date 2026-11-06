@@ -116,6 +116,8 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
 
   const files = r.attachments.filter((a) => a.status === 'complete')
   const media = files.find((a) => a.kind === 'video') ?? files.find((a) => a.kind === 'image')
+  // Nothing to play yet is not the same as nothing sent: a file still arriving says so.
+  const pending = r.attachments.some((a) => a.status === 'uploading' && (a.kind === 'video' || a.kind === 'image'))
   const frames = r.frames.filter((a) => a.status === 'complete')
   const hits = new Set(Array.isArray(r.triage?.frameHits) ? r.triage.frameHits : [])
   const ai = r.triage ? lines(r.triage) : []
@@ -144,7 +146,7 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
           </p>
         </>
       ) : (
-        <p className="desk-line">No video or picture.</p>
+        <p className="desk-line">{pending ? 'Still uploading.' : 'No video or picture.'}</p>
       )}
       {frames.length > 0 && (
         <div className="frames">

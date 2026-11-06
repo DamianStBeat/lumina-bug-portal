@@ -26,6 +26,7 @@ const FILES = {
   big: sparse('boss-300mb.mp4', 300 * MiB),
   mid: sparse('wave-100mb.mp4', 100 * MiB),
   small: sparse('clip-20mb.mp4', 20 * MiB),
+  tiny: sparse('bug-5mb.mp4', 5 * MiB),
   huge: sparse('long-3gb.mp4', 3 * 1024 ** 3),
   zip: sparse('logs.zip', 2048),
 }
@@ -141,16 +142,18 @@ async function settle(page) {
   }
 }
 
-// Width rule for every page; the 56 px rule on the player pages and on the desk's action buttons (the desk's filter
-// pills stay at the preview's size). Clipped: content bigger than a box that hides its overflow, or spilling out of
-// a control (the ellipsis on file names is meant). Overlap: two controls whose boxes cross.
+// Width rule for every page; the 56 px rule on the player pages and on the desk under 820 px (touch layouts); from
+// 820 px the desk keeps the preview's filter pills, so only its action buttons are held to 56 px. Clipped: content
+// bigger than a box that hides its overflow, or spilling out of a control (the ellipsis on file names is meant).
+// Overlap: two controls whose boxes cross.
 function measure(page, desk) {
   return page.evaluate((desk) => {
     const vis = (el) => el.checkVisibility({ visibilityProperty: true, opacityProperty: true })
     const name = (el) => `${el.tagName.toLowerCase()}.${String(el.className).trim().replace(/ +/g, '.')}`
     const over = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth
     const small = []
-    for (const el of document.querySelectorAll(desk ? '.actions .btn' : 'button, a[href], input, textarea, select, .chip')) {
+    const pc = desk && window.innerWidth >= 820
+    for (const el of document.querySelectorAll(pc ? '.actions .btn' : 'button, a[href], input, textarea, select, .chip')) {
       if (!vis(el)) continue
       const r = el.getBoundingClientRect()
       if (r.width > 0 && r.height > 0 && r.height < 56) small.push(`${name(el)}=${Math.round(r.height)}px`)
@@ -372,11 +375,19 @@ const ROWS = {
     await page.waitForFunction((t) => document.querySelector('.err')?.textContent?.trim() !== t, zip.text)
     const huge = await errOf(page)
     const rows = await page.locator('.file').count()
+    // Four good files in one pick: three are listed, the fourth is the count message, and nothing is sent.
+    await input.setInputFiles([FILES.big, FILES.mid, FILES.small, FILES.tiny])
+    await page.waitForFunction((t) => document.querySelector('.err')?.textContent?.trim() !== t, huge.text)
+    const four = await errOf(page)
+    const listed = await page.locator('.file').count()
     await close()
     if (zip.border !== ORANGE || huge.border !== ORANGE || zip.text === huge.text || rows || seen.attachments) {
       throw new Error(`${JSON.stringify([zip, huge])} rows ${rows} posts ${seen.attachments}`)
     }
-    return `"${zip.text}" / "${huge.text}", 0 POST attachments`
+    if (four.border !== ORANGE || four.text !== 'A report can have up to 3 files.' || listed !== 3) {
+      throw new Error(`four files: ${JSON.stringify(four)} listed ${listed}`)
+    }
+    return `"${zip.text}" / "${huge.text}" / four at once: 3 listed + "${four.text}", 0 POST attachments`
   },
   7: async () => {
     const { page, close } = await open('/', { locale: 'it-IT' })
@@ -410,19 +421,30 @@ const ROWS = {
     return 'code prefilled, 20 MB video added, "We have it" with LUM-482193'
   },
   9: async () => {
-    const { page, close } = await open('/status/LUM-482193')
-    await page.locator('.state').waitFor()
-    const four = await page.evaluate(() => document.querySelector('.state')?.textContent)
-    const parts = await page.locator('.card > *').evaluateAll((els) => els.map((el) => el.className || el.tagName))
-    const text = await page.locator('.card').textContent()
-    await close()
-    const known = ["We have it. Nobody has looked at it yet.", "We're looking at it.", 'It is fixed in the game.',
-      'We checked it. There is nothing to fix.']
-    const extra = parts.filter((c) => !['eyebrow', 'gold', 'lead', 'track', 'state', 'small'].includes(c))
-    if (!known.includes(four ?? '') || extra.length || /boss|bridge|phone/i.test(text ?? '')) {
-      throw new Error(`${four}; extra ${extra}`)
+    const said = {
+      received: 'We have it. Nobody has looked at it yet.', looking: "We're looking at it.", fixed: 'It is fixed in the game.',
+      checked: 'We checked it. There is nothing to fix.',
     }
-    return `"${four}", nothing else (${parts.join(', ')})`
+    // The page must show the state the API gives for that code, not any of the four.
+    const check = async (code, want) => {
+      const api = (await call(`/api/v1/status/${code}`)).status
+      const { page, close } = await open(`/status/${code}`)
+      await page.locator('.state').waitFor()
+      const four = await page.evaluate(() => document.querySelector('.state')?.textContent)
+      const parts = await page.locator('.card > *').evaluateAll((els) => els.map((el) => el.className || el.tagName))
+      const text = await page.locator('.card').textContent()
+      await close()
+      const extra = parts.filter((c) => !['eyebrow', 'gold', 'lead', 'track', 'state', 'small'].includes(c))
+      if (api !== want || four !== said[api] || extra.length || /boss|bridge|phone|clan chat/i.test(text ?? '')) {
+        throw new Error(`${code}: api ${api}, want ${want}, shown "${four}"; extra ${extra}`)
+      }
+      return `${code} ${api} → "${four}"`
+    }
+    const seeded = await check('LUM-482193', 'looking')
+    // A second state, set through the mock's desk route: the page follows the API, it does not keep a default.
+    await call('/api/v1/desk/reports/LUM-481793/status', { status: 'fixed' })
+    const changed = await check('LUM-481793', 'fixed')
+    return `${seeded}; ${changed}; nothing else on the card`
   },
   10: async () => {
     const { page, close } = await open('/desk?code=LUM-482193', { width: 1440 })

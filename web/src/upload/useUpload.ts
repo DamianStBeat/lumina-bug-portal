@@ -77,12 +77,17 @@ export function useUpload(only?: string) {
   const saved = useRef<Session | null>(boot.s)
   const target = useRef<Target | null>(null)
   const entries = useRef<Entry[]>([])
-  // Non-null while a run is going; also how reset() and unmount stop it.
+  // Non-null while a run (an upload, or the delete of a removed file) is going; also how reset() and unmount stop it.
   const run = useRef<AbortController | null>(null)
+  // Moves on at reset() and at unmount, so a page's own request answered after either is told apart (guard()).
+  const epoch = useRef(0)
   const [files, setFiles] = useState<FileItem[]>([])
   const [phase, setPhase] = useState<Phase>('idle')
   const [rejection, setRejection] = useState<Rejection | null>(null)
   const [resume, setResume] = useState<Resume | null>(boot.resume)
+  // A removed file whose attachment is being deleted; and one whose delete failed, which stays in the list.
+  const [removing, setRemoving] = useState(false)
+  const [unremoved, setUnremoved] = useState(false)
 
   const sync = useCallback(() => setFiles(entries.current.map(view)), [])
   const store = useCallback((s: Session | null) => {
@@ -103,10 +108,19 @@ export function useUpload(only?: string) {
   useEffect(() => {
     const list = entries
     const ctl = run
+    const ep = epoch
     return () => {
+      ep.current++
       ctl.current?.abort()
       list.current.forEach((e) => e.previewUrl && URL.revokeObjectURL(e.previewUrl))
     }
+  }, [])
+
+  // Taken by a page before its own await (createReport, attachSession): false afterwards when the page was left or
+  // reset meanwhile, so a late answer never starts an upload nor overwrites the session of the one made since.
+  const guard = useCallback(() => {
+    const at = epoch.current
+    return () => epoch.current === at
   }, [])
 
   const addFiles = useCallback(
@@ -138,20 +152,42 @@ export function useUpload(only?: string) {
   )
 
   const removeFile = useCallback(
-    (key: string) => {
+    async (key: string): Promise<void> => {
       const e = entries.current.find((x) => x.key === key)
       if (!e || run.current || e.state === 'done') return
-      if (e.previewUrl) URL.revokeObjectURL(e.previewUrl)
-      entries.current = entries.current.filter((x) => x !== e)
-      const s = saved.current
-      if (s) {
-        // Best effort: an attachment left behind is aborted by the worker's daily cleanup after 7 days.
-        if (e.att) deleteAttachment(e.att.attachmentId, s.reportToken).catch(() => {})
-        store({ ...s, files: s.files.filter((f) => !sameFile(f, e.file)) })
+      const token = saved.current?.reportToken
+      if (e.att && token) {
+        // Its attachment holds one of the report's 3 places, so the file leaves the list (and the session) only once
+        // the server has let it go; a failed delete keeps both, and pressing Remove again retries it.
+        const ac = new AbortController()
+        run.current = ac
+        setRemoving(true)
+        setUnremoved(false)
+        try {
+          await deleteAttachment(e.att.attachmentId, token)
+        } catch (err) {
+          // 404: the attachment is already gone, which is what removing it asked for.
+          if (!(err instanceof ApiError && err.status === 404)) {
+            if (!ac.signal.aborted) {
+              patch(key, { state: 'error' })
+              setUnremoved(true)
+            }
+            return
+          }
+        } finally {
+          if (run.current === ac) run.current = null
+          if (!ac.signal.aborted) setRemoving(false)
+        }
+        // reset() or unmount came first: the list and the session are no longer this one's to change.
+        if (ac.signal.aborted) return
       }
+      if (e.previewUrl) URL.revokeObjectURL(e.previewUrl)
+      entries.current = entries.current.filter((x) => x.key !== key)
+      const s = saved.current
+      if (s) store({ ...s, files: s.files.filter((f) => !sameFile(f, e.file)) })
       sync()
     },
-    [sync, store],
+    [sync, store, patch],
   )
 
   const start = useCallback(
@@ -179,6 +215,8 @@ export function useUpload(only?: string) {
       const live = () => !ac.signal.aborted
       run.current = ac
       setPhase('uploading')
+      // The file whose delete failed goes up with the rest: it is no longer a file waiting to be removed.
+      setUnremoved(false)
       sync()
       let current: string | null = null
       try {
@@ -237,6 +275,7 @@ export function useUpload(only?: string) {
   const retry = useCallback(() => start(target.current ?? undefined), [start])
 
   const reset = useCallback(() => {
+    epoch.current++
     run.current?.abort()
     run.current = null
     entries.current.forEach((e) => e.previewUrl && URL.revokeObjectURL(e.previewUrl))
@@ -246,6 +285,8 @@ export function useUpload(only?: string) {
     sync()
     setPhase('idle')
     setRejection(null)
+    setRemoving(false)
+    setUnremoved(false)
   }, [sync, store])
 
   const total = files.reduce((n, f) => n + f.size, 0)
@@ -253,7 +294,22 @@ export function useUpload(only?: string) {
 
   const refused = files.find((f) => f.state === 'refused')?.why ?? null
 
-  return { files, phase, rejection, refused, progress, resume, addFiles, removeFile, start, retry, reset }
+  return {
+    files,
+    phase,
+    rejection,
+    refused,
+    progress,
+    resume,
+    removing,
+    unremoved,
+    addFiles,
+    removeFile,
+    start,
+    retry,
+    reset,
+    guard,
+  }
 }
 
 function entry(file: File, state: Entry['state'], confirmed: number, att?: Att): Entry {

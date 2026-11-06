@@ -50,7 +50,7 @@ export const it: Strings = {
   errType: 'Questo file non è un video né una foto. Scegline un altro.',
   errSize: 'Questo file supera i 2 GB. Scegli un video più corto.',
   errCount: 'Una segnalazione può avere al massimo 3 file.',
-  errSend: 'La segnalazione non è partita. Controlla il Wi-Fi, poi premi Riprova.',
+  errSend: 'La segnalazione non è partita. Controlla il Wi-Fi, poi mandala di nuovo.',
   errCode: 'Non troviamo questo codice. Controllalo e riprova.',
   statusH: 'La tua segnalazione',
   statusLead: 'Ecco a che punto è la tua segnalazione.',
@@ -69,4 +69,5 @@ export const it: Strings = {
   errRefused: 'Non possiamo aggiungere questo file. Toglilo, o premi Indietro per ricominciare.',
   errCheck: 'Il controllo di sicurezza non si è caricato. Controlla il Wi-Fi, poi premi Riprova.',
   remove: 'Togli',
+  errRemove: 'Questo file non è stato tolto. Controlla il Wi-Fi, poi premi di nuovo Togli.',
 }

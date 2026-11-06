@@ -15,8 +15,9 @@ const CODE = /^LUM-\d{6}$/
 export default function AddVideo() {
   const { t } = useI18n()
   const { query } = useRoute()
+  const addr = (query.get('code') ?? '').trim().toUpperCase()
   // The code in the address wins: a saved upload is offered only for that same code (or when none is given).
-  const [asked] = useState(() => (query.get('code') ?? '').trim().toUpperCase())
+  const [asked] = useState(addr)
   const up = useUpload(asked || undefined)
   // `bound` is the report the upload belongs to; set after a reload too, so the same files continue without a check.
   const [bound, setBound] = useState<string | null>(up.resume?.code ?? null)
@@ -27,6 +28,17 @@ export default function AddVideo() {
   const [failed, setFailed] = useState(false)
   const widget = useRef<TurnstileHandle>(null)
   const ids = { code: useId(), hint: useId() }
+
+  // Browser Back and Forward change the address under this same page. The field follows it while no upload owns the
+  // form; once bound (or sending, or uploading) it keeps the report the files go to, and Back is the way out.
+  const [seen, setSeen] = useState(addr)
+  if (addr !== seen) {
+    setSeen(addr)
+    if (!bound && !sending && up.phase !== 'uploading') {
+      setCode(addr)
+      setBadCode(false)
+    }
+  }
 
   const add = async () => {
     if (sending) return
@@ -41,11 +53,15 @@ export default function AddVideo() {
     }
     if (!token) return
     setSending(true)
+    // The page may be left or reset while attachSession is out; its answer then belongs to nobody.
+    const still = up.guard()
     try {
       const { reportToken } = await attachSession(code, token)
+      if (!still()) return
       setBound(code)
       await up.start({ code, reportToken })
     } catch (e) {
+      if (!still()) return
       // 404: the code is wrong, the player can fix it; anything else is the network or the server.
       if (e instanceof ApiError && e.status === 404) setBadCode(true)
       else setFailed(true)
@@ -79,7 +95,8 @@ export default function AddVideo() {
     )
   }
 
-  const uploading = up.phase === 'uploading'
+  // A Remove waiting for the server locks the page as an upload does: the list is about to change.
+  const uploading = up.phase === 'uploading' || up.removing
   const missing = up.resume?.missing ?? []
   // Only when there is something to undo: a code typed or prefilled stays editable in its field.
   const backButton = (bound || up.files.length > 0) && (
@@ -131,7 +148,7 @@ export default function AddVideo() {
       <FilePicker up={up} locked={sending} />
       {up.phase === 'error' ? (
         <>
-          <button type="button" className="btn gold-btn" onClick={() => void up.retry()}>
+          <button type="button" className="btn gold-btn" disabled={up.removing} onClick={() => void up.retry()}>
             {t.retry}
           </button>
           {backButton}

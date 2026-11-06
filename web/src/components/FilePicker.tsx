@@ -21,7 +21,7 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
   const { t } = useI18n()
   const input = useRef<HTMLInputElement>(null)
   const [over, setOver] = useState(false)
-  const busy = locked || up.phase === 'uploading'
+  const busy = locked || up.phase === 'uploading' || up.removing
 
   const take = (list: FileList | null) => {
     if (busy || !list || list.length === 0) return
@@ -40,7 +40,8 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
 
   return (
     <>
-      {up.phase === 'error' && <Err text={t.errUp} />}
+      {/* A failed Remove has its own line: Try again would upload the file the player wanted gone. */}
+      {up.unremoved ? <Err text={t.errRemove} /> : up.phase === 'error' && <Err text={t.errUp} />}
       {refused && up.phase !== 'error' && <Err text={refused} />}
       {why && why !== refused && up.phase !== 'error' && <Err text={why} />}
       {up.phase !== 'error' && (
@@ -82,7 +83,7 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
         }}
       />
       {up.files.map((f) => (
-        <FileRow key={f.key} f={f} onRemove={busy || f.state === 'done' ? undefined : () => up.removeFile(f.key)} />
+        <FileRow key={f.key} f={f} onRemove={busy || f.state === 'done' ? undefined : () => void up.removeFile(f.key)} />
       ))}
     </>
   )
