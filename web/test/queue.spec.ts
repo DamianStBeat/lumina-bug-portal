@@ -427,6 +427,12 @@ describe('queue: stale answers are dropped (the same state object)', () => {
       const u = fxOf(s, 'upload')[0]!
       return { s, ev: { t: 'uploaded', key: u.key, gen: u.gen, epoch: u.epoch }, gone: removeGone }
     },
+    // Red team r1 (Astra, test gap): a failed upload, Try again can pass it.
+    failed: () => {
+      const s = upload()
+      const u = fxOf(s, 'upload')[0]!
+      return { s, ev: { t: 'failed', key: u.key, gen: u.gen, epoch: u.epoch, why: null }, gone: removeGone }
+    },
     'delete answered': () => {
       const u = upload()
       const s = reduce(u, { t: 'remove', key: keyOf(u, 'a.mp4') })
@@ -464,5 +470,20 @@ describe('queue: stale answers are dropped (the same state object)', () => {
       expect(s.epoch).toBe(1)
       expect(reduce(s, older(ev, { epoch: -1 }))).toBe(s)
     })
+  })
+
+  // Red team r1 (Astra, test gap): the failure of the attempt before a Try again lands on the retried upload.
+  it('failed of an old generation against the retried upload of the same file: dropped, the retry goes on', () => {
+    const s0 = upload()
+    const u = fxOf(s0, 'upload')[0]!
+    const ev: Event = { t: 'failed', key: u.key, gen: u.gen, epoch: u.epoch, why: null }
+    const s1 = reduce(s0, ev)
+    expect(item(s1, 'a.mp4')?.step).toBe('failed')
+    const s2 = reduce(s1, { t: 'send' })
+    expect(item(s2, 'a.mp4')).toMatchObject({ step: 'uploading', gen: u.gen + 1 })
+    expect(fxOf(s2, 'upload')[0]).toMatchObject({ key: u.key, gen: u.gen + 1 })
+    expect(reduce(s2, ev)).toBe(s2)
+    // Its refusal too: an old "refused" never turns the retried upload into a refused file.
+    expect(reduce(s2, { ...ev, why: 'size' })).toBe(s2)
   })
 })
