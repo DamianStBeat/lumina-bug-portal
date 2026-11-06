@@ -168,6 +168,38 @@ describe('web-fix row 3: Remove fails, then another file is picked', () => {
     expect(names(h3)).toEqual(['d.mp4'])
   })
 
+  // After a reload whose background DELETE failed: a pick that needs the removed file's place sends that DELETE again
+  // first, and its answer decides the pick.
+  async function backgroundDeleteFailed() {
+    const saved = await removeFailedThenLeft()
+    const h2 = mount()
+    await settle()
+    expect(deletes()).toHaveLength(2)
+    expect(marked('a.mp4')).toBe(true)
+    return { ...saved, h2 }
+  }
+
+  it('row 3 retry: the pick that needs the place sends the DELETE again; answered 200 { ok: true } the pick is accepted', async () => {
+    const { att, h2 } = await backgroundDeleteFailed()
+    server.routeFault = () => null
+    await pick(h2, [file('b.mp4', 2 * MiB), file('c.mp4', 2 * MiB), file('d.mp4', 2 * MiB)])
+    expect(deletes()).toHaveLength(3)
+    expect(att.status).toBe('aborted')
+    expect(line('a.mp4')).toBeUndefined()
+    expect(h2.result.current.rejection).toBeNull()
+    expect(names(h2)).toEqual(['b.mp4', 'c.mp4', 'd.mp4'])
+  })
+
+  it('row 3 retry: the DELETE sent again fails again, so the pick is refused as count and the line stays marked', async () => {
+    const { att, h2 } = await backgroundDeleteFailed()
+    await pick(h2, [file('b.mp4', 2 * MiB), file('c.mp4', 2 * MiB), file('d.mp4', 2 * MiB)])
+    expect(deletes()).toHaveLength(3)
+    expect(att.status).toBe('uploading')
+    expect(marked('a.mp4')).toBe(true)
+    expect(h2.result.current.rejection).toBe('count')
+    expect(names(h2)).toEqual(['b.mp4', 'c.mp4'])
+  })
+
   it('row 3 edge: with the removed file holding its place, two new files fit and are accepted', async () => {
     await removeFailedThenLeft()
     const h2 = mount()
