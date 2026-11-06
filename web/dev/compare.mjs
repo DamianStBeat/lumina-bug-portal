@@ -39,6 +39,8 @@ const SHEETS = {
     { built: 'it-we-have-it', shot: 'phone-4-it.png' },
     { built: 'add', shot: 'phone-addvideo.png' },
     { built: 'status', none: NO_STATUS },
+    // No approved desk shot at 390 (desk.png is the 1440 one): the preview's desk screen is rendered at 390.
+    { built: 'desk', src: 's=d' },
   ],
   1440: [
     { built: 'step1', shot: 'pc-1.png' },
@@ -52,6 +54,22 @@ const SHEETS = {
     { built: 'status', none: NO_STATUS },
     { built: 'desk', shot: 'desk.png' },
   ],
+}
+
+// Every screen dev/shots.mjs takes must have its row on both sheets: a screen added there and forgotten here would
+// leave Damian's comparison silently short. The names are read from its SCREENS list, which runs nothing.
+const shotsSrc = readFileSync(new URL('./shots.mjs', import.meta.url), 'utf8')
+const screens = [...(shotsSrc.match(/\nconst SCREENS = \[([\s\S]*?)\n\]/)?.[1] ?? '').matchAll(/name: '([^']+)'/g)].map((m) => m[1])
+if (screens.length === 0) {
+  console.error('compare: no SCREENS list found in dev/shots.mjs')
+  process.exit(1)
+}
+for (const [width, list] of Object.entries(SHEETS)) {
+  const lost = screens.filter((n) => !list.some((r) => r.built === n))
+  if (lost.length) {
+    console.error(`compare: the ${width} sheet has no row for ${lost.join(', ')} (screens of dev/shots.mjs)`)
+    process.exit(1)
+  }
 }
 
 // Width and height from the PNG header (IHDR), so rows can be measured before the sheet is laid out.
@@ -86,7 +104,10 @@ async function rowOf(r, width) {
     : { label: `${r.built} · built`, from: 'missing', note: `No built shot: ${file} is missing.` }
   let left
   if (r.shot) left = side(readFileSync(path.join(preview, 'shots', r.shot)), `${r.built} · preview`, `approved ${r.shot}`)
-  else if (r.src) left = side(await renderPreview(r.src, width), `${r.built} · preview`, `rendered from source ?${r.src}`)
+  else if (r.src) {
+    const buf = await renderPreview(r.src, width)
+    left = side(buf, `${r.built} · preview (rendered from source)`, `index.html?${r.src} at ${width} px`)
+  }
   else left = { label: `${r.built} · preview`, from: 'none', note: r.none }
   const tall = Math.max(left.img?.h ?? 200, right.img?.h ?? 200)
   return { left, right, tall: LABEL + tall + GAP }

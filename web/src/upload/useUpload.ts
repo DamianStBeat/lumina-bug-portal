@@ -44,12 +44,20 @@ const view = (e: Entry): FileItem => ({
 })
 
 // A re-picked file is the same one when name, size and the hash of its first 1 MiB match; the same three values find
-// its saved line. lastModified does not decide: iPhone Photos gives the same video a new one on every export. Two
-// files the browser could not hash (head null on both) fall back to name and size, all it gives then.
-const sameFile = (a: Ident | null, b: Ident) => a !== null && a.name === b.name && a.size === b.size && a.head === b.head
+// its saved line. lastModified does not decide: iPhone Photos gives the same video a new one on every export. A file
+// the browser could not hash (head null) is never bound to a saved line that has an attachment: name and size cannot
+// tell two videos apart, and resuming would put one video's parts after another's. Correctness wins over resume, so
+// such a pick is a new upload. A line with no attachment yet has no bytes on the server, so it may still be matched.
+const sameFile = (a: Ident | null, b: Ident & { attachmentId?: string | null }) =>
+  a !== null && a.name === b.name && a.size === b.size && a.head === b.head && (a.head !== null || !b.attachmentId)
 const idOf = (e: Entry): Ident | null => (e.head === undefined ? null : { name: e.file.name, size: e.file.size, head: e.head })
 // Name and size alone: two such files may be the same one, which only their hashes can tell.
 const twins = (a: { name: string; size: number }, b: { name: string; size: number }) => a.name === b.name && a.size === b.size
+// An open line no re-pick can be bound to (above). A listed file of its name and size answers it in the resume hint and
+// in Send's "done": that file goes up as a new one; the old attachment still holds its place (heldBy) until the server
+// lets it go.
+const blind = (f: SavedFile) => f.head === null && f.attachmentId !== null && !f.done && f.removing !== true
+const answered = (f: SavedFile, list: Entry[]) => blind(f) && list.some((e) => twins(e.file, f))
 
 // The SHA-256 (hex) of the first 1 MiB. A file the browser cannot read or hash gets null, not a failed pick: it can
 // still be sent, it is only known again by name and size.
@@ -112,7 +120,7 @@ function resumeOf(s: Session | null, list: Entry[]): Resume | null {
   const open = s ? s.files.filter((f) => !f.done && !marked(f)) : []
   if (!s || open.length === 0) return null
   const missing = open
-    .filter((f) => !list.some((e) => sameFile(idOf(e), f)))
+    .filter((f) => !answered(f, list) && !list.some((e) => sameFile(idOf(e), f)))
     .map(({ name, size }) => ({ name, size }))
   return { code: s.code, missing }
 }
@@ -147,6 +155,11 @@ export function useUpload(only?: string) {
   // and removeFile() wait for it; `waiting` counts the picks queued whole, which every later pick must wait behind.
   const queue = useRef<Promise<void>>(Promise.resolve())
   const waiting = useRef(0)
+  // Removes pressed and not finished, one after the other, each behind the picks queued before it. start() waits for
+  // them after the picks, and a pick's onBack is not called for a file in `leaving`: a Remove pressed before the upload
+  // began always takes effect.
+  const removals = useRef<Promise<void>>(Promise.resolve())
+  const leaving = useRef(new Set<string>())
 
   const sync = useCallback(() => setFiles(entries.current.map(view)), [])
   const store = useCallback((s: Session | null) => {
@@ -371,26 +384,28 @@ export function useUpload(only?: string) {
         sync()
         const r = resumeOf(now, entries.current)
         setResume(r)
-        if (back && r !== null && r.missing.length === 0) onBack?.()
+        // A file the player already removed is not back: its Remove goes first, nothing starts the upload.
+        if (back && r !== null && r.missing.length === 0 && !got.some((g) => leaving.current.has(g.key))) onBack?.()
       })
     },
     [sync, enqueue, decide],
   )
 
-  const removeFile = useCallback(
+  // The removal itself, once the picks queued before it are hashed. A run set meanwhile (a Send pressed after Remove)
+  // waits for this one in start(), so it is not a reason to stop; the DELETE then goes under that run's controller,
+  // which reset() and unmount abort.
+  const drop = useCallback(
     async (key: string): Promise<void> => {
-      if (run.current || !entries.current.some((x) => x.key === key)) return
-      // A file still being hashed may turn out to be a saved one with an attachment: Remove then has a DELETE to send.
-      await queue.current
       const e = entries.current.find((x) => x.key === key)
-      if (!e || run.current || e.state === 'done') return
+      if (!e || e.state === 'done') return
       const before = saved.current
       const att = e.att
       if (att && before) {
         // Its attachment holds one of the report's 3 places, so the file leaves the list (and the session) only once
         // the server has let it go; a failed delete keeps both, and pressing Remove again retries it. The line is
         // marked first, so a page left before the answer has the next load finish the removal.
-        const ac = new AbortController()
+        const own = run.current === null
+        const ac = run.current ?? new AbortController()
         run.current = ac
         setRemoving(true)
         setUnremoved(false)
@@ -407,7 +422,7 @@ export function useUpload(only?: string) {
             return
           }
         } finally {
-          if (run.current === ac) run.current = null
+          if (own && run.current === ac) run.current = null
           if (!ac.signal.aborted) setRemoving(false)
         }
         // reset() or unmount came first: the list and the session are no longer this one's to change.
@@ -421,6 +436,26 @@ export function useUpload(only?: string) {
       sync()
     },
     [sync, store, patch],
+  )
+
+  // Pressed while an upload or another file's DELETE is going, Remove does nothing (the page disables it then). Pressed
+  // before, it always takes effect: it is queued behind the earlier Removes and the picks, and start() waits for it.
+  const removeFile = useCallback(
+    (key: string): Promise<void> => {
+      if (run.current || !entries.current.some((x) => x.key === key)) return Promise.resolve()
+      leaving.current.add(key)
+      // A file still being hashed may turn out to be a saved one with an attachment: Remove then has a DELETE to send.
+      const p = removals.current
+        .then(() => queue.current)
+        .then(() => drop(key))
+        .finally(() => leaving.current.delete(key))
+      removals.current = p.then(
+        () => undefined,
+        () => undefined,
+      )
+      return p
+    },
+    [drop],
   )
 
   const start = useCallback(
@@ -438,6 +473,8 @@ export function useUpload(only?: string) {
       try {
         // Resume or new is decided on what the picked files are: the picks still being hashed are settled first.
         await queue.current
+        // Then every Remove pressed before Send: a file removed is not sent.
+        await removals.current
         if (!live()) return false
         const prev = saved.current
         // Attachments bound to another report's session cannot be reused for this one.
@@ -452,8 +489,9 @@ export function useUpload(only?: string) {
           ? prev.files.map((f) => (marked(f) && entries.current.some((e) => e.att && lineOf(e)(f)) ? unmark(f) : f))
           : []
         // After the wait every listed file is hashed, so `?? null` never stands in for a head not known yet.
+        // A file bound by an earlier Send of this visit is found by its attachment (an unhashed one by nothing else).
         const added = entries.current
-          .filter((e) => !kept.some((f) => !marked(f) && sameFile(idOf(e), f)))
+          .filter((e) => !kept.some(lineOf(e)))
           .map((e): SavedFile => ({ name: e.file.name, size: e.file.size, head: e.head ?? null, done: false, attachmentId: null }))
         let s: Session = { v: 3, code: tgt.code, reportToken: tgt.reportToken, files: [...kept, ...added] }
         target.current = tgt
@@ -474,7 +512,8 @@ export function useUpload(only?: string) {
             if (!live()) return false
             const made: Att = { attachmentId: r.attachmentId, partSize: r.partSize, partCount: r.partCount }
             att = made
-            s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(id, x) ? { ...x, ...made } : x)) }
+            // Only a line with no attachment yet takes the new one; from here on the line is known by it.
+            s = { ...s, files: s.files.map((x) => (x.attachmentId === null && sameFile(id, x) ? { ...x, ...made } : x)) }
             patch(key, { att })
             store(s)
           }
@@ -489,13 +528,14 @@ export function useUpload(only?: string) {
             },
           })
           if (!live()) return false
-          s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(id, x) ? { ...x, done: true } : x)) }
+          const sent = att.attachmentId
+          s = { ...s, files: s.files.map((x) => (x.attachmentId === sent ? { ...x, done: true } : x)) }
           patch(key, { state: 'done', confirmed: f.size })
           store(s)
         }
         // Done only when every saved file is: one not picked again after a reload still waits for its bytes, and the
         // page shows the resume hint for it.
-        if (s.files.every((x) => x.done || marked(x))) {
+        if (s.files.every((x) => x.done || marked(x) || answered(x, entries.current))) {
           // A removed line still waiting for its DELETE outlives the upload, so the next load can finish it.
           const left = s.files.filter(marked)
           store(left.length > 0 ? { ...s, files: left } : null)
