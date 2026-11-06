@@ -129,7 +129,9 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
         <>
           <div className="video live">
             {media.kind === 'video' ? (
+              // The first frame as poster: without it the player is a black box until play.
               <video key={media.id} controls preload="metadata" src={deskStreamUrl(media.id)}
+                poster={frames[0] ? deskStreamUrl(frames[0].id) : undefined}
                 onLoadedMetadata={(e) => setDur({ id: media.id, secs: e.currentTarget.duration })} />
             ) : (
               <img src={deskStreamUrl(media.id)} alt={`Picture ${media.filename}`} />

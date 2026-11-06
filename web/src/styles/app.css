@@ -149,6 +149,8 @@ button.chip{width:100%;text-align:left}
 .q{display:block;font:700 20px Inter;margin:6px 0 10px}
 .q .opt{font-weight:500;color:var(--slate);font-size:16px}
 .btn:disabled{opacity:.5;cursor:default}
+/* A waiting gold button (Send before the check, while uploading) stays gold, only fainter: no brown or grey fill. */
+.btn.gold-btn:disabled{opacity:.55}
 .drop{display:block;width:100%}
 .drop span{display:block}
 .drop.over{border-color:var(--warm-gold);background:rgba(215,154,43,.10)}

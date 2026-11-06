@@ -218,9 +218,16 @@ const ROWS = {
     const h1 = await page.locator('h1').textContent()
     const box = await gold(page).boundingBox()
     const area = await page.locator('textarea').isVisible()
+    // Gold on first load: never disabled, full opacity. An empty press shows the orange hint and focuses the field.
+    const look = await gold(page).evaluate((el) => `${el.disabled}:${getComputedStyle(el).opacity}`)
+    await gold(page).click()
+    const hint = await page.locator('.err').textContent()
+    const focus = await page.evaluate(() => document.activeElement?.tagName)
     await close()
     if (h1 !== 'Report a bug' || !area || Math.round(box?.height ?? 0) !== 64) throw new Error(`h1=${h1} gold=${box?.height}`)
-    return 'title, field, gold button 64 px'
+    if (look !== 'false:1' || hint !== 'Write what happened first.' || focus !== 'TEXTAREA')
+      throw new Error(`look=${look} hint=${hint} focus=${focus}`)
+    return 'title, field, gold 64 px enabled at opacity 1, empty press: orange hint + focus'
   },
   2: async () => {
     const { page, close } = await open('/')

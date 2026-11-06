@@ -42,7 +42,9 @@ export default function Report() {
   const [token, setToken] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
   const [failed, setFailed] = useState(false)
+  const [noWhat, setNoWhat] = useState(false)
   const widget = useRef<TurnstileHandle>(null)
+  const whatBox = useRef<HTMLTextAreaElement>(null)
   const ids = { what: useId(), hint1: useId(), name: useId(), hintn: useId() }
 
   const go = (n: 1 | 2 | 3) => {
@@ -58,6 +60,7 @@ export default function Report() {
     setDevice(undefined)
     setName('')
     setFailed(false)
+    setNoWhat(false)
     go(1)
   }
 
@@ -109,6 +112,7 @@ export default function Report() {
           {t.q1}
         </label>
         <textarea
+          ref={whatBox}
           id={ids.what}
           value={what}
           maxLength={2000}
@@ -120,7 +124,17 @@ export default function Report() {
           <Icon name="info" />
           <span>{t.hint1}</span>
         </div>
-        <button type="button" className="btn gold-btn" disabled={!what.trim()} onClick={() => go(2)}>
+        {noWhat && !what.trim() && <Err text={t.errWhat} />}
+        {/* Never disabled: a dimmed first button reads as "broken"; an empty press says what is missing instead. */}
+        <button
+          type="button"
+          className="btn gold-btn"
+          onClick={() => {
+            if (what.trim()) return go(2)
+            setNoWhat(true)
+            whatBox.current?.focus()
+          }}
+        >
           {t.next} <Icon name="next" />
         </button>
       </Shell>

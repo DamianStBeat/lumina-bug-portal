@@ -48,6 +48,7 @@ export const en = {
   addSend: 'Add to report',
   // Not in the preview: written for this site in the same voice.
   resumeHint: 'To carry on, choose the same file again.',
+  errWhat: 'Write what happened first.',
   errType: 'This file is not a video or a picture. Choose another file.',
   errSize: 'This file is bigger than 2 GB. Choose a shorter video.',
   errCount: 'A report can have up to 3 files.',

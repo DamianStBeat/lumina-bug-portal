@@ -46,6 +46,7 @@ export const it: Strings = {
   addHint: 'Lo trovi nel gioco in Le mie segnalazioni, o nel tuo thread di Discord.',
   addSend: 'Aggiungi alla segnalazione',
   resumeHint: 'Per continuare, scegli di nuovo lo stesso file.',
+  errWhat: 'Prima scrivi cosa è successo.',
   errType: 'Questo file non è un video né una foto. Scegline un altro.',
   errSize: 'Questo file supera i 2 GB. Scegli un video più corto.',
   errCount: 'Una segnalazione può avere al massimo 3 file.',
