@@ -142,6 +142,8 @@ describe('web-fix row 3: Remove fails, then another file is picked', () => {
     expect(att.status).toBe('uploading')
 
     await pick(h2, [file('b.mp4', 2 * MiB), file('c.mp4', 2 * MiB), file('d.mp4', 2 * MiB)])
+    // The pick that needs the place sends the DELETE again first; it fails again.
+    expect(deletes()).toHaveLength(3)
     expect(h2.result.current.rejection).toBe('count')
     expect(names(h2)).toEqual(['b.mp4', 'c.mp4'])
 
@@ -160,7 +162,7 @@ describe('web-fix row 3: Remove fails, then another file is picked', () => {
     server.routeFault = () => null
     const h3 = mount()
     await settle()
-    expect(deletes()).toHaveLength(3)
+    expect(deletes()).toHaveLength(4)
     expect(att.status).toBe('aborted')
     expect(line('a.mp4')).toBeUndefined()
     await pick(h3, [file('d.mp4', 2 * MiB)])
