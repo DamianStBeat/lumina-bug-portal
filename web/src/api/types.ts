@@ -132,16 +132,41 @@ export type DeskReportWire = {
   duplicates: string[]
 }
 
-// The agent's triage JSON (<= 32 KB) is free-form: the known fields are typed, anything else is kept as data.
+// The agent's triage JSON (<= 32 KB), as agent/lumina_bug_agent/run.py post_triage builds it. The types mirror its
+// schemas (schemas.py STAGE_A_SCHEMA, STAGE_B_SCHEMA), but the stored text is the agent's: the desk checks every
+// field before showing it. A stage is null when it gave no valid answer, both when the agent failed or the triage
+// was too large for the worker.
+export type DeskStageA = {
+  what: string
+  where: string
+  when_in_video: string | null
+  device: string | null
+  steps: string[]
+  expected: string | null
+  actual: string | null
+  language: string
+  injection_suspected: boolean
+}
+
+export type DeskStageB = {
+  verdict: Verdict
+  confidence: number
+  summary: string
+  likely_files: { path: string; line: number | null; why: string }[]
+  risk_paths: string[]
+  // Set only to a code the agent offered as a possible duplicate (schemas.py validate_stage_b).
+  duplicate_of: string | null
+  fix_size: 'small' | 'medium' | 'large' | 'unknown'
+}
+
 export type DeskTriage = {
-  summary?: string
-  cause?: string
-  riskPath?: string
-  sameAs?: string[]
-  fix?: string
-  confidence?: number
-  frameHits?: number[]
-} & Record<string, unknown>
+  stage_a: DeskStageA | null
+  stage_b: DeskStageB | null
+  // One entry per video or picture the agent checked; notes such as stage_b_invalid, agent_failed, triage_too_large.
+  files: Record<string, unknown>[]
+  notes: string[]
+  agent: string
+}
 
 export type DeskReport = Omit<DeskReportRow, 'fileCount'> & {
   lang?: string

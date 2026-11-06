@@ -7,7 +7,8 @@ import path from 'node:path'
 import type { Plugin } from 'vite'
 import type {
   AttachmentKind, CreateAttachmentRes, CreateReportRes, DeskAttachment, DeskAttachmentWire, DeskFilter,
-  DeskListRowWire, DeskListWire, DeskReport, DeskReportWire, ListPartsRes, PublicStatus, ReportStatus, StatusRes,
+  DeskListRowWire, DeskListWire, DeskReport, DeskReportWire, DeskStageA, DeskStageB, DeskTriage, ListPartsRes,
+  PublicStatus, ReportStatus, StatusRes,
 } from '../src/api/types.ts'
 
 const PART_SIZE = 16777216
@@ -48,30 +49,41 @@ type State = {
 type SeedFile = [kind: AttachmentKind, filename: string, mime: string, sizeBytes: number]
 type Seed = [ageMin: number, report: Omit<Report, 'createdAt' | 'updatedAt' | 'source'>, files: SeedFile[]]
 const TOP = 'LUM-482193'
+// A triage in the shape the agent posts it (agent/lumina_bug_agent/run.py post_triage): both stages answered.
+function triage(a: Pick<DeskStageA, 'what' | 'where' | 'device'>, b: Omit<DeskStageB, 'confidence'>): DeskTriage {
+  const stageA: DeskStageA = {
+    ...a, when_in_video: null, steps: [], expected: null, actual: null, language: 'en', injection_suspected: false,
+  }
+  return { stage_a: stageA, stage_b: { ...b, confidence: 0.86 }, files: [], notes: [], agent: 'lumina-bug-agent/1' }
+}
 // The five rows of the preview's desk screen, same texts, areas, devices, verdicts and sizes.
 const SEEDS: Seed[] = [
   [4, {
     code: TOP, status: 'looking', what: 'The boss stopped on the bridge and the wave never ended.', whereArea: 'match',
     device: 'phone', lang: 'en', verdict: 'simple_fix', prUrl: 'https://github.com/DamianStBeat/Lumina2/pull/1402',
-    triage: {
-      summary: 'on the Bridge map the boss waits forever at the last waypoint (frame 4, 1:52).',
-      cause: '`src/server/Waves/BossPath.luau:212` expects 9 waypoints; the Bridge path has 8.',
-      riskPath: 'none (no saves, currency, inventory, purchases).',
-      sameAs: ['LUM-481993', 'LUM-479093'],
-      fix: 'read the waypoint count from the map. 6 lines, 1 spec.',
-      confidence: 0.86,
-      // Frame numbers, 1-based, as the AI line says "frame 4".
-      frameHits: [4],
-    },
+    triage: triage({ what: 'on the Bridge map the boss waits at the last waypoint', where: 'match', device: 'phone' }, {
+      verdict: 'simple_fix', summary: 'BossPath expects 9 waypoints; the Bridge path has 8.',
+      likely_files: [{ path: 'src/server/Waves/BossPath.luau', line: 212, why: 'reads waypoint 9' }],
+      risk_paths: [], duplicate_of: null, fix_size: 'small',
+    }),
   }, [['video', 'boss-bridge.mp4', 'video/mp4', 312 * MB],
     ...[1, 2, 3, 4, 5, 6].map((n): SeedFile => ['frames', `frame-${n}.jpg`, 'image/jpeg', 149496])]],
   [11, {
     code: 'LUM-482093', status: 'looking', what: 'my crate gave me nothing after the spin', whereArea: 'crates',
-    device: 'computer', verdict: 'needs_person', triage: { riskPath: 'inventory path' },
+    device: 'computer', verdict: 'needs_person',
+    triage: triage({ what: 'a crate spin gives no item', where: 'crates', device: 'computer' }, {
+      verdict: 'needs_person', summary: 'The crate reward is granted after the spin ends.',
+      likely_files: [{ path: 'src/server/Crates/Spin.luau', line: null, why: 'grants the reward' }],
+      risk_paths: ['src/server/Inventory/Grant.luau'], duplicate_of: null, fix_size: 'medium',
+    }),
   }, [['video', 'crate-spin.mp4', 'video/mp4', 88 * MB]]],
   [18, {
     code: 'LUM-481993', status: 'duplicate', what: 'boss stuck on bridge again!!', whereArea: 'match', device: 'tablet',
-    verdict: 'duplicate', duplicateOf: TOP, triage: { sameAs: [TOP] },
+    verdict: 'duplicate', duplicateOf: TOP,
+    triage: triage({ what: 'the boss stops on the Bridge map', where: 'match', device: 'tablet' }, {
+      verdict: 'duplicate', summary: 'The same stop at the last waypoint as LUM-482193.', likely_files: [],
+      risk_paths: [], duplicate_of: TOP, fix_size: 'unknown',
+    }),
   }, [['video', 'boss-stuck.mp4', 'video/mp4', 540 * MB]]],
   [32, { code: 'LUM-481893', status: 'not_bug', what: 'i want more gems pls', whereArea: 'shop', verdict: 'not_bug' },
     []],

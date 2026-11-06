@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode, type Ref } from 'react'
 import { ApiError, deskReport, deskSetStatus, deskStreamUrl } from '../../api/client'
-import type { DeskReport, DeskReportRow, DeskTriage } from '../../api/types'
+import type { DeskReport, DeskReportRow, DeskTriage, Verdict } from '../../api/types'
 import { Icon } from '../../components/Icons'
 import { githubPr } from './ReportList'
 
@@ -22,16 +22,50 @@ function spans(s: string): ReactNode[] {
   })
 }
 
-function lines(t: DeskTriage): [string, string][] {
-  const same = Array.isArray(t.sameAs) ? t.sameAs.filter((c): c is string => typeof c === 'string') : []
-  const all: [string, string | undefined][] = [
-    ['What it is', text(t.summary)],
-    ['Likely cause', text(t.cause)],
-    ['Risk path', text(t.riskPath)],
-    ['Same bug', same.length ? same.join(', ') : undefined],
-    ['Fix', text(t.fix)],
+// The stages and each likely file count only as objects; anything else is a stage or a file with no answer.
+const record = (v: unknown): Record<string, unknown> | undefined =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
+
+// The list's words for each verdict (ReportList VERDICT), so the panel says what the row says.
+const VERDICT: Record<Verdict, string> = {
+  simple_fix: 'Simple fix',
+  needs_person: 'Needs a person',
+  duplicate: 'Duplicate',
+  not_bug: 'Not a bug',
+  unclear: 'Unclear',
+}
+
+// `path:line` then why: line 0 is a line, a null line leaves the path alone, an item without a text path is dropped.
+function likelyFiles(v: unknown): ReactNode[] {
+  return (Array.isArray(v) ? v : []).flatMap((item) => {
+    const f = record(item)
+    const path = text(f?.path)
+    if (!f || !path) return []
+    const at = typeof f.line === 'number' && Number.isInteger(f.line) && f.line >= 0 ? `:${f.line}` : ''
+    const why = text(f.why)
+    return [<><code>{path + at}</code>{why && <> {spans(why)}</>}</>]
+  })
+}
+
+// The verdict is the report's and has no label in the preview's panel: when the agent failed or the triage was too
+// large for the worker both stages are null, but the AI did read the report.
+function lines(verdict: unknown, t: DeskTriage | undefined): [string | null, ReactNode][] {
+  const a = record(t?.stage_a)
+  const b = record(t?.stage_b)
+  const what = text(a?.what)
+  const cause = text(b?.summary)
+  const why = [...(cause ? [spans(cause)] : []), ...likelyFiles(b?.likely_files)]
+  const risks = Array.isArray(b?.risk_paths) ? b.risk_paths.map(text).filter((s) => s !== undefined) : []
+  const fix = b?.fix_size
+  const all: [string | null, ReactNode | undefined][] = [
+    [null, typeof verdict === 'string' && Object.hasOwn(VERDICT, verdict) ? VERDICT[verdict as Verdict] : undefined],
+    ['What it is', what && spans(what)],
+    ['Likely cause', why.length ? why.map((n, i) => <span key={i}>{i > 0 && '; '}{n}</span>) : undefined],
+    ['Risk path', risks.length ? risks.join(', ') : undefined],
+    ['Same bug', text(b?.duplicate_of)],
+    ['Fix', typeof fix === 'string' && ['small', 'medium', 'large', 'unknown'].includes(fix) ? fix : undefined],
   ]
-  return all.filter((l): l is [string, string] => l[1] !== undefined)
+  return all.filter((l): l is [string | null, ReactNode] => l[1] !== undefined)
 }
 
 function clock(secs: number): string {
@@ -119,8 +153,7 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
   // Nothing to play yet is not the same as nothing sent: a file still arriving says so.
   const pending = r.attachments.some((a) => a.status === 'uploading' && (a.kind === 'video' || a.kind === 'image'))
   const frames = r.frames.filter((a) => a.status === 'complete')
-  const hits = new Set(Array.isArray(r.triage?.frameHits) ? r.triage.frameHits : [])
-  const ai = r.triage ? lines(r.triage) : []
+  const ai = lines(r.verdict, r.triage)
   const pr = githubPr(r.prUrl)
   const secs = media && dur?.id === media.id ? dur.secs : undefined
 
@@ -151,11 +184,12 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
       {frames.length > 0 && (
         <div className="frames">
           {frames.map((f, i) => {
-            const alt = hits.has(i + 1) ? `Frame ${i + 1}, marked by the AI` : `Frame ${i + 1}`
+            // The agent's triage names no frame, so none is marked as the AI's.
+            const alt = `Frame ${i + 1}`
             return (
               <button key={f.id} type="button" aria-label={`Open ${alt.toLowerCase()}`}
                 onClick={() => setBig({ code: r.code, id: f.id, alt })}>
-                <img src={deskStreamUrl(f.id)} alt="" loading="lazy" className={hits.has(i + 1) ? 'hit' : ''} />
+                <img src={deskStreamUrl(f.id)} alt="" loading="lazy" />
               </button>
             )
           })}
@@ -166,8 +200,8 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
         {ai.length ? (
           <ul>
             {ai.map(([k, v]) => (
-              <li key={k}>
-                <b>{k}:</b> {spans(v)}
+              <li key={k ?? 'verdict'}>
+                {k ? <><b>{k}:</b> {v}</> : <b>{v}</b>}
               </li>
             ))}
           </ul>
