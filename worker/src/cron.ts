@@ -17,7 +17,9 @@ const MAX_BATCHES = 10;
 // finds a finished object makes one uncharged delete more; such objects only exist after a failed D1 write.
 const R2_BUDGET = 500;
 
-type Budget = { r2: number };
+// `failures` counts the objects a step logged and skipped: the run still throws at the end, so the cron shows as
+// failed instead of reporting success over work it left for tomorrow.
+type Budget = { r2: number; failures: number };
 
 const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -56,6 +58,7 @@ async function expireMedia(env: Env, now: number, budget: Budget) {
           await env.FILES.delete(row.r2_key);
           done.push(row.id);
         } catch (err) {
+          budget.failures++;
           console.error("retention: media delete failed", row.id, reason(err));
         }
       }
@@ -67,57 +70,63 @@ async function expireMedia(env: Env, now: number, budget: Budget) {
 }
 
 /**
- * Uploads still open after 7 days: aborted in R2 (its stored parts go with it), row `aborted`, parts rows dropped.
- * One R2 already completed (its D1 write failed) has its object deleted and its row marked `deleted` instead.
+ * Uploads still open after 7 days: aborted in R2 (its stored parts go with it), row `aborted` with its upload id
+ * cleared, parts rows dropped. One R2 already completed (its D1 write failed) has its object deleted and its row
+ * marked `deleted` instead.
  *
  * The row is claimed in D1 before R2 is touched. A complete that lands first keeps its row and its object (the claim
  * changes nothing); one that lands after the claim finds its own D1 write refused and answers 409, so no player is
  * told "ok" for a file this step then deletes.
+ *
+ * An `aborted` row that still has its upload id is a claim whose R2 work never finished (the abort failed, or the
+ * D1 write after it did), or a player's DELETE: it is picked up again here, so a failed run is retried the next day,
+ * not when the report reaches 12 months. Every R2 call is idempotent (an abort of a gone upload is "no such upload",
+ * a head then finds the object or not), and clearing the upload id is what marks the row as done.
  */
 async function abortStaleUploads(env: Env, now: number, budget: Budget) {
-  type Row = { id: string; r2_key: string; upload_id: string | null };
+  type Row = { id: string; r2_key: string; upload_id: string | null; status: string };
+  // A cursor on id, so a row that failed is not selected again in this run: tomorrow's run retries it.
+  let after = "";
   await inBatches<Row>(
     budget,
     async () =>
       (
         await env.DB.prepare(
-          `SELECT id, r2_key, upload_id FROM attachments WHERE status = 'uploading' AND created_at < ? LIMIT ${BATCH}`,
+          `SELECT id, r2_key, upload_id, status FROM attachments
+           WHERE (status = 'uploading' OR (status = 'aborted' AND upload_id IS NOT NULL)) AND created_at < ? AND id > ?
+           ORDER BY id LIMIT ${BATCH}`,
         )
-          .bind(now - UPLOAD_DAYS * DAY_MS)
+          .bind(now - UPLOAD_DAYS * DAY_MS, after)
           .all<Row>()
       ).results,
     async (rows) => {
       const claim = env.DB.prepare("UPDATE attachments SET status = 'aborted' WHERE id = ? AND status = 'uploading'");
-      const release = env.DB.prepare("UPDATE attachments SET status = 'uploading' WHERE id = ? AND status = 'aborted'");
-      const claimed: string[] = [];
-      const found: string[] = [];
+      const handled: { id: string; found: boolean }[] = [];
       // Rows a complete took first are no longer `uploading`: they count as handled, the next select skips them.
       let skipped = 0;
       for (const row of rows) {
         if (budget.r2 < ABORT_R2_CALLS) break;
-        if ((await claim.bind(row.id).run()).meta.changes !== 1) {
+        after = row.id;
+        if (row.status === "uploading" && (await claim.bind(row.id).run()).meta.changes !== 1) {
           skipped++;
           continue;
         }
         budget.r2 -= ABORT_R2_CALLS;
         try {
-          if (row.upload_id && (await abortUpload(env.FILES, row.r2_key, row.upload_id))) found.push(row.id);
-          claimed.push(row.id);
+          handled.push({ id: row.id, found: row.upload_id !== null && (await abortUpload(env.FILES, row.r2_key, row.upload_id)) });
         } catch (err) {
+          // The row stays `aborted` with its upload id, which is what brings it back tomorrow.
+          budget.failures++;
           console.error("retention: upload abort failed", row.id, reason(err));
-          // Back to `uploading` so tomorrow's run tries again, as it did before the claim existed.
-          try {
-            await release.bind(row.id).run();
-          } catch (err2) {
-            console.error("retention: upload release failed", row.id, reason(err2));
-          }
         }
       }
-      const mark = env.DB.prepare("UPDATE attachments SET status = 'deleted' WHERE id = ? AND status = 'aborted'");
+      const mark = env.DB.prepare(
+        "UPDATE attachments SET status = CASE WHEN ?2 = 1 THEN 'deleted' ELSE status END, upload_id = NULL WHERE id = ?1 AND status = 'aborted'",
+      );
       const parts = env.DB.prepare("DELETE FROM parts WHERE attachment_id = ?");
-      const statements = [...found.map((id) => mark.bind(id)), ...claimed.map((id) => parts.bind(id))];
+      const statements = handled.flatMap(({ id, found }) => [mark.bind(id, found ? 1 : 0), parts.bind(id)]);
       if (statements.length) await env.DB.batch(statements);
-      return claimed.length + skipped;
+      return handled.length + skipped;
     },
   );
 }
@@ -126,8 +135,8 @@ type OldAtt = { id: string; r2_key: string; upload_id: string | null; status: st
 
 /**
  * Removes the objects of one old report's attachments, a page at a time within the budget. Every row is covered,
- * whatever its status: an `uploading` or `aborted` row may still hold an open upload or a finished object (a failed
- * abort whose release failed too), a `deleted` one is deleted again, which R2 treats as a no-op. Each attachment row
+ * whatever its status: an `uploading` or `aborted` row may still hold an open upload or a finished object (a
+ * stale-upload abort that has not succeeded yet), a `deleted` one is deleted again, which R2 treats as a no-op. Each attachment row
  * goes, with its parts, as soon as its object is gone, so a report with more objects than one day's budget moves
  * forward every run and the rows still there are exactly the objects left to remove. Rows are deleted by id: a frame
  * the agent adds while this runs is not in our list and stays for the next run. Returns false when the budget ran out
@@ -161,6 +170,7 @@ async function purgeAttachments(env: Env, reportId: string, budget: Budget): Pro
         else await env.FILES.delete(a.r2_key);
         gone.push(a.id);
       } catch (err) {
+        budget.failures++;
         console.error("retention: old report object failed", a.id, reason(err));
       }
     }
@@ -223,7 +233,7 @@ async function dropOldHashes(env: Env, now: number) {
 
 export async function runRetention(env: Env): Promise<void> {
   const now = Date.now();
-  const budget: Budget = { r2: R2_BUDGET };
+  const budget: Budget = { r2: R2_BUDGET, failures: 0 };
   // Oldest reports first: deleting them also removes media and uploads the later steps would otherwise touch.
   const steps: [string, () => Promise<void>][] = [
     ["old reports", () => deleteOldReports(env, now, budget)],
@@ -241,5 +251,7 @@ export async function runRetention(env: Env): Promise<void> {
       console.error("retention: step failed", name, reason(err));
     }
   }
-  if (failed > 0) throw new Error(`retention: ${failed} step(s) failed`);
+  if (failed > 0 || budget.failures > 0) {
+    throw new Error(`retention: ${failed} step(s) failed, ${budget.failures} object(s) left for the next run`);
+  }
 }

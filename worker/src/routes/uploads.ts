@@ -147,13 +147,25 @@ async function complete(req: Request, env: Env, id: string): Promise<Response> {
   try {
     await uploadOf(env, a).complete(parts.map((p) => ({ partNumber: p.n, etag: p.etag })));
   } catch (err) {
-    if (!isNoSuchUpload(err)) throw err;
-    // A concurrent complete got there first: its answer stands, ours is the same ok.
-    const now = await env.DB.prepare("SELECT status FROM attachments WHERE id = ?").bind(a.id).first<{ status: string }>();
-    if (now?.status === "complete") return json({ ok: true });
-    // R2 finished an earlier complete whose D1 write failed: the object is there, so the batch below finishes the
-    // job. Without this, every retry would ask R2 again and answer 500 forever. No object: aborted, nothing to finish.
-    if (now?.status !== "uploading" || (await env.FILES.head(a.r2_key)) === null) throw new HttpError(409, "not_uploading");
+    if (isNoSuchUpload(err)) {
+      // A concurrent complete got there first: its answer stands, ours is the same ok.
+      const now = await env.DB.prepare("SELECT status FROM attachments WHERE id = ?").bind(a.id).first<{ status: string }>();
+      if (now?.status === "complete") return json({ ok: true });
+      // R2 finished an earlier complete whose D1 write failed: the object is there, so the batch below finishes the
+      // job. Without this, every retry would ask R2 again and answer 500 forever. No object: aborted, nothing to finish.
+      if (now?.status !== "uploading" || (await env.FILES.head(a.r2_key)) === null) throw new HttpError(409, "not_uploading");
+    } else if ((await env.FILES.head(a.r2_key)) === null) {
+      // R2 refused the part list, most likely an obsolete etag: two PUTs of the same part racing can leave the older
+      // one's etag in D1 (its upsert landing last), and the binding has no listParts to learn the newest. The upload
+      // is still open and an uploadPart on the same number replaces the bytes, so the way out is to forget what D1
+      // knows and ask the client for every part again, instead of a 500 on every retry until the 7-day abort.
+      await env.DB.prepare("DELETE FROM parts WHERE attachment_id = ?").bind(a.id).run();
+      const missing = Array.from({ length: a.part_count ?? 0 }, (_, i) => i + 1);
+      return json({ error: "missing_parts", missing }, 409);
+    }
+    // Otherwise the object is there: R2 completed despite the error, so the batch below finishes the job. Forgetting
+    // the parts in that case would strand the row (every part refused as not_uploading, complete asking for parts).
+    // A failing head throws, leaving the parts in place: a 500 the client can retry.
   }
   const at = Date.now();
   const data = JSON.stringify({ attachmentId: a.id, kind: a.kind, size: a.size_bytes });

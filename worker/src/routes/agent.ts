@@ -191,7 +191,13 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
       .bind(verdict, triageText, status, duplicateOf, now, report.id),
     eventStatement(env, report.id, "triaged", { verdict }, now),
   ];
-  if (duplicateOf) writes.push(eventStatement(env, report.id, "duplicate_linked", { duplicateOf }, now));
+  if (duplicateOf) {
+    writes.push(eventStatement(env, report.id, "duplicate_linked", { duplicateOf }, now));
+    // Reports already linked to this one were linked while it was an original; now that it points at a root, they
+    // point there too. Storing the root covers links made later, this covers the ones made earlier, so every chain
+    // stays one hop whatever order the links are made in, and the read guard's depth limit is never reached.
+    writes.push(env.DB.prepare("UPDATE reports SET duplicate_of = ? WHERE duplicate_of = ?").bind(duplicateOf, code));
+  }
   await env.DB.batch(writes);
   return json({ ok: true });
 }
