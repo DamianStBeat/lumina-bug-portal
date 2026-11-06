@@ -1,0 +1,8 @@
+# Copy to .dev.vars for `wrangler dev`. Test values only, never a real secret.
+# Cloudflare's documented always-pass Turnstile test secret:
+TURNSTILE_SECRET=1x0000000000000000000000000000000AA
+GAME_KEY=dev-game-key-not-a-secret
+AGENT_KEY=dev-agent-key-not-a-secret
+IP_SALT_SEED=dev-ip-salt-seed-not-a-secret
+# Only honoured when ENVIRONMENT=dev (set it in .dev.vars too for local desk work).
+DESK_DEV_BYPASS=0
