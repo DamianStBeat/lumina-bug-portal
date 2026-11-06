@@ -98,7 +98,13 @@ export async function linkDuplicate(env: Env, code: string, target: string, own:
       // meanwhile is 404, a target removed is 400, a loop closed meanwhile is 409 duplicate_cycle. Only a chain still
       // valid but moved under both attempts is busy: "not yet", so the caller is told to retry.
       await reportOf(env, code);
-      await rootOriginal(env, target, code);
+      const last = await rootOriginal(env, target, code);
+      // rootOriginal stops reading at MAX_DUPLICATE_DEPTH, the guard walks further from the root it stopped at: a loop
+      // only the guard sees fails every attempt the same way, so it is asked with the guard's own walk, from this root.
+      const loop = chainReaches(last.code, code);
+      if (await env.DB.prepare(`SELECT ${loop.sql} AS hit`).bind(...loop.binds).first<number>("hit")) {
+        throw new HttpError(409, "duplicate_cycle");
+      }
       throw new HttpError(409, "duplicate_busy", { body: { retryAfter: BUSY_RETRY_SECONDS }, headers: { "Retry-After": String(BUSY_RETRY_SECONDS) } });
     }
   }
@@ -121,10 +127,22 @@ function guardedEvent(env: Env, reportId: string, type: EventType, data: string,
  * the depth bound also stops it on a loop that does not.
  */
 function cycleGuard(root: Root, self: string, selfId: string): Guard {
+  const loop = chainReaches(root.code, self);
   return {
     sql: `EXISTS (SELECT 1 FROM reports WHERE id = ?)
       AND EXISTS (SELECT 1 FROM reports WHERE code = ? AND (CASE WHEN status = 'duplicate' THEN duplicate_of END) IS ?)
-      AND NOT EXISTS (
+      AND NOT ${loop.sql}`,
+    binds: [selfId, root.code, root.next, ...loop.binds],
+  };
+}
+
+/**
+ * The guard's walk: the chain from `root`, through duplicate rows only, reaches `self`. One copy, used by the guard and
+ * by the check after the last attempt, so the two can never disagree on what a loop is.
+ */
+function chainReaches(root: string, self: string): Guard {
+  return {
+    sql: `EXISTS (
         WITH RECURSIVE chain(code, depth) AS (
           SELECT ?, 0
           UNION ALL
@@ -132,7 +150,7 @@ function cycleGuard(root: Root, self: string, selfId: string): Guard {
           WHERE r.status = 'duplicate' AND r.duplicate_of IS NOT NULL AND c.depth < ${MAX_DUPLICATE_DEPTH + 1}
         )
         SELECT 1 FROM chain WHERE code = ?)`,
-    binds: [selfId, root.code, root.next, root.code, self],
+    binds: [root, self],
   };
 }
 

@@ -176,7 +176,7 @@ async function setStatus(req: Request, env: Env, code: string, who: DeskIdentity
   // One transaction, the event first: its `from` is read from the row inside the transaction, so a change landing
   // between our lookup and this batch can never be recorded with a stale previous status. Leaving `duplicate` clears
   // the link: a stale one would come back, unguarded, if the report were set back later.
-  await env.DB.batch([
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
        SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5, 'by', 'desk', 'email', ?6)
@@ -189,6 +189,8 @@ async function setStatus(req: Request, env: Env, code: string, who: DeskIdentity
       now,
     ),
   ]);
+  // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
   return json({ ok: true });
 }
 

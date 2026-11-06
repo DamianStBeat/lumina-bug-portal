@@ -2,7 +2,6 @@
 import { requireAgentKey } from "../lib/auth";
 import { CODE_PATTERN, ulid } from "../lib/codes";
 import { duplicateTarget, linkDuplicate } from "../lib/duplicates";
-import { eventStatement } from "../lib/events";
 import { apiPath, dispatch, HttpError, json, readBody, readJson, type Route, type RouteHandler } from "../lib/http";
 import { enforceRate } from "../lib/rate";
 import { insertReport, reportOf } from "../lib/reports";
@@ -180,16 +179,19 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
   const now = Date.now();
   // One batch is one transaction: the new status and its events land together or not at all. The status_changed
   // event goes first and reads `from` from the row inside the transaction, written only when the stored status
-  // differs: a desk change landing after our lookup is never lost from the history the bot follows.
-  await env.DB.batch([
+  // differs: a desk change landing after our lookup is never lost from the history the bot follows. Every statement
+  // writes only while the row exists: retention may delete it after the lookup, and an event on its id is an orphan.
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
        SELECT id, ?, 'status_changed', json_object('from', status, 'to', ?) FROM reports WHERE id = ? AND status <> ?`,
     ).bind(now, status, report.id, status),
     env.DB.prepare("UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = NULL, updated_at = ? WHERE id = ?")
       .bind(verdict, triageText, status, now, report.id),
-    eventStatement(env, report.id, "triaged", { verdict }, now),
+    env.DB.prepare("INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'triaged', ? FROM reports WHERE id = ?")
+      .bind(now, JSON.stringify({ verdict }), report.id),
   ]);
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
   return json({ ok: true });
 }
 
@@ -216,7 +218,7 @@ async function setStatus(req: Request, env: Env, code: string): Promise<Response
   const now = Date.now();
   // The event first, its `from` read from the row inside the same transaction, as the desk's status route does.
   // Leaving `duplicate` clears the link: a stale one would come back, unguarded, if the report were set back later.
-  await env.DB.batch([
+  const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
        SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5) FROM reports WHERE id = ?1`,
@@ -224,6 +226,8 @@ async function setStatus(req: Request, env: Env, code: string): Promise<Response
     env.DB.prepare("UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), duplicate_of = NULL, updated_at = ? WHERE id = ?")
       .bind(status, prUrl, now, report.id),
   ]);
+  // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
+  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
   return json({ ok: true });
 }
 
