@@ -3,6 +3,7 @@
 // Every step works in bounded batches and the whole run has an R2 budget, so a backlog (the first run after an
 // outage, a flood of reports) never pushes one invocation past the Workers limits: what is left waits for tomorrow.
 // One object that fails is logged by attachment id (never its key, which names a player's file) and skipped.
+import { ABORT_R2_CALLS, abortUpload } from "./lib/uploads";
 
 const DAY_MS = 86_400_000;
 const MEDIA_DAYS = 60;
@@ -16,17 +17,6 @@ const MAX_BATCHES = 10;
 const R2_BUDGET = 500;
 
 type Budget = { r2: number };
-
-const NO_SUCH_UPLOAD = /\(10024\)|multipart upload does not exist/i;
-
-/** Aborts an R2 multipart upload; one that R2 no longer knows (aborted or completed earlier) counts as done. */
-async function abortUpload(env: Env, key: string, uploadId: string): Promise<void> {
-  try {
-    await env.FILES.resumeMultipartUpload(key, uploadId).abort();
-  } catch (err) {
-    if (!(err instanceof Error && NO_SUCH_UPLOAD.test(err.message))) throw err;
-  }
-}
 
 const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
@@ -75,7 +65,10 @@ async function expireMedia(env: Env, now: number, budget: Budget) {
   );
 }
 
-/** Uploads still open after 7 days: aborted in R2 (its stored parts go with it), row `aborted`, parts rows dropped. */
+/**
+ * Uploads still open after 7 days: aborted in R2 (its stored parts go with it), row `aborted`, parts rows dropped.
+ * One R2 already completed (its D1 write failed) has its object deleted and its row marked `deleted` instead.
+ */
 async function abortStaleUploads(env: Env, now: number, budget: Budget) {
   type Row = { id: string; r2_key: string; upload_id: string | null };
   await inBatches<Row>(
@@ -89,19 +82,20 @@ async function abortStaleUploads(env: Env, now: number, budget: Budget) {
           .all<Row>()
       ).results,
     async (rows) => {
-      const done: string[] = [];
-      for (const row of rows.slice(0, budget.r2)) {
-        budget.r2--;
+      const done: { id: string; status: "aborted" | "deleted" }[] = [];
+      for (const row of rows) {
+        if (budget.r2 < ABORT_R2_CALLS) break;
+        budget.r2 -= ABORT_R2_CALLS;
         try {
-          if (row.upload_id) await abortUpload(env, row.r2_key, row.upload_id);
-          done.push(row.id);
+          const found = row.upload_id ? await abortUpload(env.FILES, row.r2_key, row.upload_id) : false;
+          done.push({ id: row.id, status: found ? "deleted" : "aborted" });
         } catch (err) {
           console.error("retention: upload abort failed", row.id, reason(err));
         }
       }
-      const mark = env.DB.prepare("UPDATE attachments SET status = 'aborted' WHERE id = ? AND status = 'uploading'");
+      const mark = env.DB.prepare("UPDATE attachments SET status = ? WHERE id = ? AND status = 'uploading'");
       const parts = env.DB.prepare("DELETE FROM parts WHERE attachment_id = ?");
-      if (done.length) await env.DB.batch(done.flatMap((id) => [mark.bind(id), parts.bind(id)]));
+      if (done.length) await env.DB.batch(done.flatMap(({ id, status }) => [mark.bind(status, id), parts.bind(id)]));
       return done.length;
     },
   );
@@ -130,12 +124,14 @@ async function deleteOldReports(env: Env, now: number, budget: Budget) {
           .bind(report.id)
           .all<Att>();
         const live = atts.filter((a) => a.status === "complete" || a.status === "uploading");
-        if (live.length > budget.r2) break;
+        const cost = live.reduce((sum, a) => sum + (a.status === "uploading" && a.upload_id ? ABORT_R2_CALLS : 1), 0);
+        if (cost > budget.r2) break;
+        budget.r2 -= cost;
         let clean = true;
         for (const a of live) {
-          budget.r2--;
           try {
-            if (a.status === "uploading" && a.upload_id) await abortUpload(env, a.r2_key, a.upload_id);
+            // An upload R2 completed behind D1's back has its object deleted by abortUpload too.
+            if (a.status === "uploading" && a.upload_id) await abortUpload(env.FILES, a.r2_key, a.upload_id);
             else await env.FILES.delete(a.r2_key);
           } catch (err) {
             clean = false;

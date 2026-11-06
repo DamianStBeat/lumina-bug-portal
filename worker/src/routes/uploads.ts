@@ -5,6 +5,7 @@ import { requireReportToken } from "../lib/auth";
 import { CODE_PATTERN, ulid } from "../lib/codes";
 import { dispatch, HttpError, json, readJson, type Route, type RouteHandler } from "../lib/http";
 import {
+  abortUpload,
   expectedPartSize,
   isNoSuchUpload,
   MAX_PLAYER_FILES,
@@ -146,10 +147,13 @@ async function complete(req: Request, env: Env, id: string): Promise<Response> {
   try {
     await uploadOf(env, a).complete(parts.map((p) => ({ partNumber: p.n, etag: p.etag })));
   } catch (err) {
+    if (!isNoSuchUpload(err)) throw err;
     // A concurrent complete got there first: its answer stands, ours is the same ok.
     const now = await env.DB.prepare("SELECT status FROM attachments WHERE id = ?").bind(a.id).first<{ status: string }>();
-    if (isNoSuchUpload(err) && now?.status === "complete") return json({ ok: true });
-    throw err;
+    if (now?.status === "complete") return json({ ok: true });
+    // R2 finished an earlier complete whose D1 write failed: the object is there, so the batch below finishes the
+    // job. Without this, every retry would ask R2 again and answer 500 forever. No object: aborted, nothing to finish.
+    if (now?.status !== "uploading" || (await env.FILES.head(a.r2_key)) === null) throw new HttpError(409, "not_uploading");
   }
   const at = Date.now();
   const data = JSON.stringify({ attachmentId: a.id, kind: a.kind, size: a.size_bytes });
@@ -167,14 +171,13 @@ async function complete(req: Request, env: Env, id: string): Promise<Response> {
 async function remove(req: Request, env: Env, id: string): Promise<Response> {
   let a = await authorized(req, env, id);
   // Two passes at most: if a complete lands between our read and our update, the second pass deletes the object.
+  // An upload R2 already completed while D1 says `uploading` is caught by abortUpload, which deletes its object.
   for (let pass = 0; pass < 2; pass++) {
     if (a.status === "uploading") {
-      try {
-        await uploadOf(env, a).abort();
-      } catch (err) {
-        if (!isNoSuchUpload(err)) throw err;
-      }
-      const r = await env.DB.prepare("UPDATE attachments SET status = 'aborted' WHERE id = ? AND status = 'uploading'").bind(a.id).run();
+      const found = await abortUpload(env.FILES, a.r2_key, a.upload_id ?? "");
+      const r = await env.DB.prepare("UPDATE attachments SET status = ? WHERE id = ? AND status = 'uploading'")
+        .bind(found ? "deleted" : "aborted", a.id)
+        .run();
       if (r.meta.changes === 1) break;
     } else if (a.status === "complete") {
       await env.FILES.delete(a.r2_key);
