@@ -385,3 +385,48 @@ describe('audit 1 finding 4: each typed field of the stored triage, of the wrong
     expect(screen.getByRole('button', { name: 'Mark fixed' })).toBeTruthy()
   })
 })
+
+describe('audit 2: a verdict the web does not know, and linked codes without a stage (tests-commit 10)', () => {
+  // Codes linked here by hand (desk.ts:161-162 setStatus duplicate on another report): the worker's `duplicates`.
+  const LINKED = ['LUM-481993', 'LUM-479093']
+
+  // A sixth verdict added to the worker (agent.ts:159 v.VERDICTS) before the web knows it, and strings that read like
+  // keys every object has. "needs_review" is the one a lookup without the own-key check (ReportDetail.tsx:78) throws on.
+  it.each(['needs_review', 'constructor', 'hasOwnProperty'])(
+    'finding 1: a stored verdict outside the five (%s, both stages null): the detail renders, the verdict is dropped',
+    async (verdict) => {
+      const r = triageReal()
+      Object.assign(r.report, { status: 'looking', verdict, duplicate_of: null })
+      Object.assign(r.report.triage!, { stage_a: null, stage_b: null, files: [], notes: ['agent_failed'] })
+      const text = textOf(await openPanel(r))
+      expect(text).not.toContain(verdict)
+      expect(text).not.toMatch(/\[object|undefined|null|function/)
+      expect(screen.getByText('boss-bridge.mp4', { exact: false })).toBeTruthy()
+      expect(screen.getByRole('button', { name: 'Mark fixed' })).toBeTruthy()
+    },
+  )
+
+  it('finding 2: triage null with two reports linked here: still "not looked at yet", no "Same bug" row', async () => {
+    // Not yet is not an answer: a hand-made link is not the AI's reading of this report.
+    const r = triageReal()
+    Object.assign(r.report, { status: 'received', verdict: null, duplicate_of: null, triage: null })
+    r.duplicates = [...LINKED]
+    const panel = await openPanel(r)
+    expect(screen.getByText(NOT_YET)).toBeTruthy()
+    expect(rowOf(panel, 'Same bug')).toBeUndefined()
+    for (const c of LINKED) expect(textOf(panel)).not.toContain(c)
+  })
+
+  it('finding 2: agent failed (both stages null, verdict unclear) with two reports linked here: the verdict alone', async () => {
+    // run.py:155: post_triage(code, "unclear", None, None, [], ["agent_failed"]); the links are no stage of the AI.
+    const r = triageReal()
+    Object.assign(r.report, { status: 'looking', verdict: 'unclear', duplicate_of: null })
+    Object.assign(r.report.triage!, { stage_a: null, stage_b: null, files: [], notes: ['agent_failed'] })
+    r.duplicates = [...LINKED]
+    const panel = await openPanel(r)
+    expect(rows(panel)).toEqual(['Unclear'])
+    expect(rowOf(panel, 'Same bug')).toBeUndefined()
+    for (const c of LINKED) expect(textOf(panel)).not.toContain(c)
+    expect(screen.queryByText(NOT_YET)).toBeNull()
+  })
+})
