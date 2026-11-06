@@ -1,8 +1,9 @@
 // Decided behaviour B1 (lead, final critical round) on useUpload, against the fake worker: Remove of a file whose
 // attachment exists. The saved line is marked `removing: true` before the DELETE; 200 or 404 drops the file and its
 // line; any other failure keeps both (still marked) and Remove again retries; a page left while the DELETE is out is
-// finished by the next load in the background: the removed file is never asked for again and never holds one of the
-// 3 places. A reload is an unmount followed by a new mount: nothing survives it but sessionStorage and the server.
+// finished by the next load in the background: the removed file is never asked for again, and (web-fix rule) it keeps
+// one of the 3 places until a DELETE is answered 2xx { ok: true } or 404, as the server still counts its attachment.
+// A reload is an unmount followed by a new mount: nothing survives it but sessionStorage and the server.
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { loadSession } from '../src/upload/session'
@@ -223,21 +224,31 @@ describe('decided B1: a page left while the DELETE is out is finished by the nex
     expect(line('a.mp4')).toBeUndefined()
   })
 
-  it('B1 reload: while that background DELETE is out the removed file holds none of the 3 places', async () => {
+  // Rewritten for the web-fix rule: the place frees only once the DELETE answered, never while it is out.
+  it('B1 reload: while that background DELETE is out the removed file still holds its place; answered 200 { ok: true } it frees it', async () => {
     const { token } = await leftMidDelete()
     const gate = deferred()
     server.holdRoute = (m) => (m === 'DELETE' ? gate.promise : null)
     const h2 = mount()
     await act(() => flush())
     expect(deletes()).toHaveLength(2)
-    act(() => h2.result.current.addFiles([file('b.mp4', 2 * MiB), file('c.mp4', 2 * MiB), file('d.mp4', 2 * MiB)]))
-    expect(names(h2)).toEqual(['b.mp4', 'c.mp4', 'd.mp4'])
-    expect(h2.result.current.rejection).toBeNull()
+    await act(async () => {
+      await Promise.resolve(h2.result.current.addFiles([file('b.mp4', 2 * MiB), file('c.mp4', 2 * MiB), file('d.mp4', 2 * MiB)]))
+    })
+    await act(() => flush())
+    expect(names(h2)).toEqual(['b.mp4', 'c.mp4'])
+    expect(h2.result.current.rejection).toBe('count')
 
     gate.resolve()
     server.holdRoute = () => null
     await act(() => flush())
     expect(line('a.mp4')).toBeUndefined()
+    await act(async () => {
+      await Promise.resolve(h2.result.current.addFiles([file('d.mp4', 2 * MiB)]))
+    })
+    await act(() => flush())
+    expect(names(h2)).toEqual(['b.mp4', 'c.mp4', 'd.mp4'])
+    expect(h2.result.current.rejection).toBeNull()
     let ok = false
     await act(async () => {
       ok = await drive(h2.result.current.start({ code: CODE, reportToken: token }))
