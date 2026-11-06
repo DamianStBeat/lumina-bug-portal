@@ -1,0 +1,21 @@
+# Lumina Bugs: the Discord app of the Lumina bug portal, as a systemd user service on Valor1.
+# Installed by bot/install.sh into ~/.config/systemd/user/. Logs: journalctl --user -u lumina-bug-bot
+[Unit]
+Description=Lumina Bugs Discord bot (Lumina bug portal)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Developer/GitHub/lumina-bug-portal/bot
+# Secrets live only here (mode 600, outside the repository).
+EnvironmentFile=%h/.config/lumina-bug-portal/bot.env
+# Node 24 runs the TypeScript directly (type stripping); /usr/bin/node is the system Node on Valor1.
+ExecStart=/usr/bin/node %h/Developer/GitHub/lumina-bug-portal/bot/src/main.ts
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+MemoryMax=300M
+
+[Install]
+WantedBy=default.target
