@@ -100,6 +100,10 @@ function fresh(): State {
   return { reports, atts, nextCode: FIRST_CODE, nextAtt: 1, faults, puts: new Map() }
 }
 let state: State = fresh()
+// A real clip for the video attachments, sent by dev/shots.mjs (POST /__mock/video) so row 10 can prove playback.
+// Outside `state`: /__mock/reset between rows keeps it.
+let clip: Buffer | null = null
+const CLIP_CAP = 4 * 1024 * 1024
 
 function times(rec: Rec): { createdAt: number; updatedAt: number } {
   if (rec.seedAgeMs === undefined) return { createdAt: rec.report.createdAt, updatedAt: rec.report.updatedAt }
@@ -223,9 +227,9 @@ function needAtt(req: IncomingMessage, id: string): Att {
 }
 
 async function stream(req: IncomingMessage, res: ServerResponse, att: Att, jpg: string): Promise<void> {
-  // Videos get a few KB of zeros: enough to exercise Range and the player, nothing heavy kept in memory.
+  // Videos get the clip shots.mjs sent, else a few KB of zeros (enough for Range, not for playback).
   const isVideo = att.kind === 'video'
-  const data = isVideo ? Buffer.alloc(8192) : await readFile(jpg)
+  const data = isVideo ? (clip ?? Buffer.alloc(8192)) : await readFile(jpg)
   const total = data.length
   res.setHeader('Content-Type', isVideo ? 'video/mp4' : 'image/jpeg')
   res.setHeader('Accept-Ranges', 'bytes')
@@ -409,6 +413,11 @@ async function control(req: IncomingMessage, res: ServerResponse, p: string): Pr
     if (offline !== undefined) f.offline = offline as boolean
     if (slowMs !== undefined) f.slowMs = slowMs as number
     return send(res, 200, f)
+  }
+  if (req.method === 'POST' && p === '/__mock/video') {
+    const { bytes, length } = await readBody(req, CLIP_CAP, true)
+    clip = length > 0 ? Buffer.concat(bytes) : null
+    return send(res, 200, { bytes: length })
   }
   if (req.method === 'GET' && p === '/__mock/stats') {
     const parts = (byPart: Map<number, { got: number; ok: number }>) => Object.fromEntries([...byPart])

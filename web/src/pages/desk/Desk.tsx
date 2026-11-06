@@ -18,6 +18,8 @@ export default function Desk() {
   const [reload, setReload] = useState(0)
   const [list, setList] = useState<List>({ key: '', rows: [] })
   const [more, setMore] = useState(false)
+  // The list key a Load more failed for: the rows already shown stay, one orange line says the next page did not come.
+  const [moreFailed, setMoreFailed] = useState<string | null>(null)
   const [denied, setDenied] = useState(false)
   const detailRef = useRef<HTMLElement>(null)
   const key = `${filter}#${reload}`
@@ -61,6 +63,7 @@ export default function Desk() {
   async function loadMore() {
     if (!list.cursor || more) return
     setMore(true)
+    setMoreFailed(null)
     try {
       const res = await deskList(filter, list.cursor)
       setList((l) => {
@@ -70,6 +73,7 @@ export default function Desk() {
       })
     } catch (e) {
       fail(e)
+      if (!isDenied(e)) setMoreFailed(key)
     } finally {
       setMore(false)
     }
@@ -111,6 +115,7 @@ export default function Desk() {
             onRetry={() => setReload((n) => n + 1)}
             hasMore={!loading && !!list.cursor}
             loadingMore={more}
+            moreFailed={moreFailed === key}
             onMore={loadMore}
           />
           <ReportDetail ref={detailRef} code={code} onDenied={deny} onChanged={patchRow} />

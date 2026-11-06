@@ -1,5 +1,5 @@
 // Mirrors CONTRACT.md "Limits", checked before any byte leaves the device (acceptance row 6).
-export type Rejection = 'type' | 'size' | 'count'
+export type Rejection = 'type' | 'size' | 'count' | 'empty'
 export const MAX_FILES = 3
 export const MAX_BYTES = 2 * 1024 ** 3
 
@@ -16,6 +16,8 @@ export function validatePick(existing: number, picked: File[]): { ok: File[]; re
   for (const f of picked) {
     let why: Rejection | null = null
     if (!isMedia(f)) why = 'type'
+    // An empty file has no part to send: the server would refuse it on every try.
+    else if (f.size === 0) why = 'empty'
     else if (f.size > MAX_BYTES) why = 'size'
     else if (existing + ok.length >= MAX_FILES) why = 'count'
     if (why) rejection ??= why

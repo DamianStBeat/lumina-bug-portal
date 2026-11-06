@@ -110,6 +110,7 @@ type Props = {
   onRetry: () => void
   hasMore: boolean
   loadingMore: boolean
+  moreFailed: boolean
   onMore: () => void
 }
 
@@ -157,6 +158,7 @@ export function ReportList(p: Props) {
           <Row key={r.code} r={r} now={now} sel={r.code === p.selected} onSelect={() => p.onSelect(r.code)} />
         ))}
       </ul>
+      {p.moreFailed && <p className="desk-line desk-err">More reports did not load. Press Load more to try again.</p>}
       {p.hasMore && (
         <button type="button" className="btn ghost desk-more" disabled={p.loadingMore} onClick={p.onMore}>
           {p.loadingMore ? 'Loading…' : 'Load more'}

@@ -65,4 +65,8 @@ export const it: Strings = {
   copied: 'Copiato',
   updated: (date: string): string => `Aggiornata il ${date}`,
   errLoad: 'Ora non riusciamo a caricarla. Controlla il Wi-Fi, poi premi Riprova.',
+  errEmpty: 'Questo file è vuoto. Scegline un altro.',
+  errRefused: 'Non possiamo aggiungere questo file. Toglilo, o premi Indietro per ricominciare.',
+  errCheck: 'Il controllo di sicurezza non si è caricato. Controlla il Wi-Fi, poi premi Riprova.',
+  remove: 'Togli',
 }

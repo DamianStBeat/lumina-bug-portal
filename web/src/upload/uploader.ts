@@ -3,7 +3,8 @@ import { ApiError, completeAttachment, listParts, putPart } from '../api/client'
 // Framework-free on purpose: one file, one attachment, everything it needs passed in.
 // Pool: 3 parts in flight per file, and useUpload sends the files one after the other, so never more than 3 at once.
 export const MAX_IN_FLIGHT = 3
-export const MAX_ATTEMPTS = 5
+// One try and 5 retries: "each part retried 5 times" (brief, Uploader).
+export const MAX_ATTEMPTS = 6
 const BASE_DELAY_MS = 1000
 
 export type UploadOptions = {
@@ -18,14 +19,14 @@ export type UploadOptions = {
 }
 
 // Network, timeouts, rate limits and server errors can pass; any other 4xx will answer the same way next time.
-function retryable(e: unknown): boolean {
+export function retryable(e: unknown): boolean {
   if (!(e instanceof ApiError)) return false
   return e.status === 0 || e.status === 408 || e.status === 429 || e.status >= 500
 }
 
 const hasWindow = typeof window !== 'undefined'
 
-// ~1 s, 2 s, 4 s, 8 s with ±25 % jitter, so many players cut off together do not come back in the same second.
+// ~1 s, 2 s, 4 s, 8 s, 16 s with ±25 % jitter, so many players cut off together do not come back in the same second.
 // Ends early when the network returns; rejects when the run is stopped.
 function backoff(attempt: number, signal: AbortSignal): Promise<void> {
   const ms = BASE_DELAY_MS * 2 ** (attempt - 1) * (0.75 + Math.random() * 0.5)
@@ -118,7 +119,7 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
   const unconfirmed = () => Array.from({ length: partCount }, (_, i) => i + 1).filter((n) => !confirmed.has(n))
 
   async function readServer(): Promise<void> {
-    const { uploaded } = await attempt(() => listParts(id, token))
+    const { uploaded } = await attempt((signal) => listParts(id, token, signal))
     confirmed.clear()
     // A part of the wrong size (an older, cut attempt) is not "done": it is sent again and replaced.
     for (const p of uploaded) {
@@ -130,14 +131,14 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
   try {
     await readServer()
     await sendParts(unconfirmed())
-    const first = await attempt(() => completeAttachment(id, token))
+    const first = await attempt((signal) => completeAttachment(id, token, signal))
     if (!first.missing) return
     // The server knows better than our map: forget what it says is missing, and ask it when it gave no list.
     first.missing.forEach((n) => confirmed.delete(n))
     if (first.missing.length === 0) await readServer()
     else report()
     await sendParts(unconfirmed())
-    const second = await attempt(() => completeAttachment(id, token))
+    const second = await attempt((signal) => completeAttachment(id, token, signal))
     if (second.missing) throw new ApiError(409, 'missing_parts')
   } finally {
     o.signal?.removeEventListener('abort', onStop)

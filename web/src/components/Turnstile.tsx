@@ -1,6 +1,7 @@
-import { useEffect, useImperativeHandle, useRef, type Ref } from 'react'
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react'
 import { TURNSTILE_SITE_KEY } from '../config'
 import { useI18n } from '../i18n'
+import { Err } from './FilePicker'
 
 // Only the part of Cloudflare's widget API this site calls.
 type RenderOptions = {
@@ -39,13 +40,14 @@ function loadApi(): Promise<TurnstileApi> {
     s.src = SRC
     s.async = true
     s.defer = true
-    s.onload = () => (window.turnstile ? resolve(window.turnstile) : reject(new Error('turnstile missing')))
-    s.onerror = () => {
-      // Forget the failed load, so the next page that needs the widget tries again.
+    // Forget a failed load, so Try again (or the next page that needs the widget) adds the script again.
+    const fail = (why: string) => {
       loading = null
       s.remove()
-      reject(new Error('turnstile blocked'))
+      reject(new Error(why))
     }
+    s.onload = () => (window.turnstile ? resolve(window.turnstile) : fail('turnstile missing'))
+    s.onerror = () => fail('turnstile blocked')
     document.head.appendChild(s)
   })
   return loading
@@ -53,7 +55,11 @@ function loadApi(): Promise<TurnstileApi> {
 
 // `onToken(null)` means "no usable token now": not loaded yet, expired, failed or reset.
 export function Turnstile({ onToken, ref }: { onToken(token: string | null): void; ref?: Ref<TurnstileHandle> }) {
-  const { lang } = useI18n()
+  const { t, lang } = useI18n()
+  // The script did not load (offline, a school filter, a browser shield): say so and offer to load it again, instead
+  // of a Send button that stays grey for no visible reason.
+  const [failed, setFailed] = useState(false)
+  const [tries, setTries] = useState(0)
   const box = useRef<HTMLDivElement>(null)
   const widget = useRef<string | null>(null)
   // The widget keeps the callbacks it was rendered with; reading the latest one through a ref avoids re-rendering it.
@@ -71,6 +77,8 @@ export function Turnstile({ onToken, ref }: { onToken(token: string | null): voi
   }))
 
   useEffect(() => {
+    // A build without a site key cannot pass the check; the line below says so (see web/README.md).
+    if (!TURNSTILE_SITE_KEY) return
     let live = true
     loadApi().then(
       (api) => {
@@ -86,7 +94,11 @@ export function Turnstile({ onToken, ref }: { onToken(token: string | null): voi
           size: el.clientWidth < NORMAL_WIDTH ? 'compact' : 'normal',
         })
       },
-      () => live && report.current(null),
+      () => {
+        if (!live) return
+        report.current(null)
+        setFailed(true)
+      },
     )
     return () => {
       live = false
@@ -94,7 +106,28 @@ export function Turnstile({ onToken, ref }: { onToken(token: string | null): voi
       widget.current = null
       report.current(null)
     }
-  }, [lang])
+  }, [lang, tries])
 
-  return <div className="turnstile" ref={box} />
+  if (!TURNSTILE_SITE_KEY) return <Err text={t.errCheck} />
+  return (
+    <>
+      {failed && (
+        <>
+          <Err text={t.errCheck} />
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => {
+              setFailed(false)
+              setTries((n) => n + 1)
+            }}
+          >
+            {t.retry}
+          </button>
+          <div className="gap" />
+        </>
+      )}
+      <div className="turnstile" ref={box} hidden={failed} />
+    </>
+  )
 }

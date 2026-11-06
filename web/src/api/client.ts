@@ -97,22 +97,31 @@ export function attachSession(code: string, turnstileToken: string): Promise<Att
   return call(`/reports/${seg(code)}/attach-session`, { method: 'POST', json })
 }
 
-export function createAttachment(code: string, token: string, body: CreateAttachmentBody): Promise<CreateAttachmentRes> {
-  return call(`/reports/${seg(code)}/attachments`, { method: 'POST', json: body, token })
+export function createAttachment(
+  code: string,
+  token: string,
+  body: CreateAttachmentBody,
+  signal?: AbortSignal,
+): Promise<CreateAttachmentRes> {
+  return call(`/reports/${seg(code)}/attachments`, { method: 'POST', json: body, token, signal })
 }
 
 export function putPart(id: string, n: number, token: string, data: Blob, signal?: AbortSignal): Promise<PutPartRes> {
   return call(`/attachments/${seg(id)}/parts/${n}`, { method: 'PUT', raw: data, token, signal })
 }
 
-export function listParts(id: string, token: string): Promise<ListPartsRes> {
-  return call(`/attachments/${seg(id)}/parts`, { token })
+export function listParts(id: string, token: string, signal?: AbortSignal): Promise<ListPartsRes> {
+  return call(`/attachments/${seg(id)}/parts`, { token, signal })
 }
 
 // 409 missing_parts is an answer the uploader acts on, not a failure. `missing` is [] when the server gave no list
 // (the contract does not fix the field name), so the caller knows to ask listParts instead.
-export async function completeAttachment(id: string, token: string): Promise<{ ok: true; missing?: number[] }> {
-  const res = await send(`/attachments/${seg(id)}/complete`, { method: 'POST', token })
+export async function completeAttachment(
+  id: string,
+  token: string,
+  signal?: AbortSignal,
+): Promise<{ ok: true; missing?: number[] }> {
+  const res = await send(`/attachments/${seg(id)}/complete`, { method: 'POST', token, signal })
   const body = await readBody(res)
   if (res.ok) return { ok: true }
   const code = errorCode(res, body)

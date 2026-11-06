@@ -3,7 +3,8 @@
 //   node dev/shots.mjs <dev-server-url> <out-dir>
 // Exits 1 when a width check or a row fails. The big test files are sparse (no disk used), made in a temp folder
 // that is removed on exit.
-import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { chromium } from 'playwright-core'
@@ -28,6 +29,12 @@ const FILES = {
   huge: sparse('long-3gb.mp4', 3 * 1024 ** 3),
   zip: sparse('logs.zip', 2048),
 }
+// A real 3-second clip for the desk player (row 10), served by the mock for video attachments. VP9 in MP4: a
+// royalty-free codec every Chromium build decodes (open-source builds have no H.264).
+const CLIP = path.join(tmp, 'clip-3s.mp4')
+execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+  'testsrc=size=640x360:rate=24:duration=3', '-c:v', 'libvpx-vp9', '-b:v', '300k', '-pix_fmt', 'yuv420p',
+  '-movflags', '+faststart', CLIP])
 // 360 is not in the brief's list: it is the most common Android width, and step 2 overflowed there by 2 px.
 const WIDTHS = [320, 360, 390, 820, 1024, 1440, 1920]
 const SHOT_WIDTHS = [390, 820, 1440]
@@ -60,6 +67,9 @@ async function until(fn, ms, what) {
 }
 
 const browser = await chromium.launch()
+await fetch(base + '/__mock/video', { method: 'POST', body: readFileSync(CLIP) }).then((r) => {
+  if (!r.ok) throw new Error(`/__mock/video answered ${r.status}`)
+})
 const contexts = new Set()
 
 // One fresh tab per check: the Turnstile size is chosen at render from the width, as on a real device.
@@ -131,21 +141,44 @@ async function settle(page) {
   }
 }
 
-// Width rule for every page; the 56 px rule only on the player pages (the desk is a team screen on a PC).
+// Width rule for every page; the 56 px rule on the player pages and on the desk's action buttons (the desk's filter
+// pills stay at the preview's size). Clipped: content bigger than a box that hides its overflow, or spilling out of
+// a control (the ellipsis on file names is meant). Overlap: two controls whose boxes cross.
 function measure(page, desk) {
   return page.evaluate((desk) => {
-    const over = document.documentElement.scrollWidth - window.innerWidth
+    const vis = (el) => el.checkVisibility({ visibilityProperty: true, opacityProperty: true })
+    const name = (el) => `${el.tagName.toLowerCase()}.${String(el.className).trim().replace(/ +/g, '.')}`
+    const over = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth
     const small = []
-    if (!desk) {
-      for (const el of document.querySelectorAll('button, a[href], input, textarea, select, .chip')) {
-        if (!el.checkVisibility({ visibilityProperty: true, opacityProperty: true })) continue
-        const r = el.getBoundingClientRect()
-        if (r.width > 0 && r.height > 0 && r.height < 56) {
-          small.push(`${el.tagName.toLowerCase()}.${String(el.className).replace(/ /g, '.')}=${Math.round(r.height)}px`)
-        }
+    for (const el of document.querySelectorAll(desk ? '.actions .btn' : 'button, a[href], input, textarea, select, .chip')) {
+      if (!vis(el)) continue
+      const r = el.getBoundingClientRect()
+      if (r.width > 0 && r.height > 0 && r.height < 56) small.push(`${name(el)}=${Math.round(r.height)}px`)
+    }
+    const clipped = []
+    for (const el of document.querySelectorAll('body *')) {
+      if (el.closest('svg') || el.matches('input, textarea, select, iframe, video, img, .visually-hidden, .file .name b')) continue
+      if (!vis(el)) continue
+      const cs = getComputedStyle(el)
+      const flow = cs.overflowX + cs.overflowY
+      if (cs.display === 'inline' || /auto|scroll/.test(flow)) continue
+      if (!/hidden|clip/.test(flow) && !el.matches('button, a[href], .chip')) continue
+      if (el.scrollWidth - el.clientWidth > 1 || el.scrollHeight - el.clientHeight > 1) clipped.push(name(el))
+    }
+    const boxes = [...document.querySelectorAll('button, a[href], input, textarea, select, iframe, .chip, [role=progressbar]')]
+      .filter(vis).map((el) => [el, el.getBoundingClientRect()]).filter(([, r]) => r.width > 0 && r.height > 0)
+    const overlap = []
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const [a, ra] = boxes[i]
+        const [b, rb] = boxes[j]
+        if (a.contains(b) || b.contains(a)) continue
+        const x = Math.min(ra.right, rb.right) - Math.max(ra.left, rb.left)
+        const y = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top)
+        if (x > 1 && y > 1) overlap.push(`${name(a)} x ${name(b)}`)
       }
     }
-    return { over, small }
+    return { over, small, clipped, overlap }
   }, desk)
 }
 
@@ -193,9 +226,9 @@ for (const s of SCREENS) {
           await tab.page.screenshot({ path: file, fullPage: true })
           shots.push(file)
         }
-        return { screen: s.name, width, ...m, ok: m.over <= 0 && m.small.length === 0 }
+        return { screen: s.name, width, ...m, ok: m.over <= 0 && !m.small.length && !m.clipped.length && !m.overlap.length }
       } catch (e) {
-        return { screen: s.name, width, over: NaN, small: [], ok: false, error: e.message }
+        return { screen: s.name, width, over: NaN, small: [], clipped: [], overlap: [], ok: false, error: e.message }
       } finally {
         await tab.close()
       }
@@ -205,10 +238,38 @@ for (const s of SCREENS) {
 }
 await faults()
 
-console.log('\nscreen            width  scroll  small (<56 px)  result')
+console.log('\nscreen            width  scroll  small (<56 px) / clipped / overlap  result')
 for (const r of table) {
-  const small = r.error ?? (r.small.join(', ') || '-')
+  const small = r.error ?? ([...r.small, ...r.clipped.map((c) => `clipped ${c}`), ...r.overlap].join(', ') || '-')
   console.log(`${r.screen.padEnd(17)} ${String(r.width).padStart(5)}  ${String(r.over).padStart(6)}  ${small}  ${r.ok ? 'PASS' : 'FAIL'}`)
+}
+
+// Row 4, run twice: the server failing every part (HTTP 503), then the browser really offline (setOffline). Each
+// time: the orange 3e line, the network back, Try again, the upload completes and no confirmed part is sent again.
+async function cutAndResume(cut, restore) {
+  await reset()
+  await faults({ slowMs: 700 })
+  const { page, seen, close } = await open('/')
+  await toStep3(page)
+  await pickAndSend(page, FILES.mid)
+  await until(async () => seen.atts[0] && Object.values(await stats(seen.atts[0])).some((c) => c.ok > 0), 30_000, 'a part')
+  await cut(page)
+  await page.locator('.err').waitFor({ timeout: 90_000 })
+  const err = await errOf(page)
+  const at = await pct(page)
+  // A part cut in flight may still land on the server; the counts are read after it has.
+  await sleep(1500)
+  const before = await stats(seen.atts[0])
+  await restore(page)
+  await page.getByRole('button', { name: 'Try again' }).click()
+  await doneCode(page)
+  const after = await stats(seen.atts[0])
+  await close()
+  const kept = Object.keys(before).filter((n) => before[n].ok > 0)
+  const resent = kept.filter((n) => after[n].got !== before[n].got)
+  const all = Array.from({ length: 7 }, (_, i) => after[i + 1]?.ok > 0).every(Boolean)
+  if (err.border !== ORANGE || resent.length || !all || !kept.length) throw new Error(`${JSON.stringify(err)} resent ${resent}`)
+  return `orange at ${at} %, parts ${kept} kept, not sent again, completed`
 }
 
 // Each row returns a short note; a thrown error is its FAIL reason.
@@ -264,26 +325,12 @@ const ROWS = {
     return `bar ${[...new Set(mid)].length} steps (${mid[0]}…${mid.at(-1)} %), ${parts}/19 parts, ${code}`
   },
   4: async () => {
-    await faults({ slowMs: 700 })
-    const { page, seen, close } = await open('/')
-    await toStep3(page)
-    await pickAndSend(page, FILES.mid)
-    await until(async () => seen.atts[0] && Object.values(await stats(seen.atts[0])).some((c) => c.ok > 0), 30_000, 'a part')
-    await faults({ slowMs: 700, failParts: 10_000 })
-    await page.locator('.err').waitFor({ timeout: 90_000 })
-    const err = await errOf(page)
-    const at = await pct(page)
-    const before = await stats(seen.atts[0])
-    await faults()
-    await page.getByRole('button', { name: 'Try again' }).click()
-    await doneCode(page)
-    const after = await stats(seen.atts[0])
-    await close()
-    const kept = Object.keys(before).filter((n) => before[n].ok > 0)
-    const resent = kept.filter((n) => after[n].got !== before[n].got)
-    const all = Array.from({ length: 7 }, (_, i) => after[i + 1]?.ok > 0).every(Boolean)
-    if (err.border !== ORANGE || resent.length || !all || !kept.length) throw new Error(`${JSON.stringify(err)} resent ${resent}`)
-    return `orange at ${at} %, parts ${kept} kept, not sent again; completed`
+    const http = await cutAndResume(() => faults({ slowMs: 700, failParts: 10_000 }), () => faults())
+    const net = await cutAndResume(
+      (p) => p.context().setOffline(true),
+      async (p) => (await p.context().setOffline(false), await faults()),
+    )
+    return `HTTP 503: ${http}; browser offline: ${net}`
   },
   5: async () => {
     await faults({ slowMs: 400 })
@@ -387,15 +434,23 @@ const ROWS = {
       fixed: await n('.actions button'), cols: await page.locator('.dash').evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length),
     }
     const ai = await page.locator('.ai').textContent()
+    // The clip really plays: decoded frames (readyState 2 = HAVE_CURRENT_DATA) and the clock moving.
+    const play = await page.locator('.video video').evaluate(async (v) => {
+      v.muted = true
+      await v.play()
+      await new Promise((r) => setTimeout(r, 1000))
+      return { ready: v.readyState, t: v.currentTime, w: v.videoWidth }
+    })
     await close()
     const ok = got.rows === 5 && got.filters === 6 && got.video === 1 && got.frames === 6 && got.pr === 1 && got.fixed === 1
-    if (!ok || got.cols !== 2 || !/Likely cause/.test(ai ?? '')) throw new Error(JSON.stringify(got))
-    return `two columns, ${got.rows} rows, ${got.filters} filters, video, ${got.frames} frames, AI triage, PR link`
+    const plays = play.ready >= 2 && play.t > 0 && play.w > 0
+    if (!ok || !plays || got.cols !== 2 || !/Likely cause/.test(ai ?? '')) throw new Error(JSON.stringify({ ...got, ...play }))
+    return `two columns, ${got.rows} rows, ${got.filters} filters, video plays (readyState ${play.ready}, ${play.t.toFixed(1)} s, ${play.w} px), ${got.frames} frames, AI triage, PR link`
   },
   11: async () => {
     const bad = table.filter((r) => !r.ok)
     if (bad.length) throw new Error(bad.map((r) => `${r.screen}@${r.width}`).join(', '))
-    return `${table.length} screen × width checks, no side scroll, no player control under 56 px`
+    return `${table.length} screen × width checks: no side scroll, nothing clipped, no controls overlapping, no control under 56 px`
   },
 }
 

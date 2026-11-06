@@ -179,7 +179,8 @@ export default function Report() {
 
   const uploading = up.phase === 'uploading'
   const missing = up.resume?.missing ?? []
-  const canSend = code ? up.files.length > 0 : !!token && !!what.trim()
+  // A refused file is removed first (FilePicker's Remove), then Send goes on with the rest.
+  const canSend = !up.refused && (code ? up.files.length > 0 : !!token && !!what.trim())
   return (
     <Shell>
       <Steps n={3} />

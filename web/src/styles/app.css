@@ -130,7 +130,7 @@ td .sub{color:var(--slate);font-size:12.5px;margin-top:3px}
 .ai li{margin:4px 0}
 .ai li b{color:var(--soft-white);font-weight:600}
 .actions{display:flex;gap:10px;margin-top:14px}
-.actions .btn{min-height:48px;font-size:15px}
+.actions .btn{min-height:56px;font-size:15px}
 .lock{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--slate);margin-top:12px}
 
 /* Additions: what the preview lacks because its elements were pictures, not controls. */
@@ -171,3 +171,6 @@ button.chip{width:100%;text-align:left}
 /* stage E: two chip columns need about 370 px ("Something else" does not shrink); tighter below, one column under 360. */
 @media(max-width:379px){.chip{padding:0 12px;gap:8px}}
 @media(max-width:359px){.chips{grid-template-columns:1fr}}
+
+/* red team round: Remove on a file row, under its bar, a full 56 px target. */
+.file .rm{grid-column:2;justify-self:start;min-height:56px;padding:0 18px;border-radius:14px;border:1px solid rgba(142,220,255,.22);font:600 16px Inter;color:var(--glow-blue)}

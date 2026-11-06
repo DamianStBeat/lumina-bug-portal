@@ -1,28 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { createAttachment, deleteAttachment } from '../api/client'
+import { ApiError, createAttachment, deleteAttachment } from '../api/client'
 import { clearSession, loadSession, saveSession, type SavedFile, type Session } from './session'
-import { uploadFile } from './uploader'
+import { retryable, uploadFile } from './uploader'
 import { validatePick, type Rejection } from './validate'
 
+// Why the server turned a file down for good: one of the pick-time reasons, or any other refusal ('other').
+export type Refusal = Rejection | 'other'
 export type FileItem = {
   key: string
   name: string
   size: number
   kind: 'video' | 'image'
   confirmed: number
-  state: 'waiting' | 'uploading' | 'done' | 'error'
+  // 'error': network or server, Try again can pass it. 'refused': the server would answer the same again, so the
+  // only way on is to remove the file.
+  state: 'waiting' | 'uploading' | 'done' | 'error' | 'refused'
+  why?: Refusal
   previewUrl?: string
 }
 export type Phase = 'idle' | 'uploading' | 'error' | 'done'
 export type Target = { code: string; reportToken: string }
 type Resume = { code: string; missing: { name: string; size: number }[] }
-type Att = Pick<SavedFile, 'attachmentId' | 'partSize' | 'partCount'>
+type Att = { attachmentId: string; partSize: number; partCount: number }
 // The File and its attachment stay out of React state: the upload loop reads and replaces them across awaits.
 type Entry = Omit<FileItem, 'name' | 'size'> & { file: File; att?: Att }
+type Ident = { name: string; size: number; lastModified: number }
 
 let seq = 0
-
-const boundIds = (list: Entry[]) => new Set(list.flatMap((e) => (e.att ? [e.att.attachmentId] : [])))
 
 const view = (e: Entry): FileItem => ({
   key: e.key,
@@ -31,23 +35,44 @@ const view = (e: Entry): FileItem => ({
   kind: e.kind,
   confirmed: e.confirmed,
   state: e.state,
+  why: e.why,
   previewUrl: e.previewUrl,
 })
 
-const sameFile = (f: File, s: { name: string; size: number; lastModified: number }) =>
-  f.name === s.name && f.size === s.size && f.lastModified === s.lastModified
+// The browser gives a re-picked file no other identity; the same three values also find its saved line.
+const sameFile = (a: Ident, b: Ident) => a.name === b.name && a.size === b.size && a.lastModified === b.lastModified
+const attOf = (f: SavedFile): Att | undefined =>
+  f.attachmentId === null ? undefined : { attachmentId: f.attachmentId, partSize: f.partSize, partCount: f.partCount }
+
+const SERVER_REFUSAL: Record<string, Rejection> = {
+  invalid_mime: 'type',
+  file_too_large: 'size',
+  too_many_files: 'count',
+}
+// null: Try again can work (the network, the server, parts the server lost). Anything else is a refusal.
+function refusalOf(e: unknown): Refusal | null {
+  if (!(e instanceof ApiError)) return 'other'
+  // Status 0 is also the uploader's own 'bad_parts' (the file does not fit the server's parts): not the network.
+  if (e.code === 'missing_parts' || (e.status === 0 ? e.code === 'network' : retryable(e))) return null
+  return SERVER_REFUSAL[e.code] ?? 'other'
+}
 
 // Shown while a saved session still has unfinished files; `missing` lists the ones not picked again yet.
-function resumeOf(s: Session | null, bound: Set<string>): Resume | null {
+function resumeOf(s: Session | null, list: Entry[]): Resume | null {
   if (!s || s.files.every((f) => f.done)) return null
-  const missing = s.files.filter((f) => !f.done && !bound.has(f.attachmentId)).map(({ name, size }) => ({ name, size }))
+  const missing = s.files
+    .filter((f) => !f.done && !list.some((e) => sameFile(e.file, f)))
+    .map(({ name, size }) => ({ name, size }))
   return { code: s.code, missing }
 }
 
-export function useUpload() {
+// `only`: the report the page was asked for. A saved upload of another report is not offered here and never used for
+// this one; it stays in storage until an upload to this report replaces it.
+export function useUpload(only?: string) {
   const [boot] = useState(() => {
-    const s = loadSession()
-    return { s, resume: resumeOf(s, new Set()) }
+    const found = loadSession()
+    const s = found && only && found.code !== only ? null : found
+    return { s, resume: resumeOf(s, []) }
   })
   const saved = useRef<Session | null>(boot.s)
   const target = useRef<Target | null>(null)
@@ -64,7 +89,7 @@ export function useUpload() {
     saved.current = s
     if (s) saveSession(s)
     else clearSession()
-    setResume(resumeOf(s, boundIds(entries.current)))
+    setResume(resumeOf(s, entries.current))
   }, [])
   // Entries are replaced, never edited in place, so a FileItem handed to React never changes under it.
   const patch = useCallback(
@@ -88,27 +113,26 @@ export function useUpload() {
     (picked: File[]) => {
       if (run.current) return
       const s = saved.current
-      const taken = boundIds(entries.current)
       const known: Entry[] = []
       const fresh: File[] = []
       for (const f of picked) {
         // The same file twice would upload twice and spend one of the 3 places.
-        if (entries.current.some((e) => sameFile(f, e.file))) continue
-        const m = s?.files.find((sf) => !taken.has(sf.attachmentId) && sameFile(f, sf))
+        if ([...entries.current, ...known].some((e) => sameFile(f, e.file))) continue
+        const m = s?.files.find((sf) => sameFile(f, sf))
         if (!m) {
           fresh.push(f)
           continue
         }
-        taken.add(m.attachmentId)
-        known.push(entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, m))
+        known.push(entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, attOf(m)))
       }
-      // Saved attachments not picked again still hold a place on the server, so they count against the 3.
-      const held = s ? s.files.filter((sf) => !taken.has(sf.attachmentId)).length : 0
-      const { ok, rejection: why } = validatePick(entries.current.length + known.length + held, fresh)
+      const list = [...entries.current, ...known]
+      // Saved files not picked again hold a place on the server (or will on resume), so they count against the 3.
+      const held = s ? s.files.filter((sf) => !list.some((e) => sameFile(e.file, sf))).length : 0
+      const { ok, rejection: why } = validatePick(list.length + held, fresh)
       setRejection(why)
-      entries.current = [...entries.current, ...known, ...ok.map((f) => entry(f, 'waiting', 0))]
+      entries.current = [...list, ...ok.map((f) => entry(f, 'waiting', 0))]
       sync()
-      setResume(resumeOf(s, boundIds(entries.current)))
+      setResume(resumeOf(s, entries.current))
     },
     [sync],
   )
@@ -120,11 +144,10 @@ export function useUpload() {
       if (e.previewUrl) URL.revokeObjectURL(e.previewUrl)
       entries.current = entries.current.filter((x) => x !== e)
       const s = saved.current
-      const token = target.current?.reportToken ?? s?.reportToken
-      if (e.att && token) {
+      if (s) {
         // Best effort: an attachment left behind is aborted by the worker's daily cleanup after 7 days.
-        deleteAttachment(e.att.attachmentId, token).catch(() => {})
-        if (s) store({ ...s, files: s.files.filter((f) => f.attachmentId !== e.att?.attachmentId) })
+        if (e.att) deleteAttachment(e.att.attachmentId, s.reportToken).catch(() => {})
+        store({ ...s, files: s.files.filter((f) => !sameFile(f, e.file)) })
       }
       sync()
     },
@@ -133,24 +156,27 @@ export function useUpload() {
 
   const start = useCallback(
     async (t?: Target): Promise<boolean> => {
-      if (run.current) return false
+      // A refused file would be refused again: it has to be removed first.
+      if (run.current || entries.current.some((e) => e.state === 'refused')) return false
       const prev = saved.current
       const tgt = t ?? target.current ?? (prev ? { code: prev.code, reportToken: prev.reportToken } : null)
-      if (entries.current.length === 0 || !tgt) {
-        if (entries.current.length > 0) return false
-        store(null)
-        setPhase('done')
-        return true
-      }
+      if (!tgt) return false
       // Attachments bound to another report's session cannot be reused for this one.
       const same = prev?.code === tgt.code
       entries.current = entries.current.map((e) =>
         !same ? { ...e, att: undefined, state: 'waiting', confirmed: 0 } : e.state === 'done' ? e : { ...e, state: 'waiting' },
       )
-      let s: Session = { v: 1, code: tgt.code, reportToken: tgt.reportToken, files: same ? prev.files : [] }
+      // Every file is written down before its attachment is asked for, so a reload from here on resumes this report.
+      const kept = same ? prev.files : []
+      const added = entries.current
+        .filter((e) => !kept.some((f) => sameFile(f, e.file)))
+        .map(({ file: f }): SavedFile => ({ name: f.name, size: f.size, lastModified: f.lastModified, done: false, attachmentId: null }))
+      let s: Session = { v: 2, code: tgt.code, reportToken: tgt.reportToken, files: [...kept, ...added] }
       target.current = tgt
       store(s)
       const ac = new AbortController()
+      // After reset() or unmount nothing may be written: no storage, no state.
+      const live = () => !ac.signal.aborted
       run.current = ac
       setPhase('uploading')
       sync()
@@ -161,11 +187,12 @@ export function useUpload() {
           current = key
           let att = known
           if (!att) {
-            const r = await createAttachment(tgt.code, tgt.reportToken, { filename: f.name, size: f.size, mime: f.type })
-            // reset() may have come during the await: its cleared session must not be written back.
-            if (ac.signal.aborted) return false
-            att = { attachmentId: r.attachmentId, partSize: r.partSize, partCount: r.partCount }
-            s = { ...s, files: [...s.files, { ...att, name: f.name, size: f.size, lastModified: f.lastModified, done: false }] }
+            const body = { filename: f.name, size: f.size, mime: f.type }
+            const r = await createAttachment(tgt.code, tgt.reportToken, body, ac.signal)
+            if (!live()) return false
+            const made: Att = { attachmentId: r.attachmentId, partSize: r.partSize, partCount: r.partCount }
+            att = made
+            s = { ...s, files: s.files.map((x) => (sameFile(x, f) ? { ...x, ...made } : x)) }
             patch(key, { att })
             store(s)
           }
@@ -175,21 +202,30 @@ export function useUpload() {
             ...att,
             token: tgt.reportToken,
             signal: ac.signal,
-            onConfirmed: (b) => patch(key, { confirmed: b }),
+            onConfirmed: (b) => {
+              if (live()) patch(key, { confirmed: b })
+            },
           })
-          const doneId = att.attachmentId
-          s = { ...s, files: s.files.map((x) => (x.attachmentId === doneId ? { ...x, done: true } : x)) }
+          if (!live()) return false
+          s = { ...s, files: s.files.map((x) => (sameFile(x, f) ? { ...x, done: true } : x)) }
           patch(key, { state: 'done', confirmed: f.size })
           store(s)
         }
-        store(null)
-        setPhase('done')
-        return true
-      } catch {
+        // Done only when every saved file is: one not picked again after a reload still waits for its bytes, and the
+        // page shows the resume hint for it.
+        if (s.files.every((x) => x.done)) {
+          store(null)
+          setPhase('done')
+          return true
+        }
+        setPhase('idle')
+        return false
+      } catch (e) {
         // A stop asked by reset() or unmount is not an error to show.
-        if (ac.signal.aborted) return false
-        if (current) patch(current, { state: 'error' })
-        setPhase('error')
+        if (!live()) return false
+        const why = refusalOf(e)
+        if (current) patch(current, why ? { state: 'refused', why } : { state: 'error' })
+        setPhase(why ? 'idle' : 'error')
         return false
       } finally {
         if (run.current === ac) run.current = null
@@ -215,10 +251,12 @@ export function useUpload() {
   const total = files.reduce((n, f) => n + f.size, 0)
   const progress = total > 0 ? files.reduce((n, f) => n + f.confirmed, 0) / total : phase === 'done' ? 1 : 0
 
-  return { files, phase, rejection, progress, resume, addFiles, removeFile, start, retry, reset }
+  const refused = files.find((f) => f.state === 'refused')?.why ?? null
+
+  return { files, phase, rejection, refused, progress, resume, addFiles, removeFile, start, retry, reset }
 }
 
-function entry(file: File, state: Entry['state'], confirmed: number, att?: SavedFile): Entry {
+function entry(file: File, state: Entry['state'], confirmed: number, att?: Att): Entry {
   const kind = file.type.startsWith('image/') ? 'image' : 'video'
   return {
     key: `f${++seq}`,
@@ -228,6 +266,6 @@ function entry(file: File, state: Entry['state'], confirmed: number, att?: Saved
     state,
     // Only pictures get a thumbnail; a video's object URL would pin a 2 GB file for nothing.
     previewUrl: kind === 'image' ? URL.createObjectURL(file) : undefined,
-    att: att && { attachmentId: att.attachmentId, partSize: att.partSize, partCount: att.partCount },
+    att,
   }
 }

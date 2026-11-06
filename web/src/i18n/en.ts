@@ -68,4 +68,9 @@ export const en = {
   copied: 'Copied',
   updated: (date: string): string => `Last change: ${date}`,
   errLoad: "We can't load this now. Check your Wi-Fi, then press Try again.",
+  // Red team round: a refusal that trying again cannot fix, the safety check that did not load, removing a file.
+  errEmpty: 'This file is empty. Choose another file.',
+  errRefused: "We can't add this file. Remove it, or press Back to start again.",
+  errCheck: 'The safety check did not load. Check your Wi-Fi, then press Try again.',
+  remove: 'Remove',
 }

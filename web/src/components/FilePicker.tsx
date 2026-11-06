@@ -33,12 +33,16 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
     if (up.resume && missing.length > 0 && allBack) void up.start()
   }
 
-  const why = up.rejection && { type: t.errType, size: t.errSize, count: t.errCount }[up.rejection]
+  const text = { type: t.errType, size: t.errSize, count: t.errCount, empty: t.errEmpty, other: t.errRefused }
+  const why = up.rejection && text[up.rejection]
+  // A refusal has its own line: Try again would only meet the same answer, so it says what to do instead.
+  const refused = up.refused && text[up.refused]
 
   return (
     <>
       {up.phase === 'error' && <Err text={t.errUp} />}
-      {why && up.phase !== 'error' && <Err text={why} />}
+      {refused && up.phase !== 'error' && <Err text={refused} />}
+      {why && why !== refused && up.phase !== 'error' && <Err text={why} />}
       {up.phase !== 'error' && (
         <button
           type="button"
@@ -78,20 +82,20 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
         }}
       />
       {up.files.map((f) => (
-        <FileRow key={f.key} f={f} />
+        <FileRow key={f.key} f={f} onRemove={busy || f.state === 'done' ? undefined : () => up.removeFile(f.key)} />
       ))}
     </>
   )
 }
 
-function FileRow({ f }: { f: FileItem }) {
+function FileRow({ f, onRemove }: { f: FileItem; onRemove?: () => void }) {
   const { t, lang } = useI18n()
   const pct = f.size > 0 ? Math.min(100, Math.floor((f.confirmed / f.size) * 100)) : 100
   // SI megabytes, as the preview's "312 MB"; one decimal under 10 MB so a small picture does not read "0 MB".
   const mb = new Intl.NumberFormat(lang, { maximumFractionDigits: f.size < 1e7 ? 1 : 0 }).format(
     Math.max(f.size / 1e6, 0.1),
   )
-  const cls = f.state === 'done' ? 'file done' : f.state === 'error' ? 'file failed' : 'file'
+  const cls = f.state === 'done' ? 'file done' : f.state === 'error' || f.state === 'refused' ? 'file failed' : 'file'
   return (
     <div className={cls}>
       <div className="thumb" style={f.previewUrl ? { backgroundImage: `url("${f.previewUrl}")` } : undefined} />
@@ -114,6 +118,12 @@ function FileRow({ f }: { f: FileItem }) {
         </div>
         {f.state === 'uploading' && <div className="small">{t.up}</div>}
       </div>
+      {onRemove && (
+        // Starts with the visible word, so voice control users can say what they see.
+        <button type="button" className="rm" aria-label={`${t.remove} ${f.name}`} onClick={onRemove}>
+          {t.remove}
+        </button>
+      )}
     </div>
   )
 }
