@@ -136,8 +136,9 @@ def _current(client: Client, code: str) -> tuple[str, int] | None:
 
 
 def transient(status: int | None) -> bool:
-    """A worker failure worth trying again later: no answer, 5xx, 408 or 429. Any other 4xx is final."""
-    return status is None or status >= 500 or status in (408, 429)
+    """A worker failure worth trying again later: no answer, 5xx, 408, 429, or a 2xx/other status raised for a body
+    cut short or not JSON (client.py). Only a 4xx other than 408/429 (deleted, refused) is final."""
+    return status is None or not 400 <= status < 500 or status in (408, 429)
 
 
 def attempt(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any], stage_b: dict[str, Any],

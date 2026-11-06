@@ -81,10 +81,11 @@ class Cache:
         ).fetchall()
         return [dict(zip(("code", "title", "summary", "verdict", "status"), r)) for r in rows]
 
-    def summary_of(self, code: str) -> str | None:
-        """None: the report is not remembered; "" : remembered without a summary (cached before its triage)."""
-        row = self._db.execute("SELECT summary FROM reports WHERE code = ?", (code,)).fetchone()
-        return None if row is None else str(row[0] or "")
+    def summary_of(self, code: str) -> tuple[str, str | None] | None:
+        """None: the report is not remembered; else (summary, verdict). ("", None): cached before its triage;
+        a verdict with "": triaged without a summary (stage B invalid), nothing more to fetch."""
+        row = self._db.execute("SELECT summary, verdict FROM reports WHERE code = ?", (code,)).fetchone()
+        return None if row is None else (str(row[0] or ""), None if row[1] is None else str(row[1]))
 
     def set_status(self, code: str, status: str) -> None:
         # Only reports already remembered: run.py seeds unknown ones from created/triaged events first.

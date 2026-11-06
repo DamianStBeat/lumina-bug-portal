@@ -259,12 +259,13 @@ class Round:
 
     def seed(self, code: str, refresh: bool) -> bool:
         """An unknown report joins the duplicate list: its title and the triage's summary, never the player's text.
-        `refresh` (a `triaged` event): a report cached before its triage, with no summary, is fetched again.
+        `refresh` (a `triaged` event): a report cached before its triage (no verdict, no summary) is fetched again;
+        one this agent triaged itself is never refetched.
         False: not handled, to be tried next round (the cap of 50 reached, or a GET that may answer later)."""
         if not CODE_RX.fullmatch(code):
             return True
         known = self.cache.summary_of(code)
-        if known is not None and (known or not refresh):
+        if known is not None and (known != ("", None) or not refresh):
             return True
         if self.seeds >= MAX_SEEDS:
             return False
