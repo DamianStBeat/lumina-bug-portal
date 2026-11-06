@@ -212,14 +212,30 @@ const SCREENS = [
   },
 ]
 
+// At most two tabs at a time (the server's memory rule: seven Chromium tabs at once took 3.5 GB). Results keep the
+// order of the items, so the PASS table reads as before.
+const TABS = 2
+async function pooled(items, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  const lane = async () => {
+    while (next < items.length) {
+      const i = next++
+      results[i] = await fn(items[i])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(TABS, items.length) }, lane))
+  return results
+}
+
 const table = []
 const shots = []
 for (const s of SCREENS) {
   await reset()
   await faults(s.faults)
-  // The six widths of a screen run side by side; the mock's faults are global, so screens run one after another.
-  const results = await Promise.all(
-    WIDTHS.map(async (width) => {
+  // The widths of a screen run two at a time; the mock's faults are global, so screens run one after another.
+  const results = await pooled(
+    WIDTHS, async (width) => {
       const tab = await open(s.url, { width, locale: s.locale })
       try {
         await s.go?.(tab.page)
@@ -236,7 +252,7 @@ for (const s of SCREENS) {
       } finally {
         await tab.close()
       }
-    }),
+    },
   )
   table.push(...results)
 }
