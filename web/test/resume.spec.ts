@@ -329,3 +329,48 @@ describe('resume state: storage blocked or unreadable', () => {
     expect(await startAll(h, { code: CODE, reportToken: token })).toBe(true)
   })
 })
+
+describe('decided B5 on useUpload: a lost answer or a complete without { ok: true } keeps the upload resumable', () => {
+  it('B5: complete answering 200 {} every time is the error state with Try again, the session kept with the file not done', async () => {
+    const token = server.addReport(CODE)
+    server.routeFault = (m, p) => (m === 'POST' && p.endsWith('/complete') ? { status: 200, body: '{}' } : null)
+    const h = mount()
+    act(() => h.result.current.addFiles([file('clip.mp4', 2 * PART)]))
+    expect(await startAll(h, { code: CODE, reportToken: token })).toBe(false)
+    expect(h.result.current.phase).toBe('error')
+    expect(h.result.current.files[0]?.state).toBe('error')
+    expect(h.result.current.refused).toBeNull()
+    expect(loadSession()?.code).toBe(CODE)
+    expect(loadSession()?.files).toEqual([expect.objectContaining({ name: 'clip.mp4', done: false })])
+
+    server.routeFault = () => null
+    let ok = false
+    await act(async () => {
+      ok = await drive(h.result.current.retry())
+    })
+    expect(ok).toBe(true)
+    expect(h.result.current.phase).toBe('done')
+    expect(server.attsOf(CODE).map((a) => a.status)).toEqual(['complete'])
+    expect(loadSession()).toBeNull()
+  })
+
+  it('B5: a part whose 200 is cut every time is the error state with Try again, not a refusal', async () => {
+    const token = server.addReport(CODE)
+    server.partFault = (_id, n) => (n === 1 ? 'cut' : 'ok')
+    const h = mount()
+    act(() => h.result.current.addFiles([file('clip.mp4', 2 * PART)]))
+    expect(await startAll(h, { code: CODE, reportToken: token })).toBe(false)
+    expect(h.result.current.phase).toBe('error')
+    expect(h.result.current.files[0]?.state).toBe('error')
+    expect(h.result.current.refused).toBeNull()
+    expect(loadSession()?.code).toBe(CODE)
+
+    server.partFault = () => 'ok'
+    let ok = false
+    await act(async () => {
+      ok = await drive(h.result.current.retry())
+    })
+    expect(ok).toBe(true)
+    expect(server.attsOf(CODE).map((a) => a.status)).toEqual(['complete'])
+  })
+})

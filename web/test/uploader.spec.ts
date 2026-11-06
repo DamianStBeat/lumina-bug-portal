@@ -358,3 +358,45 @@ describe('resume from GET /attachments/{id}/parts', () => {
     expect(server.requests('POST', '/complete')).toHaveLength(0)
   })
 })
+
+describe('decided B5: an answer lost mid-body, and a complete that is not { ok: true }', () => {
+  it('B5: a part whose 200 is cut mid-body is sent again, and the upload completes', async () => {
+    server.partFault = (_id, n, k) => (n === 2 && k === 1 ? 'cut' : 'ok')
+    const f = file('clip.mp4', 3 * PART)
+    const a = await attach(f)
+    const { p, seen } = run(f, a)
+    await drive(p)
+    expect(server.puts().filter((r) => r.n === 2)).toHaveLength(2)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+    expect(seen.at(-1)).toBe(f.size)
+  })
+
+  it('B5: a part cut mid-body every time gives up after its retries with a network error', async () => {
+    server.partFault = (_id, n) => (n === 1 ? 'cut' : 'ok')
+    const f = file('clip.mp4', PART)
+    const a = await attach(f)
+    const err = await drive(run(f, a).p).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).code).toBe('network')
+    expect(server.puts().filter((r) => r.n === 1)).toHaveLength(6)
+    expect(server.requests('POST', '/complete')).toHaveLength(0)
+  })
+
+  it('B5: a complete answering 200 {} is tried again, and the next { ok: true } completes it', async () => {
+    server.routeFault = (m, p, k) => (m === 'POST' && p.endsWith('/complete') && k === 1 ? { status: 200, body: '{}' } : null)
+    const f = file('clip.mp4', 2 * PART)
+    const a = await attach(f)
+    await drive(run(f, a).p)
+    expect(server.requests('POST', '/complete')).toHaveLength(2)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('complete')
+  })
+
+  it('B5: a complete that keeps answering 200 {} ends in an error, never in success', async () => {
+    server.routeFault = (m, p) => (m === 'POST' && p.endsWith('/complete') ? { status: 200, body: '{}' } : null)
+    const f = file('clip.mp4', PART)
+    const a = await attach(f)
+    await expect(drive(run(f, a).p)).rejects.toBeInstanceOf(ApiError)
+    expect(server.requests('POST', '/complete').length).toBeGreaterThan(1)
+    expect(server.atts.get(a.attachmentId)!.status).toBe('uploading')
+  })
+})

@@ -12,7 +12,8 @@ import {
   listParts,
   putPart,
 } from '../src/api/client'
-import { FakeServer, MiB, SparseBlob } from './helpers'
+import { retryable } from '../src/upload/uploader'
+import { FakeServer, MiB, SparseBlob, cutResponse } from './helpers'
 
 const CODE = 'LUM-482193'
 let server: FakeServer
@@ -101,5 +102,52 @@ describe('contract rule: errors are { error: "<snake_case>" }, never raw text fo
   it('errors: a 200 that is not JSON (a proxy page) is a failure, not an empty success', async () => {
     answer(200, '<html>captive portal</html>', 'text/html')
     await expect(getStatus(CODE)).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+describe('decided B5: a 2xx whose body cannot be read is the network, not an answer', () => {
+  const blob = new SparseBlob(MiB) as unknown as Blob
+  const calls: [string, () => Promise<unknown>][] = [
+    ['createReport', () => createReport({ what: 'The boss stopped.', turnstileToken: 'tt' })],
+    ['attachSession', () => attachSession(CODE, 'tt')],
+    ['createAttachment', () => createAttachment(CODE, 'tok', { filename: 'a.mp4', size: MiB, mime: 'video/mp4' })],
+    ['putPart', () => putPart('att-1', 1, 'tok', blob)],
+    ['listParts', () => listParts('att-1', 'tok')],
+    ['completeAttachment', () => completeAttachment('att-1', 'tok')],
+    ['getStatus', () => getStatus(CODE)],
+  ]
+  it.each(calls)('B5: %s answered 200 with the connection lost mid-body is ApiError network, retried like it', async (_n, call) => {
+    vi.stubGlobal('fetch', vi.fn(async () => cutResponse(200)))
+    const err = await call().catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).code).toBe('network')
+    expect(retryable(err)).toBe(true)
+  })
+
+  it('B5 edge: a 201 cut mid-body is the network too', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => cutResponse(201)))
+    const err = await createReport({ what: 'The boss stopped.', turnstileToken: 'tt' }).catch((e: unknown) => e)
+    expect((err as ApiError).code).toBe('network')
+    expect(retryable(err)).toBe(true)
+  })
+})
+
+describe('decided B5: complete answering 200 without { ok: true } is not success', () => {
+  const bodies: [string, string, string][] = [
+    ['an empty object', '{}', 'application/json'],
+    ['ok false', '{"ok":false}', 'application/json'],
+    ['ok as text', '{"ok":"true"}', 'application/json'],
+    ['a page that is not JSON', '<html>captive portal</html>', 'text/html'],
+  ]
+  it.each(bodies)('B5: %s is a retryable server error, not success', async (_n, body, type) => {
+    answer(200, body, type)
+    const err = await completeAttachment('att-1', 'tok').catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect(retryable(err)).toBe(true)
+  })
+
+  it('B5 edge: 200 { ok: true } is success, with no missing list', async () => {
+    answer(200, JSON.stringify({ ok: true }))
+    await expect(completeAttachment('att-1', 'tok')).resolves.toEqual({ ok: true })
   })
 })

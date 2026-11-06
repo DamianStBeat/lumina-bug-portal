@@ -43,7 +43,9 @@ export function file(name: string, size: number, type = 'video/mp4', lastModifie
   return new SparseFile(name, size, type, lastModified) as unknown as File
 }
 
-export type Fault = 'ok' | 'network' | { status: number; error?: string }
+// 'cut': the server stored the request and its 200 headers arrived, then the connection dropped in the body.
+// `body`: the answer's raw text instead of `{ error }` (a 200 that is not the JSON the contract names).
+export type Fault = 'ok' | 'network' | 'cut' | { status: number; error?: string; body?: string }
 type Part = { size: number; offset: number | null }
 type Att = {
   id: string
@@ -83,6 +85,23 @@ const json = (status: number, body: unknown) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 const fail = (status: number, error: string, more: Record<string, unknown> = {}) => json(status, { error, ...more })
 
+// A response whose status and headers arrived and whose body did not: reading it rejects as the browser's does when
+// the connection is lost mid-body.
+export function cutResponse(status = 200): Response {
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      c.enqueue(new TextEncoder().encode('{"ok":tr'))
+      c.error(new TypeError('network error'))
+    },
+  })
+  return new Response(stream, { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function faultAnswer(f: Exclude<Fault, 'ok' | 'network' | 'cut'>): Response {
+  if (f.body !== undefined) return new Response(f.body, { status: f.status, headers: { 'Content-Type': 'application/json' } })
+  return fail(f.status, f.error ?? `fault_${f.status}`)
+}
+
 function abortError(): Error {
   const e = new Error('The operation was aborted.')
   e.name = 'AbortError'
@@ -120,6 +139,9 @@ export class FakeServer {
   holdCreate: Promise<void> | null = null
   // While it returns a promise for a request (method, path after /api/v1), that request waits for it first.
   holdRoute: (method: string, path: string) => Promise<void> | null = () => null
+  // Decides the answer to any request but a PUT part (partFault has those) before the server handles it; `k` counts
+  // the requests with this method and path, this one included. null or 'ok': handled as usual.
+  routeFault: (method: string, path: string, k: number) => Fault | null = () => null
   // Runs at the start of every complete, before the server checks its parts (a server that lost parts).
   beforeComplete: (att: Att, k: number) => void = () => {}
   private nextCode = 500001
@@ -171,6 +193,20 @@ export class FakeServer {
     const held = this.holdRoute(method, path)
     if (held) await waitOrAbort(held, init.signal)
     let m: RegExpExecArray | null
+    const isPart = method === 'PUT' && /^\/attachments\/[^/]+\/parts\/\d+$/.test(path)
+    if (!isPart) {
+      const k = this.log.filter((r) => r.method === method && r.path === entry.path).length
+      const f = this.routeFault(method, path, k)
+      if (f === 'network') throw new TypeError('Failed to fetch')
+      if (f === 'cut') {
+        entry.reached = true
+        return cutResponse()
+      }
+      if (f && f !== 'ok') {
+        entry.reached = true
+        return faultAnswer(f)
+      }
+    }
 
     if (method === 'PUT' && (m = /^\/attachments\/([^/]+)\/parts\/(\d+)$/.exec(path))) {
       const id = decodeURIComponent(m[1] as string)
@@ -191,7 +227,7 @@ export class FakeServer {
         const fault = this.partFault(id, n, k)
         if (fault === 'network') throw new TypeError('Failed to fetch')
         entry.reached = true
-        if (fault !== 'ok') return fail(fault.status, fault.error ?? `fault_${fault.status}`)
+        if (fault !== 'ok' && fault !== 'cut') return faultAnswer(fault)
         const a = this.atts.get(id)
         if (!a) return fail(404, 'not_found')
         if (!entry.token || !this.reports.get(a.code)?.tokens.has(entry.token)) return fail(401, 'invalid_token')
@@ -199,6 +235,8 @@ export class FakeServer {
         if (n < 1 || n > a.partCount) return fail(400, 'invalid_part')
         if (entry.bodySize !== this.expectedSize(a, n)) return fail(400, 'invalid_part_size')
         a.parts.set(n, { size: entry.bodySize, offset: typeof body?.offset === 'number' ? body.offset : null })
+        // Stored, but the answer is lost after its headers: the client cannot know the part arrived.
+        if (fault === 'cut') return cutResponse()
         return json(200, { n, etag: `etag-${id}-${n}-${k}` })
       } finally {
         this.putsInFlight--
