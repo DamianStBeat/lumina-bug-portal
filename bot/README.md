@@ -18,7 +18,8 @@ worker (with the bearer `AGENT_KEY`). See `../CONTRACT.md` for the worker API.
 - **Events** (every 20 s, cursor in `~/.local/state/lumina-bug-bot/cursor`): "Fixed" and "Same bug" posts in the
   report's thread; reports from the game get their own forum post "Bug report: …" with the game context. An event
   Discord or the worker refuses for good (deleted or locked thread, missing permission, report gone) is skipped
-  with a log line; a temporary failure is retried for 5 rounds, then skipped with an error line.
+  with a log line; a temporary failure is retried at every round for 6 hours from its first failure (a restart starts the 6 hours
+  again), then skipped with an error line.
 - Every message refuses to ping anyone (`allowedMentions: { parse: [] }`), and player text is shown literally.
 - If the worker is down, the player reads "Couldn't send it. Try again in a minute." and the bot keeps running.
 

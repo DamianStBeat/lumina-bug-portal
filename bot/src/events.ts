@@ -1,6 +1,7 @@
 // Follows the worker's event log and tells Discord what changed (brief rows 5 and 6). The cursor is written after
 // every handled event, so a restart never posts one twice. A transient failure stops the batch (order matters) for at
-// most MAX_ATTEMPTS ticks; a permanent one, or the last attempt, skips the event so the stream behind it moves on.
+// most RETRY_WINDOW_MS from its first failure; a permanent one, or one past that window, skips the event so the stream
+// behind it moves on.
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { DiscordAPIError } from 'discord.js';
@@ -8,7 +9,9 @@ import type { Config, Logger } from './config.ts';
 import { errorTag, type PortalApi, PortalError, type PortalEvent, type PublicStatus, toPublicStatus } from './portal.ts';
 import { type BotMessage, fixed, gameReportPost, sameBug } from './text.ts';
 
-const MAX_ATTEMPTS = 5;
+// Measured in time, not ticks (fix round 2, decision 15): a Discord or worker outage longer than a few ticks must not
+// cost a player their "Fixed" post, while an event that never succeeds must still stop blocking the stream one day.
+const RETRY_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 /** "missing" is "never polled here" and "unparsable" a damaged file: neither is a cursor of 0. */
 export type CursorState = number | 'missing' | 'unparsable';
@@ -73,6 +76,8 @@ export type EventPollerOptions = {
   config: Config;
   log: Logger;
   intervalMs?: number;
+  /** Clock for the retry window; injectable so specs can move it by hours. */
+  now?: () => number;
 };
 
 export class EventPoller {
@@ -82,11 +87,13 @@ export class EventPoller {
   private readonly config: Config;
   private readonly log: Logger;
   private readonly intervalMs: number;
+  private readonly now: () => number;
   // Forum posts made for game reports whose link to the worker failed: the retry links instead of posting again.
   // In memory only, so a restart in that window can still repeat one post.
   private readonly unlinked = new Map<string, string>();
-  // Failed attempts per seq, in memory: a restart gives an event a fresh 5, which is the safe side.
-  private readonly attempts = new Map<number, number>();
+  // Time of the first transient failure per seq, in memory: a restart gives an event a fresh window, which is the safe
+  // side (retried again, never lost).
+  private readonly firstFailure = new Map<number, number>();
   // Highest seq handled or skipped by this process. The cursor file may lag behind it (a failed write), and an
   // event at or below it is never handled twice; undefined until the first one.
   private handled: number | undefined;
@@ -101,6 +108,7 @@ export class EventPoller {
     this.config = opts.config;
     this.log = opts.log;
     this.intervalMs = opts.intervalMs ?? 20000;
+    this.now = opts.now ?? Date.now;
   }
 
   /** One pass over the new events; rejects on a transient failure, after recording every event handled before it. */
@@ -162,16 +170,18 @@ export class EventPoller {
       if (isPermanent(err)) {
         this.log.warn('event refused for good, skipped', failed);
       } else {
-        const attempts = (this.attempts.get(event.seq) ?? 0) + 1;
-        if (attempts < MAX_ATTEMPTS) {
-          this.attempts.set(event.seq, attempts);
-          this.log.warn('event not handled, retried next tick', { ...failed, attempts });
+        const now = this.now();
+        const since = this.firstFailure.get(event.seq) ?? now;
+        const failingMs = now - since;
+        if (failingMs < RETRY_WINDOW_MS) {
+          this.firstFailure.set(event.seq, since);
+          this.log.warn('event not handled, retried next tick', { ...failed, failingMs });
           throw err;
         }
-        this.log.error('event skipped after the last attempt', { ...failed, attempts });
+        this.log.error('event skipped after failing for the whole retry window', { ...failed, failingMs });
       }
     }
-    this.attempts.delete(event.seq);
+    this.firstFailure.delete(event.seq);
   }
 
   /** Polls every intervalMs; the next tick is scheduled only after the previous one ends, so two never overlap. */
