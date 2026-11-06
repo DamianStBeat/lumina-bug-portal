@@ -60,4 +60,8 @@ export const it: Strings = {
     checked: "L'abbiamo controllata. Non c'è niente da sistemare.",
   },
   loading: 'Caricamento…',
+  copy: 'Copia il codice',
+  copied: 'Copiato',
+  updated: (date: string): string => `Aggiornata il ${date}`,
+  errLoad: 'Ora non riusciamo a caricarla. Controlla il Wi-Fi, poi premi Riprova.',
 }
