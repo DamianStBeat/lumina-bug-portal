@@ -1,0 +1,17 @@
+# One round of the Lumina bug agent (see ../README.md). The timer starts it; install.sh fills WorkingDirectory.
+[Unit]
+Description=Lumina bug agent: one round (triage of new bug reports, draft fix PRs)
+
+[Service]
+Type=oneshot
+WorkingDirectory=@AGENT_DIR@
+# The user manager's PATH has neither ~/.local/bin (claude, codex) nor ~/.rokit/bin (stylua, selene).
+Environment=PATH=%h/.local/bin:%h/.rokit/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -m lumina_bug_agent --env-file %h/.config/lumina-bug-portal/agent.env run-once
+NoNewPrivileges=yes
+UMask=0077
+# A round with fixes runs claude for up to 30 min per builder and red team. Past this, systemd sends SIGTERM: the
+# agent turns it into an exception, so worktrees, branches and temp dirs are still removed.
+TimeoutStartSec=3h
+KillMode=control-group

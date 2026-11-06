@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import AGENT_VERSION, claude_cli, log, media, triage
+from . import AGENT_VERSION, claude_cli, fix, log, media, triage
 from .cache import Cache
 from .client import Client, TooLarge, WorkerError
 from .config import Config
@@ -26,14 +26,6 @@ MAX_FAILURES = 3
 PLAYER_FIELDS = ("source", "title", "what", "where_area", "device", "lang")
 STATUSES = ("received", "looking", "fixed", "duplicate", "not_bug", "closed")
 EVENT_PAGES = 10
-
-
-def run_stage_c(
-    cfg: Config, client: Client, cache: Cache, code: str, row: dict[str, Any], stage_a: dict[str, Any],
-    stage_b: dict[str, Any],
-) -> None:  # fmt: skip
-    """Seam for round 3 (fix.py): eligibility, the builder, the path guard, both red teams, the draft PR."""
-    return None
 
 
 def _terminate(signum: int, _frame: Any) -> None:
@@ -191,7 +183,8 @@ class Round:
             summary = stage_b["summary"] if stage_b else ""
             self.cache.remember(code, stage_a["what"][:300], summary, verdict, status)
         if stage_a is not None and stage_b is not None:
-            run_stage_c(cfg, self.client, self.cache, code, row, stage_a, stage_b)
+            # Eligibility, the builder, the path guard, both red teams, the draft PR; files under `tmp`.
+            fix.run(cfg, self.client, self.cache, code, row, stage_a, stage_b, tmp)
 
     def stage_b(self, code: str, row: dict[str, Any], stage_a: dict[str, Any]) -> dict[str, Any] | None:
         if not self.fetched:
