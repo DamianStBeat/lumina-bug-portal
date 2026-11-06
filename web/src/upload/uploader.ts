@@ -1,7 +1,8 @@
 import { ApiError, completeAttachment, listParts, putPart } from '../api/client'
 
 // Framework-free on purpose: one file, one attachment, everything it needs passed in.
-// Pool: 3 parts in flight per file, and useUpload sends the files one after the other, so never more than 3 at once.
+// Pool: 3 parts in flight per file, and the queue (queue.ts) sends the files one after the other, so never more than 3
+// at once.
 export const MAX_IN_FLIGHT = 3
 // One try and 5 retries: "each part retried 5 times" (brief, Uploader).
 export const MAX_ATTEMPTS = 6
@@ -95,7 +96,8 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
     let next = 0
     let failure: unknown = null
     const worker = async () => {
-      while (failure === null && next < list.length) {
+      // A stopped run sends no further part: the next one would go to an attachment the page is deleting.
+      while (failure === null && next < list.length && !run.signal.aborted) {
         const n = list[next++] as number
         const start = (n - 1) * partSize
         const blob = file.slice(start, start + expected(n))
@@ -128,9 +130,16 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
     report()
   }
 
+  // Checked right before every complete: once the caller stopped (a Remove mid-upload), no complete may follow, or the
+  // attachment being deleted could be completed first and join the report.
+  const halt = () => {
+    if (run.signal.aborted) throw run.signal.reason
+  }
+
   try {
     await readServer()
     await sendParts(unconfirmed())
+    halt()
     const first = await attempt((signal) => completeAttachment(id, token, signal))
     if (!first.missing) return
     // The server knows better than our map: forget what it says is missing, and ask it when it gave no list.
@@ -138,6 +147,7 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
     if (first.missing.length === 0) await readServer()
     else report()
     await sendParts(unconfirmed())
+    halt()
     const second = await attempt((signal) => completeAttachment(id, token, signal))
     if (second.missing) throw new ApiError(409, 'missing_parts')
   } finally {
