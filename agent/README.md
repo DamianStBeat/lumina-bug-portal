@@ -11,6 +11,11 @@ ffmpeg, ffprobe, claude, git and gh are external commands.
 Copy `agent.env.example` to `~/.config/lumina-bug-portal/agent.env` and `chmod 600` it. The process environment
 overrides the file. Missing `PORTAL_API_BASE`, `AGENT_KEY` or `LUMINA2_REPO`, or a bad number, exits 2.
 
+`FRAME_FONT` is the font file of the time stamps drawn on the video sheets (default
+`/usr/share/fonts/truetype/freefont/FreeSans.ttf`). When the file is missing the agent logs it and asks fontconfig for
+`Sans`; if ffmpeg cannot draw with either, the video is `ffmpeg_failed` (never a sheet without times). The path goes
+into an ffmpeg filter unescaped, so it must not contain `:`, `,`, `'` or `\`.
+
 ## One round
 
 ```sh

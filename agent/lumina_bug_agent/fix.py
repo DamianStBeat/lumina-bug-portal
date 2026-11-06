@@ -24,6 +24,8 @@ GH_TIMEOUT = 300
 STATUS_PAUSES = (1, 2, 0)  # seconds after each of the 3 status tries: 3 s of backoff in all (the lead's cap: 5 s)
 REDTEAM_NOT_RUN = 4  # redteam_fast.sh: no verdict (CLI, auth, network or usage limit); never a pass
 PR_URL_RX = re.compile(r"https://github\.com/.+/pull/\d+")
+PENDING_MAX_AGE = 7 * 86400  # seconds: a status still undelivered after a week is stale news, dropped (send_pending)
+STATUS_RX = re.compile(r"[a-z_]{1,20}")  # a report status as it may appear in a log line
 IDENTITY = ("DamianStBeat", "205100563+DamianStBeat@users.noreply.github.com")
 CO_AUTHOR = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 GENERATED = "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
@@ -87,20 +89,55 @@ def post_status(client: Client, cache: Cache, code: str, body: dict[str, Any]) -
 
 
 def send_pending(client: Client, cache: Cache) -> None:
-    """Once per round, before the queue: each pending status once; kept on 5xx, 408, 429 or no answer (then stop)."""
-    for code, body in cache.pending_statuses():
+    """Once per round, before the queue, oldest first: each pending status once, and only onto a report nobody wrote
+    since it was stored. Kept on 5xx, 408, 429 or no answer (then stop); dropped on another 4xx or after 7 days."""
+    now = int(time.time())
+    for code, body, at in cache.pending_statuses():
+        if now - at > PENDING_MAX_AGE:
+            log("status expired", code=code)
+            cache.drop_pending_status(code)
+            continue
+        superseded = None
         try:
-            client.post_json(f"/agent/reports/{code}/status", json.loads(body))
+            current = _current(client, code)
+            # A person on the desk (another route) or a later write moved the report after this status was stored:
+            # theirs wins, a resend would put `fixed` or `closed` back to `looking`. updated_at is ms, `at` seconds.
+            if current is not None and (current[0] != "looking" or current[1] > at * 1000):
+                superseded = current[0] if STATUS_RX.fullmatch(current[0]) else "other"
+            elif current is not None:
+                client.post_json(f"/agent/reports/{code}/status", json.loads(body))
         except WorkerError as exc:
-            if exc.status is None or exc.status >= 500 or exc.status in (408, 429):
+            if transient(exc.status):
                 log("status still pending", code=code, status=exc.status or "none")
                 if exc.status is None:  # unreachable: every other try would wait its own timeout
                     break
                 continue
             log("status dropped", code=code, status=exc.status)  # the worker refuses it: resending cannot help
         else:
-            log("status sent", code=code)
+            if current is None:  # kept: the 7 days bound a worker that keeps answering badly
+                log("status still pending", code=code, status="bad_answer")
+                continue
+            if superseded:
+                log("status superseded", code=code, current=superseded)  # the status read, never the stored body
+            else:
+                log("status sent", code=code)
         cache.drop_pending_status(code)
+
+
+def _current(client: Client, code: str) -> tuple[str, int] | None:
+    """(status, updated_at in unix ms) of the report as the worker has it now; None for an answer without them."""
+    answer = client.get_json(f"/agent/reports/{code}")
+    row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
+    status = row.get("status") if isinstance(row, dict) else None
+    updated = row.get("updated_at") if isinstance(row, dict) else None
+    if not isinstance(status, str) or isinstance(updated, bool) or not isinstance(updated, int):
+        return None
+    return status, updated
+
+
+def transient(status: int | None) -> bool:
+    """A worker failure worth trying again later: no answer, 5xx, 408 or 429. Any other 4xx is final."""
+    return status is None or status >= 500 or status in (408, 429)
 
 
 def attempt(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any], stage_b: dict[str, Any],

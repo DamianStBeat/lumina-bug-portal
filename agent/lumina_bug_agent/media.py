@@ -18,7 +18,6 @@ PER_SHEET = 12  # tile 4x3
 MAX_SHEET_BYTES = 10 * 1024 * 1024
 FORMATS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,png_pipe,jpeg_pipe,gif,webp_pipe,image2"
 IMAGE_FORMATS = {"png_pipe", "jpeg_pipe", "webp_pipe", "image2"}
-FONT = Path("/usr/share/fonts/truetype/freefont/FreeSans.ttf")
 PROBE_TIMEOUT = 60
 FRAMES_TIMEOUT = 1200
 SMALL_TIMEOUT = 120
@@ -96,10 +95,11 @@ def video_sheets(cfg: Config, src: Path, work: Path) -> tuple[int, list[Path]]:
     frames_dir = work / f"{src.stem}-frames"
     frames_dir.mkdir(mode=0o700)
     vf = r"scale=640:-2,select='gt(scene\,0.08)+isnan(prev_selected_t)+gte(t-prev_selected_t\,2)'"
-    if not FONT.is_file():
-        log("no font file for timestamps, fontconfig Sans", font=FONT)
+    has_font = cfg.frame_font.is_file()  # FRAME_FONT, FreeSans by default
+    if not has_font:
+        log("no font file for timestamps, fontconfig Sans", font=cfg.frame_font)
     # Never a sheet without times: if drawtext cannot draw with either font, ffmpeg fails and the file is ffmpeg_failed.
-    font = f"fontfile={FONT}" if FONT.is_file() else "font=Sans"
+    font = f"fontfile={cfg.frame_font}" if has_font else "font=Sans"
     vf += (
         f",drawtext={font}:text='%{{pts\\:gmtime\\:0\\:%M\\\\\\:%S}}'"
         ":x=8:y=8:fontsize=28:fontcolor=white:box=1:boxcolor=black@0.6"

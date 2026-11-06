@@ -27,6 +27,12 @@ PLAYER_FIELDS = ("source", "title", "what", "where_area", "device", "lang")
 STATUSES = ("received", "looking", "fixed", "duplicate", "not_bug", "closed")
 EVENT_PAGES = 10
 MAX_SEEDS = 50  # GET /agent/reports/{code} per round for codes the cache does not know (sync_events)
+SEED_STALL = "seed_stall"  # meta key: "<code> <rounds>", the code whose failing GET stopped the events cursor
+STALL_ROUNDS = 3  # rounds in a row a failing seed may stop the cursor before it is let go
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _terminate(signum: int, _frame: Any) -> None:
@@ -85,6 +91,7 @@ class Round:
         self.cfg, self.client, self.cache = cfg, client, cache
         self.fetched = False  # `git fetch` once per round, on the first stage B
         self.seeds = 0  # reports fetched this round to fill the duplicate list (sync_events)
+        self.stalled = False  # this round's events stopped on a seed whose GET failed (stall)
 
     def run(self) -> None:
         if not self.cfg.dry_run:
@@ -200,7 +207,9 @@ class Round:
         return triage.run(self.cfg, code, stage_a, _game_context(row), self.cache.recent(exclude=code))
 
     def sync_events(self) -> None:
-        """Statuses of remembered reports, and unknown ones (seed), from GET /agent/events; a failure is not fatal."""
+        """Statuses of remembered reports, and unknown ones (seed), from GET /agent/events; a failure is not fatal.
+        The cursor moves only past handled events: the first one not handled (its seed hit the cap or a failing GET)
+        stops the reading, and it is read again next round with everything after it."""
         cursor = self.cache.meta("events_cursor") or "0"
         try:
             for _ in range(EVENT_PAGES):
@@ -209,22 +218,32 @@ class Round:
                 last = answer.get("last") if isinstance(answer, dict) else None
                 if not isinstance(events, list) or isinstance(last, bool) or not isinstance(last, int):
                     raise ValueError("events answer")
-                for ev in events:
-                    self.apply_event(ev)
+                if not all(isinstance(ev, dict) and _is_int(ev.get("seq")) for ev in events):
+                    raise ValueError("event seq")  # the cursor can only be saved at a seq it can trust
+                handled = 0
+                while handled < len(events) and self.apply_event(events[handled]):
+                    handled += 1
+                if handled < len(events):
+                    if handled:
+                        self.cache.set_meta("events_cursor", str(events[handled - 1]["seq"]))
+                    break
                 if not events or str(last) == cursor:
                     break
                 cursor = str(last)
                 self.cache.set_meta("events_cursor", cursor)
+            if not self.stalled and self.cache.meta(SEED_STALL):
+                self.cache.set_meta(SEED_STALL, "")  # this round did not stop on a failing GET: the count restarts
         except WorkerError as exc:
             log("events failed", status=exc.status or "none")
         except ValueError:
             log("events failed", status="bad_answer")
 
-    def apply_event(self, ev: Any) -> None:
-        if not isinstance(ev, dict) or not isinstance(ev.get("code"), str):
-            return
-        if ev.get("type") in ("created", "triaged"):
-            self.seed(ev["code"])
+    def apply_event(self, ev: dict[str, Any]) -> bool:
+        """False when the event is not handled yet (its seed must be tried again next round)."""
+        if not isinstance(ev.get("code"), str):
+            return True
+        if ev.get("type") in ("created", "triaged") and not self.seed(ev["code"], refresh=ev.get("type") == "triaged"):
+            return False
         data = ev.get("data")
         if isinstance(data, str):
             try:
@@ -236,21 +255,32 @@ class Round:
             status = "duplicate"
         if status in STATUSES:
             self.cache.set_status(ev["code"], status)
+        return True
 
-    def seed(self, code: str) -> None:
-        """An unknown report joins the duplicate list: its title and the triage's summary, never the player's text."""
-        if self.seeds >= MAX_SEEDS or not CODE_RX.fullmatch(code) or self.cache.knows(code):
-            return
+    def seed(self, code: str, refresh: bool) -> bool:
+        """An unknown report joins the duplicate list: its title and the triage's summary, never the player's text.
+        `refresh` (a `triaged` event): a report cached before its triage, with no summary, is fetched again.
+        False: not handled, to be tried next round (the cap of 50 reached, or a GET that may answer later)."""
+        if not CODE_RX.fullmatch(code):
+            return True
+        known = self.cache.summary_of(code)
+        if known is not None and (known or not refresh):
+            return True
+        if self.seeds >= MAX_SEEDS:
+            return False
         self.seeds += 1
         try:
             answer = self.client.get_json(f"/agent/reports/{code}")
         except WorkerError as exc:
+            if not fix.transient(exc.status):
+                log("seed dropped", code=code, status=exc.status)  # deleted or refused: it must not hold the cursor
+                return True
             log("seed failed", code=code, status=exc.status or "none")
-            return
+            return self.stall(code)
         row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
         if not isinstance(row, dict):
             log("seed failed", code=code, status="bad_answer")
-            return
+            return self.stall(code)
         found = row.get("triage")  # a JSON string in D1, null until triaged
         if isinstance(found, str):
             try:
@@ -264,6 +294,20 @@ class Round:
                             summary[:300] if isinstance(summary, str) else "",
                             verdict if isinstance(verdict, str) else None,  # None: not triaged yet, not a verdict
                             status if status in STATUSES else None)  # fmt: skip
+        return True
+
+    def stall(self, code: str) -> bool:
+        """A seed GET failed. Not handled, unless the same code stopped the cursor the two rounds before as well: then
+        it is let go (`seed skipped`), so one report the worker cannot serve never blocks the events for good."""
+        before = (self.cache.meta(SEED_STALL) or "").split()
+        rounds = int(before[1]) + 1 if len(before) == 2 and before[0] == code and before[1].isdigit() else 1
+        if rounds >= STALL_ROUNDS:
+            log("seed skipped", code=code, rounds=rounds)
+            self.cache.set_meta(SEED_STALL, "")
+            return True
+        self.cache.set_meta(SEED_STALL, f"{code} {rounds}")
+        self.stalled = True
+        return False
 
     def stage_a_prompt(self, row: dict[str, Any]) -> str:
         data: dict[str, Any] = {k: row.get(k) for k in PLAYER_FIELDS}

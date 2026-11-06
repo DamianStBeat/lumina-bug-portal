@@ -81,8 +81,10 @@ class Cache:
         ).fetchall()
         return [dict(zip(("code", "title", "summary", "verdict", "status"), r)) for r in rows]
 
-    def knows(self, code: str) -> bool:
-        return self._db.execute("SELECT 1 FROM reports WHERE code = ?", (code,)).fetchone() is not None
+    def summary_of(self, code: str) -> str | None:
+        """None: the report is not remembered; "" : remembered without a summary (cached before its triage)."""
+        row = self._db.execute("SELECT summary FROM reports WHERE code = ?", (code,)).fetchone()
+        return None if row is None else str(row[0] or "")
 
     def set_status(self, code: str, status: str) -> None:
         # Only reports already remembered: run.py seeds unknown ones from created/triaged events first.
@@ -93,8 +95,10 @@ class Cache:
         self._db.execute("INSERT OR REPLACE INTO pending_status(code, body, at) VALUES(?, ?, ?)",
                          (code, body, int(time.time())))  # fmt: skip
 
-    def pending_statuses(self) -> list[tuple[str, str]]:
-        return [(str(c), str(b)) for c, b in self._db.execute("SELECT code, body FROM pending_status ORDER BY at")]
+    def pending_statuses(self) -> list[tuple[str, str, int]]:
+        """(code, body, at in unix seconds), oldest first."""
+        rows = self._db.execute("SELECT code, body, at FROM pending_status ORDER BY at")
+        return [(str(c), str(b), int(a)) for c, b, a in rows]
 
     def drop_pending_status(self, code: str) -> None:
         self._db.execute("DELETE FROM pending_status WHERE code = ?", (code,))

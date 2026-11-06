@@ -32,6 +32,7 @@ class Config:
     gh_bin: str
     ffmpeg_bin: str
     ffprobe_bin: str
+    frame_font: Path  # the time stamps on the video sheets; a missing file falls back to fontconfig's Sans
     agent_id: str
     lease_minutes: int
     max_reports_per_round: int
@@ -107,6 +108,7 @@ def load(env_file: str | None) -> Config:
         gh_bin=text("GH_BIN", "gh"),
         ffmpeg_bin=text("FFMPEG_BIN", "ffmpeg"),
         ffprobe_bin=text("FFPROBE_BIN", "ffprobe"),
+        frame_font=path_of("FRAME_FONT", "/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
         agent_id=text("AGENT_ID", "valor1-agent"),
         lease_minutes=number("LEASE_MINUTES", 60, low=1, high=60),
         max_reports_per_round=number("MAX_REPORTS_PER_ROUND", 5, low=1, high=50),
