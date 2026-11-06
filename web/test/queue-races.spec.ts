@@ -50,7 +50,6 @@ const line = (name: string) => loadSession()?.files.find((f) => f.name === name)
 const marked = (name: string) => (line(name) as { removing?: unknown } | undefined)?.removing
 const names = (h: Hook) => h.result.current.files.map((f) => f.name)
 const keyOf = (h: Hook, name: string) => h.result.current.files.find((f) => f.name === name)!.key
-const stateOf = (h: Hook, name: string) => h.result.current.files.find((f) => f.name === name)?.state
 const clip = () => file('clip.mp4', 4 * PART, 'video/mp4', 1000, VIDEO)
 const small = (name: string) => file(name, 2 * MiB, 'video/mp4')
 const others = () => server.attsOf(CODE).filter((a) => a.filename !== 'clip.mp4')
@@ -210,7 +209,7 @@ describe('row 1: Remove pressed on a video, then Send at once', () => {
     expect(h.result.current.phase).toBe('done')
   })
 
-  it('row 1 (b): after a reload the saved video is picked again, Removed while its hash is pending, Send; the DELETE answers 503: the video is never uploaded nor completed, keeps its place and its orange line, the others go', async () => {
+  it('row 1 (b): after a reload the saved video is picked again, Removed while its hash is pending, Send; the DELETE answers 503: the video is never uploaded nor completed, the others reach done, and its marked line has the next load send the DELETE again', async () => {
     const { token, att } = await savedHalfWay()
     server.routeFault = (m) => (m === 'DELETE' ? { status: 503 } : null)
     const h2 = mount()
@@ -243,27 +242,22 @@ describe('row 1: Remove pressed on a video, then Send at once', () => {
     expect([...att.parts.keys()]).toEqual([1])
     // Never sent as a new file either.
     expect(server.attsOf(CODE).filter((a) => a.filename === 'clip.mp4')).toEqual([att])
-    // The orange remove line, the file in its place, Remove again offered (not busy, not done).
-    expect(h2.result.current.unremoved).toBe(true)
-    expect(marked('clip.mp4')).toBe(true)
-    expect(names(h2)).toEqual(['b.mp4', 'clip.mp4'])
-    expect(stateOf(h2, 'clip.mp4')).not.toBe('done')
-    expect(h2.result.current.removing).toBe(false)
-    expect(h2.result.current.phase).not.toBe('uploading')
-    expect(h2.result.current.phase).not.toBe('done')
-    // The others went.
+    // The report went with the other files (row 1, «la segnalazione parte con gli altri file»).
     expect(others().map((a) => [a.filename, a.status])).toEqual([['b.mp4', 'complete']])
-    expect(stateOf(h2, 'b.mp4')).toBe('done')
+    expect(h2.result.current.phase).toBe('done')
+    // Its attachment still holds a place on the server, so the marked line outlives the done upload (audit-2
+    // finding 5) and the next load finishes the removal.
+    expect(marked('clip.mp4')).toBe(true)
+    h2.unmount()
 
-    // Remove again, answered 200 { ok: true }: the video goes, still never uploaded.
     server.routeFault = () => null
-    await act(async () => {
-      await drive(h2.result.current.removeFile(keyOf(h2, 'clip.mp4')))
-    })
+    const before = deletes().length
+    const h3 = mount()
     await settle()
-    expect(h2.result.current.unremoved).toBe(false)
-    expect(names(h2)).toEqual(['b.mp4'])
+    expect(deletes().slice(before).map((r) => r.path)).toEqual([expect.stringMatching(new RegExp(`/attachments/${att.id}$`))])
     expect(att.status).toBe('aborted')
+    expect(line('clip.mp4')).toBeUndefined()
+    expect(h3.result.current.resume).toBeNull()
     expect(putsAfter(mark).filter((r) => r.id === att.id)).toEqual([])
     expect(completesOf(att.id)).toEqual([])
   })
