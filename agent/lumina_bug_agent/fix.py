@@ -89,8 +89,8 @@ def post_status(client: Client, cache: Cache, code: str, body: dict[str, Any]) -
 
 
 def send_pending(client: Client, cache: Cache) -> None:
-    """Once per round, before the queue, oldest first: each pending status once, and only onto a report nobody wrote
-    since it was stored. Kept on 5xx, 408, 429 or no answer (then stop); dropped on another 4xx or after 7 days."""
+    """Once per round, before the queue, oldest first: each pending status once, and only onto a report still
+    `looking`. Kept on a transient failure (no answer: then stop); dropped on another 4xx or after 7 days."""
     now = int(time.time())
     for code, body, at in cache.pending_statuses():
         if now - at > PENDING_MAX_AGE:
@@ -100,10 +100,11 @@ def send_pending(client: Client, cache: Cache) -> None:
         superseded = None
         try:
             current = _current(client, code)
-            # A person on the desk (another route) or a later write moved the report after this status was stored:
-            # theirs wins, a resend would put `fixed` or `closed` back to `looking`. updated_at is ms, `at` seconds.
-            if current is not None and (current[0] != "looking" or current[1] > at * 1000):
-                superseded = current[0] if STATUS_RX.fullmatch(current[0]) else "other"
+            # Only the status decides: a person on the desk who moved the report off `looking` wins, a resend would put
+            # `fixed` or `closed` back. Not updated_at: a player's upload moves it with no status change (uploads.ts),
+            # and a `looking` resent onto `looking` changes no status, it only delivers the PR link or the note.
+            if current is not None and current != "looking":
+                superseded = current if STATUS_RX.fullmatch(current) else "other"
             elif current is not None:
                 client.post_json(f"/agent/reports/{code}/status", json.loads(body))
         except WorkerError as exc:
@@ -124,21 +125,18 @@ def send_pending(client: Client, cache: Cache) -> None:
         cache.drop_pending_status(code)
 
 
-def _current(client: Client, code: str) -> tuple[str, int] | None:
-    """(status, updated_at in unix ms) of the report as the worker has it now; None for an answer without them."""
+def _current(client: Client, code: str) -> str | None:
+    """The report's status as the worker has it now; None for an answer without a string status."""
     answer = client.get_json(f"/agent/reports/{code}")
     row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
     status = row.get("status") if isinstance(row, dict) else None
-    updated = row.get("updated_at") if isinstance(row, dict) else None
-    if not isinstance(status, str) or isinstance(updated, bool) or not isinstance(updated, int):
-        return None
-    return status, updated
+    return status if isinstance(status, str) else None
 
 
 def transient(status: int | None) -> bool:
-    """A worker failure worth trying again later: no answer, 5xx, 408, 429, or a 2xx/other status raised for a body
-    cut short or not JSON (client.py). Only a 4xx other than 408/429 (deleted, refused) is final."""
-    return status is None or not 400 <= status < 500 or status in (408, 429)
+    """A worker failure worth trying again later: no answer, 5xx, 401/403 (a key being rotated), 408, 429, or a 2xx/
+    other status raised for a body cut short or not JSON (client.py). Only another 4xx (deleted, gone) is final."""
+    return status is None or not 400 <= status < 500 or status in (401, 403, 408, 429)
 
 
 def attempt(cfg: Config, code: str, row: dict[str, Any], stage_a: dict[str, Any], stage_b: dict[str, Any],

@@ -91,7 +91,7 @@ class Round:
         self.cfg, self.client, self.cache = cfg, client, cache
         self.fetched = False  # `git fetch` once per round, on the first stage B
         self.seeds = 0  # reports fetched this round to fill the duplicate list (sync_events)
-        self.stalled = False  # this round's events stopped on a seed whose GET failed (stall)
+        self.stall_before = ""  # the previous sync's stall record, read and cleared as this sync starts (stall)
 
     def run(self) -> None:
         if not self.cfg.dry_run:
@@ -211,6 +211,11 @@ class Round:
         The cursor moves only past handled events: the first one not handled (its seed hit the cap or a failing GET)
         stops the reading, and it is read again next round with everything after it."""
         cursor = self.cache.meta("events_cursor") or "0"
+        # Consecutive syncs only: the record comes back only if this sync stops on a failing seed (stall), so a sync
+        # that fails on the events endpoint or stops on another code restarts the count.
+        self.stall_before = self.cache.meta(SEED_STALL) or ""
+        if self.stall_before:
+            self.cache.set_meta(SEED_STALL, "")
         try:
             for _ in range(EVENT_PAGES):
                 answer = self.client.get_json(f"/agent/events?after={cursor}&limit=200")
@@ -231,8 +236,6 @@ class Round:
                     break
                 cursor = str(last)
                 self.cache.set_meta("events_cursor", cursor)
-            if not self.stalled and self.cache.meta(SEED_STALL):
-                self.cache.set_meta(SEED_STALL, "")  # this round did not stop on a failing GET: the count restarts
         except WorkerError as exc:
             log("events failed", status=exc.status or "none")
         except ValueError:
@@ -298,16 +301,14 @@ class Round:
         return True
 
     def stall(self, code: str) -> bool:
-        """A seed GET failed. Not handled, unless the same code stopped the cursor the two rounds before as well: then
-        it is let go (`seed skipped`), so one report the worker cannot serve never blocks the events for good."""
-        before = (self.cache.meta(SEED_STALL) or "").split()
+        """A seed GET failed. Not handled, unless the same code stopped the two syncs before in a row as well: then it
+        is let go (`seed skipped`, no record), so a report the worker cannot serve never blocks the events for good."""
+        before = self.stall_before.split()
         rounds = int(before[1]) + 1 if len(before) == 2 and before[0] == code and before[1].isdigit() else 1
         if rounds >= STALL_ROUNDS:
             log("seed skipped", code=code, rounds=rounds)
-            self.cache.set_meta(SEED_STALL, "")
             return True
         self.cache.set_meta(SEED_STALL, f"{code} {rounds}")
-        self.stalled = True
         return False
 
     def stage_a_prompt(self, row: dict[str, Any]) -> str:
