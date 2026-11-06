@@ -34,13 +34,6 @@ const STATUS: Record<ReportStatus, string> = {
   closed: 'Closed',
 }
 
-// Sizes are SI, as the uploader and the mock count them ("312 MB" = 312 000 000 bytes).
-export function size(bytes: number): string {
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`
-  if (bytes >= 1e6) return `${Math.round(bytes / 1e6)} MB`
-  return `${Math.max(1, Math.round(bytes / 1e3))} KB`
-}
-
 export function ago(ms: number, now: number): string {
   const min = Math.floor((now - ms) / 60_000)
   if (min < 1) return 'just now'
@@ -61,10 +54,10 @@ export function githubPr(url: string | undefined): { href: string; n?: string } 
   }
 }
 
-function media(a: DeskReportRow['attachments'], device?: string): string {
+// The list answer counts the player's files without their kind or size; the detail shows which file it is.
+function media(files: number, device?: string): string {
   const where = device && DEVICE[device] ? ` · ${DEVICE[device]}` : ''
-  if (a.videos > 0) return `${a.videos > 1 ? `${a.videos} videos` : 'Video'} ${size(a.totalBytes)}${where}`
-  if (a.images > 0) return `${a.images > 1 ? `${a.images} pictures` : 'Picture'} ${size(a.totalBytes)}${where}`
+  if (files > 0) return `${files > 1 ? `${files} files` : '1 file'}${where}`
   return 'No video'
 }
 
@@ -83,7 +76,7 @@ function Row({ r, now, sel, onSelect }: { r: DeskReportRow; now: number; sel: bo
         </span>
         <span className="c-what">
           {r.title || r.what}
-          <span className="sub">{media(r.attachments, r.device)}</span>
+          <span className="sub">{media(r.fileCount, r.device)}</span>
         </span>
         <span className="c-where">{(r.whereArea && WHERE[r.whereArea]) || '—'}</span>
         <span className="c-ai">

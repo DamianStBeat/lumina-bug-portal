@@ -1,6 +1,6 @@
 // Request and response shapes of CONTRACT.md "HTTP API (worker)". Public shapes follow the contract's tables.
-// Desk shapes are not detailed in the contract: they are the web slice's reading of the D1 schema (camelCase, as
-// the rest of the API), to be aligned with the worker.
+// Desk shapes are not detailed in the contract: the `*Wire` types are what worker/src/routes/desk.ts answers (D1
+// columns, snake_case, null when empty); the client turns them into the camelCase shapes the pages read.
 
 export type WhereArea = 'match' | 'lobby' | 'shop' | 'crates' | 'clan' | 'other'
 export type Device = 'phone' | 'tablet' | 'computer' | 'console'
@@ -51,9 +51,6 @@ export type DeskAttachment = {
   status: AttachmentStatus
 }
 
-// What the list needs to say "Video 312 MB · Phone" or "No video" without loading every attachment.
-export type DeskAttachmentSummary = { videos: number; images: number; totalBytes: number }
-
 export type DeskReportRow = {
   code: string
   createdAt: number
@@ -61,19 +58,78 @@ export type DeskReportRow = {
   source: ReportSource
   status: ReportStatus
   title?: string
+  // The list sends the first 200 characters only; the detail sends all of it.
   what: string
   whereArea?: WhereArea
   device?: Device
   verdict?: Verdict
+  // Not in the list answer: a row gets them from its detail answer (Desk patchRow).
   prUrl?: string
   duplicateOf?: string
-  attachments: DeskAttachmentSummary
+  // The player's files (video or picture) that did not end as an aborted upload; their kind and size are not sent.
+  fileCount: number
 }
 
 export type DeskListRes = {
   reports: DeskReportRow[]
   cursor?: string
+  // The worker on main sends no counts: the filter pills then show no number.
   counts?: Partial<Record<DeskFilter, number>>
+}
+
+// GET /desk/reports: one row per report, newest first, 50 a page.
+export type DeskListRowWire = {
+  code: string
+  created_at: number
+  updated_at: number
+  source: ReportSource
+  status: ReportStatus
+  verdict: Verdict | null
+  title: string | null
+  what: string
+  where_area: WhereArea | null
+  device: Device | null
+  attachment_count: number
+}
+export type DeskListWire = { reports: DeskListRowWire[]; nextCursor: string | null }
+
+// Every attachment of the report, frames included, in creation order. R2 keys and upload ids stay in the worker.
+export type DeskAttachmentWire = {
+  id: string
+  kind: AttachmentKind
+  filename: string
+  mime: string
+  size_bytes: number
+  status: AttachmentStatus
+  created_at: number
+  completed_at: number | null
+}
+
+// GET /desk/reports/{code}: the report row minus its token and ip hashes, triage and game_context parsed (a stored
+// text that is not JSON comes back as that text).
+export type DeskReportWire = {
+  report: {
+    code: string
+    created_at: number
+    updated_at: number
+    source: ReportSource
+    status: ReportStatus
+    title: string | null
+    what: string
+    where_area: WhereArea | null
+    device: Device | null
+    lang: string | null
+    roblox_name: string | null
+    roblox_user_id: number | null
+    discord_name: string | null
+    game_context: unknown
+    verdict: Verdict | null
+    triage: unknown
+    duplicate_of: string | null
+    pr_url: string | null
+  }
+  attachments: DeskAttachmentWire[]
+  duplicates: string[]
 }
 
 // The agent's triage JSON (<= 32 KB) is free-form: the known fields are typed, anything else is kept as data.
@@ -87,7 +143,7 @@ export type DeskTriage = {
   frameHits?: number[]
 } & Record<string, unknown>
 
-export type DeskReport = Omit<DeskReportRow, 'attachments'> & {
+export type DeskReport = Omit<DeskReportRow, 'fileCount'> & {
   lang?: string
   robloxName?: string
   robloxUserId?: number
@@ -100,4 +156,5 @@ export type DeskReport = Omit<DeskReportRow, 'attachments'> & {
   duplicates: string[]
 }
 
-export type DeskStatusBody = { status: ReportStatus; prUrl?: string; note?: string }
+// `duplicate` needs `duplicateOf`; any other status clears the link (the desk only sends `fixed` today).
+export type DeskStatusBody = { status: ReportStatus; prUrl?: string; note?: string; duplicateOf?: string }

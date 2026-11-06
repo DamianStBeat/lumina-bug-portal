@@ -1,10 +1,11 @@
 // Decided behaviour B3 (lead, final critical round) on the desk detail (jsdom): a video or picture still `uploading`
 // shows "Still uploading.", never "No video or picture."; "not yet" (still arriving, still loading) is not "none".
-// The desk reads GET /api/v1/desk/reports/{code}; here fetch answers it with the report of each case.
+// The desk reads GET /api/v1/desk/reports/{code}; here fetch answers it, in the worker's shape on main
+// (worker/src/routes/desk.ts getReport), with the report of each case.
 import { cleanup, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import type { AttachmentKind, AttachmentStatus, DeskAttachment, DeskReport } from '../src/api/types'
+import type { AttachmentKind, AttachmentStatus, DeskAttachmentWire, DeskReportWire } from '../src/api/types'
 import { ReportDetail } from '../src/pages/desk/ReportDetail'
 
 const CODE = 'LUM-482193'
@@ -14,27 +15,44 @@ const NONE = 'No video or picture.'
 
 afterEach(() => cleanup())
 
-function att(kind: AttachmentKind, status: AttachmentStatus, id = 'att-1'): DeskAttachment {
+const AT = 1_762_400_000_000
+
+function att(kind: AttachmentKind, status: AttachmentStatus, id = 'att-1'): DeskAttachmentWire {
   const mime = kind === 'image' ? 'image/png' : 'video/mp4'
-  return { id, kind, filename: kind === 'image' ? 'shot.png' : 'clip.mp4', mime, sizeBytes: 300_000_000, status }
+  const filename = kind === 'image' ? 'shot.png' : 'clip.mp4'
+  const completed_at = status === 'complete' ? AT : null
+  return { id, kind, filename, mime, size_bytes: 300_000_000, status, created_at: AT, completed_at }
 }
 
-function report(attachments: DeskAttachment[]): DeskReport {
+function report(attachments: DeskAttachmentWire[]): DeskReportWire {
   return {
-    code: CODE,
-    createdAt: 1_762_400_000_000,
-    updatedAt: 1_762_400_000_000,
-    source: 'web',
-    status: 'received',
-    what: 'The boss stopped on the bridge.',
+    report: {
+      code: CODE,
+      created_at: AT,
+      updated_at: AT,
+      source: 'web',
+      status: 'received',
+      title: null,
+      what: 'The boss stopped on the bridge.',
+      where_area: null,
+      device: null,
+      lang: null,
+      roblox_name: null,
+      roblox_user_id: null,
+      discord_name: null,
+      game_context: null,
+      verdict: null,
+      triage: null,
+      duplicate_of: null,
+      pr_url: null,
+    },
     attachments,
-    frames: [],
     duplicates: [],
   }
 }
 
 // Answers the desk detail of CODE with `r`, or never answers when `r` is null.
-function serve(r: DeskReport | null) {
+function serve(r: DeskReportWire | null) {
   const fetch = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input instanceof Request ? input.url : input)
     if (r === null) return new Promise<Response>(() => {})
