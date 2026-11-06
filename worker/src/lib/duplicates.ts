@@ -44,7 +44,8 @@ export type LinkWrites = {
 /**
  * Links report `code` to the root original of `target`, with the caller's own columns and events, all in one
  * transaction. 404 `not_found` when the report is gone, 400 `invalid_duplicate_of` when the target is, 409
- * `duplicate_cycle` when the link would close a loop, 409 `duplicate_busy` when the chain moved under both attempts.
+ * `duplicate_cycle` when the link would close a loop, 409 `duplicate_busy` when the chain moved under both attempts
+ * and a third read still finds it valid.
  */
 export async function linkDuplicate(env: Env, code: string, target: string, own: LinkWrites): Promise<void> {
   // The chain is read first (rootOriginal), then written; another link may land in between (B -> A landing while
@@ -83,18 +84,21 @@ export async function linkDuplicate(env: Env, code: string, target: string, own:
       // Reports already linked to this one were linked while it was an original; now that it points at a root, they
       // point there too. Storing the root covers links made later, this covers the ones made earlier, so every chain
       // stays one hop whatever order the links are made in, and the read guard's depth limit is never reached.
-      // Only rows still in `duplicate` move: a report a person un-duplicated keeps its stored duplicate_of, untouched.
-      // The root itself is never one of them: it may still point here from before a person un-duplicated it, and
-      // moving it would link it to itself.
+      // Only rows still in `duplicate` move. Every write that leaves `duplicate` now clears duplicate_of, so only a
+      // row stored before that rule (out of `duplicate`, still pointing here) needs this condition: it stays untouched.
+      // The root is never moved (code <> ?): a root in `duplicate` pointing here fails the guard already, so this is a
+      // second fence against linking it to itself.
       env.DB.prepare(
         `UPDATE reports SET duplicate_of = ? WHERE status = 'duplicate' AND duplicate_of = ? AND code <> ? AND ${guard.sql}`,
       ).bind(duplicateOf, code, duplicateOf, ...guard.binds),
     ]);
     if (updated!.meta.changes === 1) return;
     if (attempt === 2) {
-      // A report retention removed meanwhile is 404, as on the first lookup. Anything else is a chain that moved under
-      // both attempts: "not yet", not "no", so the caller is told to retry rather than that the link is a loop.
+      // The chain is read once more, so a definite "no" is never answered as "not yet": a report retention removed
+      // meanwhile is 404, a target removed is 400, a loop closed meanwhile is 409 duplicate_cycle. Only a chain still
+      // valid but moved under both attempts is busy: "not yet", so the caller is told to retry.
       await reportOf(env, code);
+      await rootOriginal(env, target, code);
       throw new HttpError(409, "duplicate_busy", { body: { retryAfter: BUSY_RETRY_SECONDS }, headers: { "Retry-After": String(BUSY_RETRY_SECONDS) } });
     }
   }
