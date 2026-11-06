@@ -6,6 +6,8 @@ import re
 import unicodedata
 from typing import Any
 
+from .guard import is_risky
+
 MAX_STR = 2000
 MAX_LIST = 20
 
@@ -74,3 +76,79 @@ def looks_like_injection(*texts: Any) -> bool:
             if _INJECTION_RX.search(norm):
                 return True
     return False
+
+
+VERDICTS = ("simple_fix", "needs_person", "duplicate", "not_bug", "unclear")
+FIX_SIZES = ("small", "medium", "large", "unknown")
+CODE_RX = re.compile(r"LUM-\d{6}")
+MAX_SUMMARY = 300
+MAX_FILES = 10
+MAX_PATH = 300
+_PATH = {"type": "string", "maxLength": MAX_PATH}
+STAGE_B_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdict", "confidence", "summary", "likely_files", "risk_paths", "duplicate_of", "fix_size"],
+    "properties": {
+        "verdict": {"type": "string", "enum": list(VERDICTS)},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "summary": {"type": "string", "maxLength": MAX_SUMMARY},
+        "likely_files": {"type": "array", "maxItems": MAX_FILES, "items": {
+            "type": "object", "additionalProperties": False, "required": ["path", "line", "why"],
+            "properties": {"path": _PATH, "line": {"type": ["integer", "null"], "minimum": 0}, "why": _STR},
+        }},
+        "risk_paths": {"type": "array", "maxItems": MAX_LIST, "items": _PATH},
+        "duplicate_of": {"type": ["string", "null"]},
+        "fix_size": {"type": "string", "enum": list(FIX_SIZES)},
+    },
+}  # fmt: skip
+
+
+def _ok_path(value: Any) -> bool:
+    # Relative to the checkout and never climbing out of it: stage C and a person both open these paths.
+    if not isinstance(value, str) or not value or len(value) > MAX_PATH or "\\" in value or "\x00" in value:
+        return False
+    parts = value.split("/")
+    return not value.startswith(("/", "~")) and ".." not in parts
+
+
+def _ok_number(value: Any, low: float, high: float | None) -> bool:
+    # bool is an int in Python: `true` is not a confidence nor a line number.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value >= low and (high is None or value <= high)
+
+
+def validate_stage_b(obj: Any, codes: set[str]) -> dict[str, Any] | None:
+    """The answer when it matches STAGE_B_SCHEMA, normalised; else None (the caller posts `unclear`).
+    `codes` are the reports offered as possible duplicates: `duplicate_of` may only name one of them."""
+    props = STAGE_B_SCHEMA["properties"]
+    if not isinstance(obj, dict) or set(obj) != set(props):
+        return None
+    files, risks = obj["likely_files"], obj["risk_paths"]
+    if (
+        obj["verdict"] not in VERDICTS
+        or obj["fix_size"] not in FIX_SIZES
+        or not _ok_number(obj["confidence"], 0, 1)
+        or not (isinstance(obj["summary"], str) and len(obj["summary"]) <= MAX_SUMMARY)
+        or not (isinstance(files, list) and len(files) <= MAX_FILES)
+        or not (isinstance(risks, list) and len(risks) <= MAX_LIST and all(_ok_path(p) for p in risks))
+        or not (obj["duplicate_of"] is None or isinstance(obj["duplicate_of"], str))
+    ):
+        return None
+    for f in files:
+        if not (isinstance(f, dict) and set(f) == {"path", "line", "why"} and _ok_path(f["path"])
+                and (f["line"] is None or (isinstance(f["line"], int) and _ok_number(f["line"], 0, None)))
+                and _ok_str(f["why"], False)):  # fmt: skip
+            return None
+    out = dict(obj, likely_files=[dict(f) for f in files], risk_paths=list(risks))
+    # A likely file on the risk list is a risk path even when the model did not say so: stage C reads risk_paths.
+    for f in files:
+        if is_risky(f["path"]) and f["path"] not in out["risk_paths"]:
+            out["risk_paths"].append(f["path"])
+    dup = out["duplicate_of"]
+    if not (isinstance(dup, str) and CODE_RX.fullmatch(dup) and dup in codes):
+        out["duplicate_of"] = None
+        if out["verdict"] == "duplicate":
+            out["verdict"] = "needs_person"  # "a duplicate of something unnamed" is a question for a person
+    return out

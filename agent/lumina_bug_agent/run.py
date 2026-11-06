@@ -6,11 +6,12 @@ import json
 import os
 import re
 import shutil
+import signal
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from . import AGENT_VERSION, claude_cli, log, media
+from . import AGENT_VERSION, claude_cli, log, media, triage
 from .cache import Cache
 from .client import Client, TooLarge, WorkerError
 from .config import Config
@@ -23,11 +24,8 @@ ATTACHMENT_ID_RX = re.compile(r"[A-Za-z0-9_-]{1,64}")
 MAX_TRIAGE_BYTES = 32 * 1024
 MAX_FAILURES = 3
 PLAYER_FIELDS = ("source", "title", "what", "where_area", "device", "lang")
-
-
-def run_stage_b(cfg: Config, cache: Cache, code: str, row: dict[str, Any], stage_a: dict[str, Any]) -> dict[str, Any] | None:
-    """Seam for round 2 (triage.py): the validated stage B answer, or None while stage B does not exist yet."""
-    return None
+STATUSES = ("received", "looking", "fixed", "duplicate", "not_bug", "closed")
+EVENT_PAGES = 10
 
 
 def run_stage_c(
@@ -38,7 +36,14 @@ def run_stage_c(
     return None
 
 
+def _terminate(signum: int, _frame: Any) -> None:
+    # systemd stops a unit with SIGTERM: as an exception every `finally` runs (worktrees, temp dirs, children).
+    log("terminated", signal=signum)
+    raise SystemExit(128 + signum)
+
+
 def run_round(cfg: Config) -> int:
+    signal.signal(signal.SIGTERM, _terminate)
     with round_lock(cfg.state_dir) as held:
         if not held:
             log("another round is running")
@@ -72,9 +77,20 @@ def fit_triage(triage: dict[str, Any]) -> dict[str, Any]:
     return dict(clipped, stage_a=None, stage_b=None, files=triage["files"][:3], notes=["triage_too_large"])
 
 
+def _game_context(row: dict[str, Any]) -> Any:
+    context = row.get("game_context")  # a JSON string in D1; kept as text when it does not parse
+    if isinstance(context, str):
+        try:
+            return json.loads(context)
+        except ValueError:
+            pass
+    return context
+
+
 class Round:
     def __init__(self, cfg: Config, client: Client, cache: Cache) -> None:
         self.cfg, self.client, self.cache = cfg, client, cache
+        self.fetched = False  # `git fetch` once per round, on the first stage B
 
     def run(self) -> None:
         try:
@@ -88,6 +104,8 @@ class Round:
             log("queue refused", status="bad_answer")
             return
         self.cfg.tmp_root.mkdir(parents=True, exist_ok=True)
+        if items and not self.cfg.dry_run:
+            self.sync_events()
         for item in items:
             code = item.get("code") if isinstance(item, dict) else None
             if not isinstance(code, str) or not CODE_RX.fullmatch(code):
@@ -164,23 +182,63 @@ class Round:
         else:
             if looks_like_injection(row.get("what"), row.get("title")):
                 stage_a["injection_suspected"] = True
-            stage_b = run_stage_b(cfg, self.cache, code, row, stage_a)
-            # Until round 2 lands stage B, a person looks at every report that stage A could read.
-            verdict, notes = (stage_b["verdict"], []) if stage_b else ("needs_person", ["stage_b_not_run"])
+            stage_b = self.stage_b(code, row, stage_a)
+            verdict, notes = (stage_b["verdict"], []) if stage_b else ("unclear", ["stage_b_invalid"])
         self.post_triage(code, verdict, stage_a, stage_b, files, notes)
         self.cache.clear_failures(code)
+        if stage_a is not None:
+            status = {"duplicate": "duplicate", "not_bug": "not_bug"}.get(verdict, "looking")  # as the worker sets it
+            summary = stage_b["summary"] if stage_b else ""
+            self.cache.remember(code, stage_a["what"][:300], summary, verdict, status)
         if stage_a is not None and stage_b is not None:
             run_stage_c(cfg, self.client, self.cache, code, row, stage_a, stage_b)
 
+    def stage_b(self, code: str, row: dict[str, Any], stage_a: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.fetched:
+            triage.fetch(self.cfg)  # GitError: no verdict on stale or missing code, the report is retried
+            self.fetched = True
+        # The duplicate list carries stage A's summaries, never another report's raw text (see remember above).
+        return triage.run(self.cfg, code, stage_a, _game_context(row), self.cache.recent(exclude=code))
+
+    def sync_events(self) -> None:
+        """Statuses of remembered reports from GET /agent/events; a failure only leaves them a little stale."""
+        cursor = self.cache.meta("events_cursor") or "0"
+        try:
+            for _ in range(EVENT_PAGES):
+                answer = self.client.get_json(f"/agent/events?after={cursor}&limit=200")
+                events = answer.get("events") if isinstance(answer, dict) else None
+                last = answer.get("last") if isinstance(answer, dict) else None
+                if not isinstance(events, list) or isinstance(last, bool) or not isinstance(last, int):
+                    raise ValueError("events answer")
+                for ev in events:
+                    self.apply_event(ev)
+                if not events or str(last) == cursor:
+                    break
+                cursor = str(last)
+                self.cache.set_meta("events_cursor", cursor)
+        except WorkerError as exc:
+            log("events failed", status=exc.status or "none")
+        except ValueError:
+            log("events failed", status="bad_answer")
+
+    def apply_event(self, ev: Any) -> None:
+        if not isinstance(ev, dict) or not isinstance(ev.get("code"), str):
+            return
+        data = ev.get("data")
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except ValueError:
+                data = None
+        status = (data.get("status") or data.get("to")) if isinstance(data, dict) else None
+        if ev.get("type") == "duplicate_linked" and status is None:
+            status = "duplicate"
+        if status in STATUSES:
+            self.cache.set_status(ev["code"], status)
+
     def stage_a_prompt(self, row: dict[str, Any]) -> str:
         data: dict[str, Any] = {k: row.get(k) for k in PLAYER_FIELDS}
-        context = row.get("game_context")
-        if isinstance(context, str):
-            try:
-                context = json.loads(context)
-            except ValueError:
-                pass
-        data["game_context"] = context
+        data["game_context"] = _game_context(row)
         nonce, block = claude_cli.data_block(data)
         # NONCE first: the player data is inserted last, so text in it is never treated as a placeholder.
         return claude_cli.render("stage_a.md", {"NONCE": nonce, "PLAYER_DATA": block})

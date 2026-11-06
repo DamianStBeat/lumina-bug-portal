@@ -13,11 +13,12 @@ from typing import Any
 
 from . import log
 from .config import Config
-from .schemas import STAGE_A_SCHEMA
+from .schemas import STAGE_A_SCHEMA, STAGE_B_SCHEMA
 
 CHILD_ENV_KEYS = ("HOME", "PATH", "USER", "LANG", "TERM")
 MODEL = "claude-opus-5-5"
 STAGE_A_TIMEOUT = 600
+STAGE_B_TIMEOUT = 1200
 PROMPTS = Path(__file__).resolve().parent.parent / "prompts"
 
 
@@ -74,7 +75,8 @@ def data_block(data: Any) -> tuple[str, str]:
 def parse_result(stdout: bytes) -> Any:
     """The answer object of `claude -p` (json or stream-json), or None when there is no usable result."""
     result = None
-    for line in stdout.decode("utf-8", "replace").splitlines():
+    text = stdout.decode("utf-8", "replace")
+    for line in [*text.splitlines(), text]:  # stream-json lines, or `--output-format json`'s one object
         try:
             msg = json.loads(line)
         except ValueError:
@@ -112,5 +114,27 @@ def stage_a(cfg: Config, prompt: str, images: list[Path], cwd: Path) -> Any:
         return None
     if code != 0:
         log("stage A failed", exit=code)
+        return None
+    return parse_result(out)
+
+
+def stage_b(cfg: Config, prompt: str, cwd: Path) -> Any:
+    """Read-only triage inside the stage B worktree; the answer object, or None (timeout, failure, no result)."""
+    tools = "Read,Grep,Glob"
+    argv = [
+        cfg.claude_bin, "-p", "--model", MODEL, "--restricted", "--tools", tools, "--allowedTools", tools,
+        "--permission-mode", "dontAsk", "--output-format", "json", "--no-session-persistence", "--strict-mcp-config",
+        "--json-schema", json.dumps(STAGE_B_SCHEMA),
+    ]  # fmt: skip
+    try:
+        code, out, _ = run_child(argv, STAGE_B_TIMEOUT, cwd=cwd, stdin=prompt.encode("utf-8"))
+    except subprocess.TimeoutExpired:
+        log("stage B timed out")
+        return None
+    except OSError:
+        log("stage B could not start")
+        return None
+    if code != 0:
+        log("stage B failed", exit=code)
         return None
     return parse_result(out)
