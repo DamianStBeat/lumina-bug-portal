@@ -1,0 +1,13 @@
+/* Tokens copied from guardiansoflumina/src/index.css ("Lumina Cosmic palette") */
+:root{
+  --midnight:#061327; --midnight-2:#08162f; --midnight-3:#030812;
+  --deep-navy:#0B1F43; --electric:#38B6FF; --glow-blue:#8EDCFF;
+  --gold:#D79A2B; --warm-gold:#F2C46D; --gold-deep:#9B6418;
+  --soft-white:#F4F7FB; --slate:#A8B3C7;
+  --setback:#FF9F43; /* pleasant orange for errors (four-audiences rule: never heavy red) */
+  --ok:#4FD1A5;
+  --radius:20px; --radius-button:16px;
+  /* Self-hosted through @fontsource (imported in main.tsx): no request leaves for a font CDN. */
+  --font-heading:Cinzel,Inter,serif;
+  --font-body:Inter,-apple-system,sans-serif;
+}
