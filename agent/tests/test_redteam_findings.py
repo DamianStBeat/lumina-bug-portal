@@ -8,7 +8,7 @@
    the duplicate list; at most 50 such GETs a round; a failed GET is not fatal; the player's `what` never enters the
    cache and the title is kept to 200 characters.
 4. No contact sheet without time stamps: when drawtext fails, the file is `ffmpeg_failed`. The missing-font fallback
-   (`font=Sans`) runs only on a machine without FreeSans.ttf: the path is hard-coded and this machine cannot hide it.
+   (`font=Sans`) is specified in test_followup_findings.py (`FRAME_FONT` points at a missing file), on every host.
 5. A GIT_WORKSPACE that created `bugfix/<code-lower>` and then failed leaves no local branch and no worktree.
 
 Every spec runs the real agent (helpers.Harness); expected values come from the worker's records, the fakes' records,
@@ -37,12 +37,9 @@ agent/lumina_bug_agent/fix.py|branch -D in finally also when the worktree creati
 
 from __future__ import annotations
 
-import http.server
 import json
-import os
 import re
 import unittest
-import urllib.parse
 from typing import Any
 
 from helpers import (
@@ -52,15 +49,13 @@ from helpers import (
     REAL_FFMPEG,
     STAGE_B_SIMPLE_FIX,
     VALID_STAGE_A,
-    FakeWorker,
+    EventsWorker,
     Harness,
     _write_exec,
     file_entry,
     mp4_attachment,
     stage_a_payload,
 )
-
-FREESANS = "/usr/share/fonts/truetype/freefont/FreeSans.ttf"
 
 
 def _since(h: Harness, start: int) -> list[dict[str, Any]]:
@@ -266,33 +261,6 @@ class Finding2StatusPostFails(unittest.TestCase):
 # --------------------------------------------------------------------------------------------------------------
 
 
-class EventsWorker(FakeWorker):
-    """The shared fake worker plus an events log (CONTRACT.md `GET /agent/events`) and per-code report GET failures."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.events: list[dict[str, Any]] = []
-        self.report_fails: set[str] = set()
-
-    def add_event(self, code: str, type_: str, data: dict[str, Any] | None = None) -> None:
-        self.events.append({"seq": len(self.events) + 1, "code": code, "at": 1_762_400_500_000 + len(self.events),
-                            "type": type_, "data": data or {}})
-
-    def _send(self, h: http.server.BaseHTTPRequestHandler, status: int, payload: Any, ctype: str = "application/json") -> None:
-        parsed = urllib.parse.urlsplit(h.path)
-        if h.command == "GET" and status == 200:
-            if parsed.path == "/api/v1/agent/events":
-                q = dict(urllib.parse.parse_qsl(parsed.query))
-                after = int(q.get("after") or 0)
-                limit = min(int(q.get("limit") or 100), 500)
-                page = [e for e in self.events if e["seq"] > after][:limit]
-                payload = {"events": page, "last": page[-1]["seq"] if page else after}
-            m = re.match(r"^/api/v1/agent/reports/([^/]+)$", parsed.path)
-            if m and m.group(1) in self.report_fails:
-                return super()._send(h, 500, {"error": "internal"})
-        return super()._send(h, status, payload, ctype)
-
-
 OLD_WHAT = "Old report player text zq7 the crate opens twice when I tap fast"
 OLD_SUMMARY = "Crate open handler runs twice on double tap"
 # 200 characters, then a marker the next column of a SQLite record will not start with.
@@ -430,20 +398,6 @@ class Finding4TimestampsOnEverySheet(unittest.TestCase):
         calls = h.claude_calls("stage_a")
         self.assertEqual(len(calls), 1, "the report goes on with its text")
         self.assertEqual(stage_a_payload(calls[0])[1], [], "stage A gets no sheet without time stamps")
-        h.assert_nothing_left()
-
-    @unittest.skipIf(os.path.exists(FREESANS), f"{FREESANS} exists here and cannot be hidden from the agent: the path "
-                     "is hard-coded in media.py and unprivileged mount namespaces are off on this machine "
-                     "(kernel.apparmor_restrict_unprivileged_userns = 1); runs on a machine without the font")
-    def test_finding4_missing_font_file_falls_back_to_fontconfig_sans(self) -> None:
-        h = Harness(self)
-        h.worker.add_report(self.CODE, attachments=[mp4_attachment("att-sans")])
-        h.assert_round_ok(h.run())
-        draws = [c for c in h.media_calls("ffmpeg") if any("drawtext" in a for a in c["argv"])]
-        self.assertTrue(draws, "the time stamps are still drawn without the font file")
-        self.assertTrue(all(re.search(r"font='?Sans", " ".join(c["argv"])) for c in draws),
-                        "drawtext uses fontconfig `font=Sans`")
-        self.assertTrue(h.worker.calls("frames", self.CODE), "the stamped sheets are uploaded")
         h.assert_nothing_left()
 
 

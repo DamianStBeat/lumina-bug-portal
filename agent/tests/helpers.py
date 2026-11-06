@@ -266,6 +266,21 @@ class FakeWorker:
                     if c in self.reports:
                         self.reports[c]["lease_until"] = 0
 
+    def person_sets_status(self, code: str, status: str) -> None:
+        """A person changes the report's status outside the agent's routes (the desk's `POST /desk/reports/{code}/status`):
+        the row gets the status and `updated_at` moves to now, in unix ms, as the real worker does. Not an agent request,
+        so it is not recorded in `requests`."""
+        with self._lock:
+            self.reports[code]["status"] = status
+        self._touch(code)
+
+    def _touch(self, code: str) -> None:
+        # Every write to a report row moves its `updated_at` (unix ms), the agent's own triage and status included, so a
+        # spec can tell a person's later change from the agent's earlier one only by the time, as on the real worker.
+        with self._lock:
+            row = self.reports[code]
+            row["updated_at"] = max(int(time.time() * 1000), int(row.get("updated_at") or 0) + 1)
+
     def _live_lease(self, code: str) -> bool:
         return self.leases.get(code, 0) > int(time.time() * 1000)
 
@@ -383,6 +398,7 @@ class FakeWorker:
             except (ValueError, AttributeError):
                 return self._send(h, 400, {"error": "bad_json"})
             self.reports[code]["status"] = {"duplicate": "duplicate", "not_bug": "not_bug"}.get(verdict, "looking")
+            self._touch(code)
             return self._send(h, 200, {"ok": True})
         if route == "status":
             try:
@@ -390,10 +406,38 @@ class FakeWorker:
             except (ValueError, AttributeError):
                 return self._send(h, 400, {"error": "bad_json"})
             self.reports[code]["status"] = status or self.reports[code]["status"]
+            self._touch(code)
             return self._send(h, 200, {"ok": True})
         if route == "events":
             return self._send(h, 200, {"events": [], "last": int(record["query"].get("after", "0") or 0)})
         return self._send(h, 404, {"error": "not_found"})
+
+
+class EventsWorker(FakeWorker):
+    """The shared fake worker plus an events log (CONTRACT.md `GET /agent/events`) and per-code report GET failures."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list[dict[str, Any]] = []
+        self.report_fails: set[str] = set()
+
+    def add_event(self, code: str, type_: str, data: dict[str, Any] | None = None) -> None:
+        self.events.append({"seq": len(self.events) + 1, "code": code, "at": 1_762_400_500_000 + len(self.events),
+                            "type": type_, "data": data or {}})
+
+    def _send(self, h: http.server.BaseHTTPRequestHandler, status: int, payload: Any, ctype: str = "application/json") -> None:
+        parsed = urllib.parse.urlsplit(h.path)
+        if h.command == "GET" and status == 200:
+            if parsed.path == "/api/v1/agent/events":
+                q = dict(urllib.parse.parse_qsl(parsed.query))
+                after = int(q.get("after") or 0)
+                limit = min(int(q.get("limit") or 100), 500)
+                page = [e for e in self.events if e["seq"] > after][:limit]
+                payload = {"events": page, "last": page[-1]["seq"] if page else after}
+            m = re.match(r"^/api/v1/agent/reports/([^/]+)$", parsed.path)
+            if m and m.group(1) in self.report_fails:
+                return super()._send(h, 500, {"error": "internal"})
+        return super()._send(h, status, payload, ctype)
 
 
 # --------------------------------------------------------------------------------------------------------------
