@@ -150,19 +150,11 @@ async function streamAttachment(req: Request, env: Env, id: string): Promise<Res
   return new Response(object.body, { status: 206, headers });
 }
 
-/** `https://github.com/...` only, so the desk never renders a link to anywhere else. */
-function prUrl(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
-  const ok = typeof value === "string" && value.length <= 300 && /^https:\/\/github\.com\/[\w.~/%#?=&+-]+$/.test(value);
-  if (!ok) throw new HttpError(400, "invalid_pr_url");
-  return value;
-}
-
 async function setStatus(req: Request, env: Env, code: string, who: DeskIdentity): Promise<Response> {
   const body = await readJson(req);
   const status = v.oneOf(body.status, "status", v.STATUSES);
   if (!status) throw new HttpError(400, "invalid_status");
-  const pr = prUrl(body.prUrl);
+  const pr = v.prUrl(body.prUrl);
   const note = v.text(body.note, "note", 0, 2000);
   const report = await env.DB.prepare("SELECT id FROM reports WHERE code = ?").bind(code).first<{ id: string }>();
   if (!report) throw new HttpError(404, "not_found");

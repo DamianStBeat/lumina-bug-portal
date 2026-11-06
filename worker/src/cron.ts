@@ -122,57 +122,85 @@ async function abortStaleUploads(env: Env, now: number, budget: Budget) {
   );
 }
 
+type OldAtt = { id: string; r2_key: string; upload_id: string | null; status: string };
+
 /**
- * Reports older than 12 months, with everything that hangs off them. A report whose objects could not all be
- * removed keeps its rows, so tomorrow's run still knows the keys instead of leaving files nobody can find.
+ * Removes the objects of one old report's attachments, a page at a time within the budget. Every row is covered,
+ * whatever its status: an `uploading` or `aborted` row may still hold an open upload or a finished object (a failed
+ * abort whose release failed too), a `deleted` one is deleted again, which R2 treats as a no-op. Each attachment row
+ * goes, with its parts, as soon as its object is gone, so a report with more objects than one day's budget moves
+ * forward every run and the rows still there are exactly the objects left to remove. Rows are deleted by id: a frame
+ * the agent adds while this runs is not in our list and stays for the next run. Returns false when the budget ran out
+ * before the end of the list.
+ */
+async function purgeAttachments(env: Env, reportId: string, budget: Budget): Promise<boolean> {
+  const dropParts = env.DB.prepare("DELETE FROM parts WHERE attachment_id = ?");
+  const dropRow = env.DB.prepare("DELETE FROM attachments WHERE id = ?");
+  // A cursor on id, so a row that failed is not selected again in this run: tomorrow's run retries it.
+  let after = "";
+  for (;;) {
+    const { results: atts } = await env.DB.prepare(
+      `SELECT id, r2_key, upload_id, status FROM attachments WHERE report_id = ? AND id > ? ORDER BY id LIMIT ${BATCH}`,
+    )
+      .bind(reportId, after)
+      .all<OldAtt>();
+    const gone: string[] = [];
+    let complete = true;
+    for (const a of atts) {
+      // A `complete` or `deleted` row's upload was finished by R2 before the row got there: a delete is enough.
+      const open = (a.status === "uploading" || a.status === "aborted") && a.upload_id !== null;
+      const cost = open ? ABORT_R2_CALLS : 1;
+      if (cost > budget.r2) {
+        complete = false;
+        break;
+      }
+      budget.r2 -= cost;
+      after = a.id;
+      try {
+        if (open) await abortUpload(env.FILES, a.r2_key, a.upload_id!);
+        else await env.FILES.delete(a.r2_key);
+        gone.push(a.id);
+      } catch (err) {
+        console.error("retention: old report object failed", a.id, reason(err));
+      }
+    }
+    if (gone.length) await env.DB.batch(gone.flatMap((id) => [dropParts.bind(id), dropRow.bind(id)]));
+    if (!complete) return false;
+    if (atts.length < BATCH) return true;
+  }
+}
+
+/**
+ * Reports older than 12 months, with everything that hangs off them. The report row goes only once no attachment
+ * row is left: one whose object could not be removed keeps its row (and so the report), so tomorrow's run still knows
+ * the key instead of leaving a file nobody can find. A cursor walks past such a report, so the ones behind it are
+ * still reached in the same run.
  */
 async function deleteOldReports(env: Env, now: number, budget: Budget) {
-  type Att = { id: string; r2_key: string; upload_id: string | null; status: string };
-  await inBatches<{ id: string }>(
-    budget,
-    async () =>
-      (
-        await env.DB.prepare(`SELECT id FROM reports WHERE created_at < ? ORDER BY created_at LIMIT ${BATCH}`)
-          .bind(now - REPORT_DAYS * DAY_MS)
-          .all<{ id: string }>()
-      ).results,
-    async (reports) => {
-      let done = 0;
-      for (const report of reports) {
-        const { results: atts } = await env.DB.prepare(
-          "SELECT id, r2_key, upload_id, status FROM attachments WHERE report_id = ?",
-        )
-          .bind(report.id)
-          .all<Att>();
-        const live = atts.filter((a) => a.status === "complete" || a.status === "uploading");
-        const cost = live.reduce((sum, a) => sum + (a.status === "uploading" && a.upload_id ? ABORT_R2_CALLS : 1), 0);
-        if (cost > budget.r2) break;
-        budget.r2 -= cost;
-        let clean = true;
-        for (const a of live) {
-          try {
-            // An upload R2 completed behind D1's back has its object deleted by abortUpload too.
-            if (a.status === "uploading" && a.upload_id) await abortUpload(env.FILES, a.r2_key, a.upload_id);
-            else await env.FILES.delete(a.r2_key);
-          } catch (err) {
-            clean = false;
-            console.error("retention: old report object failed", a.id, reason(err));
-          }
-        }
-        if (!clean) continue;
-        // One transaction; report_tokens would go by ON DELETE CASCADE, deleted here too so nothing relies on it.
-        await env.DB.batch([
-          env.DB.prepare("DELETE FROM parts WHERE attachment_id IN (SELECT id FROM attachments WHERE report_id = ?)").bind(report.id),
-          env.DB.prepare("DELETE FROM attachments WHERE report_id = ?").bind(report.id),
-          env.DB.prepare("DELETE FROM events WHERE report_id = ?").bind(report.id),
-          env.DB.prepare("DELETE FROM report_tokens WHERE report_id = ?").bind(report.id),
-          env.DB.prepare("DELETE FROM reports WHERE id = ?").bind(report.id),
-        ]);
-        done++;
-      }
-      return done;
-    },
-  );
+  type Row = { id: string; created_at: number };
+  let cursor: Row = { id: "", created_at: -1 };
+  for (let i = 0; i < MAX_BATCHES && budget.r2 > 0; i++) {
+    const { results: reports } = await env.DB.prepare(
+      `SELECT id, created_at FROM reports WHERE created_at < ?1 AND (created_at > ?2 OR (created_at = ?2 AND id > ?3))
+       ORDER BY created_at, id LIMIT ${BATCH}`,
+    )
+      .bind(now - REPORT_DAYS * DAY_MS, cursor.created_at, cursor.id)
+      .all<Row>();
+    for (const report of reports) {
+      if (!(await purgeAttachments(env, report.id, budget))) return;
+      cursor = report;
+      // One transaction. Each statement re-checks in D1 that nothing still hangs off the report, so an attachment
+      // added after our list was read keeps the report (and its key) for the next run. report_tokens would go by
+      // ON DELETE CASCADE, deleted here too so nothing relies on it.
+      const orphan = "NOT EXISTS (SELECT 1 FROM reports WHERE id = ?1)";
+      await env.DB.batch([
+        env.DB.prepare("DELETE FROM reports WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM attachments WHERE report_id = ?1)").bind(report.id),
+        env.DB.prepare(`DELETE FROM events WHERE report_id = ?1 AND ${orphan}`).bind(report.id),
+        env.DB.prepare(`DELETE FROM report_tokens WHERE report_id = ?1 AND ${orphan}`).bind(report.id),
+      ]);
+    }
+    if (reports.length < BATCH) return;
+  }
 }
 
 /** D1-only clean-ups, in bounded chunks: ip hashes after 2 days, rate rows whose window started over 2 days ago. */

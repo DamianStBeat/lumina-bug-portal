@@ -4,8 +4,9 @@ import type { PublicStatus } from "./validate";
 const PUBLIC: Record<string, PublicStatus> = {
   received: "received", looking: "looking", fixed: "fixed", not_bug: "checked", closed: "checked",
 };
-// Longer chains, and loops (A -> B -> A), stop here instead of walking the table.
-const MAX_DUPLICATE_DEPTH = 5;
+// Longer chains, and loops (A -> B -> A), stop here instead of walking the table. Triage stores the root original
+// and refuses a cycle, so this only guards rows written before that, or two triages racing each other.
+export const MAX_DUPLICATE_DEPTH = 10;
 
 type StatusRow = { status: string; duplicate_of: string | null; updated_at: number };
 

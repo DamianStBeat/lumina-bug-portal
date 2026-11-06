@@ -5,6 +5,7 @@ import { eventStatement } from "../lib/events";
 import { apiPath, dispatch, HttpError, json, readBody, readJson, type Route, type RouteHandler } from "../lib/http";
 import { enforceRate } from "../lib/rate";
 import { insertReport } from "../lib/reports";
+import { MAX_DUPLICATE_DEPTH } from "../lib/status";
 import * as v from "../lib/validate";
 
 const MINUTE = 60_000;
@@ -133,17 +134,30 @@ async function frames(req: Request, env: Env, code: string): Promise<Response> {
   const key = `frames/${report.id}/${id}`;
   const now = Date.now();
   await env.FILES.put(key, bytes, { httpMetadata: { contentType: mime } });
+  const data = JSON.stringify({ attachmentId: id, kind: "frames", size: bytes.byteLength });
+  let added: boolean;
   try {
-    await env.DB.prepare(
-      `INSERT INTO attachments (id, report_id, created_at, kind, filename, mime, size_bytes, r2_key, status, completed_at)
-       VALUES (?, ?, ?, 'frames', ?, ?, ?, ?, 'complete', ?)`,
-    )
-      .bind(id, report.id, now, frameName(req.headers.get("X-Filename"), mime), mime, bytes.byteLength, key, now)
-      .run();
+    // One transaction: the row and its file_added event land together. The row only while the report still exists
+    // (retention may have removed it since our lookup, and would never find a row added after that), the event only
+    // when the row was written.
+    const [row] = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO attachments (id, report_id, created_at, kind, filename, mime, size_bytes, r2_key, status, completed_at)
+         SELECT ?1, id, ?2, 'frames', ?3, ?4, ?5, ?6, 'complete', ?2 FROM reports WHERE id = ?7`,
+      ).bind(id, now, frameName(req.headers.get("X-Filename"), mime), mime, bytes.byteLength, key, report.id),
+      env.DB.prepare(
+        "INSERT INTO events (report_id, at, type, data) SELECT ?1, ?2, 'file_added', ?3 WHERE EXISTS (SELECT 1 FROM attachments WHERE id = ?4)",
+      ).bind(report.id, now, data, id),
+    ]);
+    added = row!.meta.changes === 1;
   } catch (err) {
     // No row points at the object, so retention would never find it: remove it now.
     await env.FILES.delete(key);
     throw err;
+  }
+  if (!added) {
+    await env.FILES.delete(key);
+    throw new HttpError(404, "not_found");
   }
   return json({ attachmentId: id }, 201);
 }
@@ -162,51 +176,67 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
     throw new HttpError(400, "invalid_duplicate_of");
   }
   const report = await reportOf(env, code);
-  const duplicateOf = verdict === "duplicate" ? (dup as string) : null;
-  if (duplicateOf && !(await env.DB.prepare("SELECT 1 FROM reports WHERE code = ?").bind(duplicateOf).first())) {
-    throw new HttpError(400, "invalid_duplicate_of");
-  }
+  const duplicateOf = verdict === "duplicate" ? await rootOriginal(env, dup as string, code) : null;
   const status = verdict === "duplicate" ? "duplicate" : verdict === "not_bug" ? "not_bug" : "looking";
   const now = Date.now();
-  // One batch is one transaction: the new status and its events land together or not at all. `from` is the status
-  // read above; a desk change landing in between would only make that history line stale, never the status.
+  // One batch is one transaction: the new status and its events land together or not at all. The status_changed
+  // event goes first and reads `from` from the row inside the transaction, written only when the stored status
+  // differs: a desk change landing after our lookup is never lost from the history the bot follows.
   const writes = [
+    env.DB.prepare(
+      `INSERT INTO events (report_id, at, type, data)
+       SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3) FROM reports WHERE id = ?1 AND status <> ?3`,
+    ).bind(report.id, now, status),
     env.DB.prepare("UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = ?, updated_at = ? WHERE id = ?")
       .bind(verdict, triageText, status, duplicateOf, now, report.id),
     eventStatement(env, report.id, "triaged", { verdict }, now),
   ];
   if (duplicateOf) writes.push(eventStatement(env, report.id, "duplicate_linked", { duplicateOf }, now));
-  if (status !== report.status) writes.push(eventStatement(env, report.id, "status_changed", { from: report.status, to: status }, now));
   await env.DB.batch(writes);
   return json({ ok: true });
 }
 
-/** Only an https link on github.com: the desk shows it as a link, so no other scheme or host may get there. */
-function githubUrl(value: unknown): string | null {
-  if (value === undefined || value === null) return null;
-  let url: URL | null = null;
-  try {
-    if (typeof value === "string" && value.length <= 300) url = new URL(value);
-  } catch {
-    url = null;
+/**
+ * The original a duplicate link stores: `target`, or the report its own duplicate chain ends at, so a player's status
+ * is one hop away. 400 `invalid_duplicate_of` when `target` does not exist; 409 `duplicate_cycle` when the chain
+ * comes back to `self` (the link would close a loop) or already loops. A chain broken by a missing original, or
+ * longer than the read-time limit, stops at the last report found.
+ */
+async function rootOriginal(env: Env, target: string, self: string): Promise<string> {
+  const seen = new Set([self, target]);
+  let found: string | null = null;
+  let code = target;
+  for (let depth = 0; depth < MAX_DUPLICATE_DEPTH; depth++) {
+    const row = await env.DB.prepare("SELECT status, duplicate_of FROM reports WHERE code = ?")
+      .bind(code)
+      .first<{ status: string; duplicate_of: string | null }>();
+    if (!row) break;
+    found = code;
+    const next = row.status === "duplicate" ? row.duplicate_of : null;
+    if (!next) break;
+    if (seen.has(next)) throw new HttpError(409, "duplicate_cycle");
+    seen.add(next);
+    code = next;
   }
-  if (!url || url.protocol !== "https:" || url.hostname !== "github.com" || url.port || url.username || url.password) {
-    throw new HttpError(400, "invalid_pr_url");
-  }
-  return url.href;
+  if (found === null) throw new HttpError(400, "invalid_duplicate_of");
+  return found;
 }
 
 async function setStatus(req: Request, env: Env, code: string): Promise<Response> {
   const body = await readJson(req);
   const status = v.oneOf(body.status, "status", v.STATUSES);
   if (!status) throw new HttpError(400, "invalid_status");
-  const prUrl = githubUrl(body.prUrl);
+  const prUrl = v.prUrl(body.prUrl);
   const note = v.text(body.note, "note", 0, 2000);
   const report = await reportOf(env, code);
   const now = Date.now();
+  // The event first, its `from` read from the row inside the same transaction, as the desk's status route does.
   await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO events (report_id, at, type, data)
+       SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5) FROM reports WHERE id = ?1`,
+    ).bind(report.id, now, status, note, prUrl),
     env.DB.prepare("UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), updated_at = ? WHERE id = ?").bind(status, prUrl, now, report.id),
-    eventStatement(env, report.id, "status_changed", { from: report.status, to: status, note, prUrl }, now),
   ]);
   return json({ ok: true });
 }

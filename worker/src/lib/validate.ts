@@ -43,3 +43,16 @@ export function lang(v: unknown): string | null {
   if (s !== null && !/^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/.test(s)) throw new HttpError(400, "invalid_lang");
   return s;
 }
+
+// owner and repo as GitHub allows them, then the pull request number; nothing after it (no path, query or fragment).
+const PR_URL = /^https:\/\/github\.com\/[A-Za-z0-9-]{1,39}\/[A-Za-z0-9._-]{1,100}\/pull\/[1-9]\d{0,9}$/;
+
+/**
+ * `https://github.com/<owner>/<repo>/pull/<n>`, at most 300 characters, null when absent, else 400 `invalid_pr_url`.
+ * One rule for the agent and the desk: both store it and the desk renders it as a link.
+ */
+export function prUrl(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || value.length > 300 || !PR_URL.test(value)) throw new HttpError(400, "invalid_pr_url");
+  return value;
+}
