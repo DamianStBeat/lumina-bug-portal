@@ -77,6 +77,21 @@ const lineOf = (e: Entry) => (f: SavedFile) =>
 // Saved lines no listed file stands for. Each holds a place on the server, so it counts against the 3: an open file
 // not picked again, and a removed one until its DELETE is answered, as the server still counts its attachment.
 const heldBy = (s: Session | null, list: Entry[]) => (s ? s.files.filter((f) => !list.some((e) => lineOf(e)(f))).length : 0)
+// The attachments of held removed lines whose DELETE already failed on this load (`failed`): sending it again may free
+// their places. A line whose DELETE is still out is not among them, its answer is on the way.
+const stuckLines = (s: Session | null, list: Entry[], failed: Set<string>): string[] =>
+  (s?.files ?? []).flatMap((f) =>
+    f.attachmentId !== null && f.removing === true && failed.has(f.attachmentId) && !list.some((e) => lineOf(e)(f))
+      ? [f.attachmentId]
+      : [],
+  )
+// True when the attachment is gone: 2xx { ok: true } (deleteAttachment), or 404, already gone. Any other failure is
+// false, never a throw: the line then stays marked and keeps its place.
+const deleted = (id: string, token: string): Promise<boolean> =>
+  deleteAttachment(id, token).then(
+    () => true,
+    (err: unknown) => err instanceof ApiError && err.status === 404,
+  )
 
 const SERVER_REFUSAL: Record<string, Rejection> = {
   invalid_mime: 'type',
@@ -126,6 +141,8 @@ export function useUpload(only?: string) {
   const [unremoved, setUnremoved] = useState(false)
   // Attachments whose removal the server confirmed after the run that holds an older copy of the session began.
   const dropped = useRef(new Set<string>())
+  // Attachments whose background DELETE (below) failed on this load: a pick that needs their place sends it again.
+  const failed = useRef(new Set<string>())
   // Picks waiting for their hashes, one after the other, so they are decided in the order they were made. start()
   // and removeFile() wait for it; `waiting` counts the picks queued whole, which every later pick must wait behind.
   const queue = useRef<Promise<void>>(Promise.resolve())
@@ -164,27 +181,25 @@ export function useUpload(only?: string) {
   }, [])
 
   // A Remove whose answer the last visit never saw (the page was left while its DELETE was out) is sent again here,
-  // in the background: 200 or 404 drops its line; any other failure keeps it marked for the next load. Picks and
-  // Send are not held up by it, and nothing is written after reset() or unmount.
+  // in the background: 200 or 404 drops its line; any other failure keeps it marked (for a pick that needs its place,
+  // then for the next load). Picks and Send are not held up by it, and nothing is written after reset() or unmount.
   useEffect(() => {
     const s = saved.current
     if (!s) return
     let live = true
     const at = epoch.current
-    const gone = (id: string) => {
-      if (!live || epoch.current !== at) return
-      dropped.current.add(id)
-      if (saved.current) store(saved.current)
-    }
     for (const f of s.files) {
       if (f.attachmentId === null || !f.removing) continue
       const id = f.attachmentId
-      deleteAttachment(id, s.reportToken).then(
-        () => gone(id),
-        (err: unknown) => {
-          if (err instanceof ApiError && err.status === 404) gone(id)
-        },
-      )
+      void deleted(id, s.reportToken).then((gone) => {
+        if (!live || epoch.current !== at) return
+        if (!gone) {
+          failed.current.add(id)
+          return
+        }
+        dropped.current.add(id)
+        if (saved.current) store(saved.current)
+      })
     }
     return () => {
       live = false
@@ -209,41 +224,84 @@ export function useUpload(only?: string) {
     return p
   }, [])
 
+  // Sends again the DELETE of up to `need` held removed lines whose background DELETE failed, one after the other;
+  // each one answered gone drops its line, which frees its place. True when at least one place was freed. Stops,
+  // writing nothing, once reset() or unmount came.
+  const retryHeld = useCallback(
+    async (need: number, at: number): Promise<boolean> => {
+      const s = saved.current
+      if (!s) return false
+      let freed = 0
+      for (const id of stuckLines(s, entries.current, failed.current)) {
+        if (freed >= need) break
+        const gone = await deleted(id, s.reportToken)
+        if (epoch.current !== at) return false
+        if (!gone) continue
+        failed.current.delete(id)
+        dropped.current.add(id)
+        if (saved.current) store(saved.current)
+        freed++
+      }
+      return freed > 0
+    },
+    [store],
+  )
+
   // A pick whose files are hashed: a file already listed is dropped, a saved one is bound to its line (it already
   // holds its place), the rest count against the 3. Files keep the order they were picked in. True when the pick
-  // brought back a saved file and none is missing any more.
+  // brought back a saved file and none is missing any more. When files are refused as `count` while a removed line
+  // whose DELETE failed holds a place, that DELETE is sent again first and the pick decided on its answer.
   const decide = useCallback(
-    (got: { file: File; head: string | null }[]): boolean => {
-      const s = saved.current
-      let list = entries.current
-      let count = list.length + heldBy(s, list)
-      let why: Rejection | null = null
-      let back = false
-      for (const { file: f, head } of got) {
-        const id: Ident = { name: f.name, size: f.size, head }
-        // The same file twice would upload twice and spend one of the 3 places.
-        if (list.some((e) => sameFile(idOf(e), id))) continue
-        // A removed line is not this file's any more: picked again, it is a new file with a new attachment.
-        const m = s?.files.find((sf) => !marked(sf) && sameFile(id, sf))
-        if (m) {
-          list = [...list, entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, attOf(m), head)]
-          back ||= !m.done
-          continue
+    async (got: { file: File; head: string | null }[], at: number): Promise<boolean> => {
+      // Written nowhere and making no Entry (an Entry's preview URL would leak): a pick may be planned twice.
+      const plan = (s: Session | null) => {
+        const ids = entries.current.map(idOf)
+        let count = entries.current.length + heldBy(s, entries.current)
+        let why: Rejection | null = null
+        let back = false
+        let short = 0
+        const adds: { f: File; head: string | null; m?: SavedFile }[] = []
+        for (const { file: f, head } of got) {
+          const id: Ident = { name: f.name, size: f.size, head }
+          // The same file twice would upload twice and spend one of the 3 places.
+          if (ids.some((x) => sameFile(x, id))) continue
+          // A removed line is not this file's any more: picked again, it is a new file with a new attachment.
+          const m = s?.files.find((sf) => !marked(sf) && sameFile(id, sf))
+          if (m) {
+            adds.push({ f, head, m })
+            ids.push(id)
+            back ||= !m.done
+            continue
+          }
+          const v = validatePick(count, [f])
+          why ??= v.rejection
+          if (v.rejection === 'count') short++
+          if (v.ok.length === 0) continue
+          adds.push({ f, head })
+          ids.push(id)
+          count++
         }
-        const v = validatePick(count, [f])
-        why ??= v.rejection
-        if (v.ok.length === 0) continue
-        list = [...list, entry(f, 'waiting', 0, undefined, head)]
-        count++
+        return { adds, why, back, short }
       }
-      setRejection(why)
+      let p = plan(saved.current)
+      if (p.short > 0 && (await retryHeld(p.short, at))) p = plan(saved.current)
+      // reset() or unmount came while the DELETE was out: the list is no longer this pick's to change.
+      if (epoch.current !== at) return false
+      const s = saved.current
+      const list = [
+        ...entries.current,
+        ...p.adds.map(({ f, head, m }) =>
+          m ? entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, attOf(m), head) : entry(f, 'waiting', 0, undefined, head),
+        ),
+      ]
+      setRejection(p.why)
       entries.current = list
       sync()
       const r = resumeOf(s, list)
       setResume(r)
-      return back && r !== null && r.missing.length === 0
+      return p.back && r !== null && r.missing.length === 0
     },
-    [sync],
+    [sync, retryHeld],
   )
 
   // `onBack`: called when the pick turns out to bring back the last saved file still missing, which after a reload is
@@ -266,13 +324,22 @@ export function useUpload(only?: string) {
       const held = heldBy(s, list)
       const worst = validatePick(list.length + held, picked)
       const best = validatePick(list.length + held - maybe, picked)
-      if (waiting.current > 0 || twinned || worst.ok.length !== best.ok.length || worst.rejection !== best.rejection) {
+      // A place held by a removed line whose DELETE failed on this load: when freeing it would let more of the pick in,
+      // the pick waits for that DELETE to be sent again (decide) instead of being refused as `count` at once.
+      const freed = validatePick(list.length + held - stuckLines(s, list, failed.current).length, picked)
+      if (
+        waiting.current > 0 ||
+        twinned ||
+        worst.ok.length !== best.ok.length ||
+        worst.rejection !== best.rejection ||
+        worst.ok.length !== freed.ok.length
+      ) {
         waiting.current++
         void enqueue(async () => {
           try {
             const got = await Promise.all(picked.map(async (file) => ({ file, head: await hashHead(file) })))
             // reset() or unmount came first: the list is no longer this pick's to change.
-            if (epoch.current === at && decide(got)) onBack?.()
+            if (epoch.current === at && (await decide(got, at))) onBack?.()
           } finally {
             waiting.current--
           }
