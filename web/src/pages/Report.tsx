@@ -9,6 +9,7 @@ import { WeHaveIt } from '../components/Tracker'
 import { Turnstile, type TurnstileHandle } from '../components/Turnstile'
 import { useI18n } from '../i18n'
 import { useUpload, type Target } from '../upload/useUpload'
+import { sendLine, type SendLine } from './refusal'
 
 const WHERE_ICONS: Record<WhereArea, ChipOption<WhereArea>['icon']> = {
   match: 'sword',
@@ -41,7 +42,8 @@ export default function Report() {
   const [name, setName] = useState('')
   const [token, setToken] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
-  const [failed, setFailed] = useState(false)
+  // The line of the last refused Send (decided B4); null before Send and while a new one is out.
+  const [failed, setFailed] = useState<SendLine | null>(null)
   const [noWhat, setNoWhat] = useState(false)
   const widget = useRef<TurnstileHandle>(null)
   const whatBox = useRef<HTMLTextAreaElement>(null)
@@ -59,7 +61,7 @@ export default function Report() {
     setWhere(undefined)
     setDevice(undefined)
     setName('')
-    setFailed(false)
+    setFailed(null)
     setNoWhat(false)
     go(1)
   }
@@ -67,7 +69,7 @@ export default function Report() {
   const send = async () => {
     if (sending) return
     setSending(true)
-    setFailed(false)
+    setFailed(null)
     // The page may be left or reset while createReport is out; its answer then belongs to nobody.
     const still = up.guard()
     try {
@@ -88,10 +90,10 @@ export default function Report() {
       }
       // start() keeps its own failures (phase 'error', screen 3e); only createReport throws here.
       await up.start(target)
-    } catch {
+    } catch (e) {
       if (!still()) return
       // Nothing typed or picked is lost; the used token is not valid twice, so the widget issues a new one.
-      setFailed(true)
+      setFailed(sendLine(e, false))
       widget.current?.reset()
     } finally {
       setSending(false)
@@ -199,7 +201,7 @@ export default function Report() {
           </span>
         </div>
       )}
-      {failed && <Err text={t.errSend} />}
+      {failed && <Err text={t[failed]} />}
       <FilePicker up={up} locked={sending} />
       {up.phase === 'error' ? (
         <>

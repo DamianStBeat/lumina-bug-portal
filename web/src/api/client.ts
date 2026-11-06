@@ -33,9 +33,17 @@ type Req = { method?: string; json?: unknown; raw?: Blob; token?: string; desk?:
 
 const CODE_WORD = /^[a-z0-9_]{1,64}$/
 
+// Two failures told apart: a body that never fully arrived (the connection dropped after the headers) is the
+// network, retried like any other; a body that arrived and is not JSON (a proxy page) is null for the caller to judge.
 async function readBody(res: Response): Promise<unknown> {
+  let text: string
   try {
-    return await res.json()
+    text = await res.text()
+  } catch {
+    throw new ApiError(0, 'network')
+  }
+  try {
+    return JSON.parse(text) as unknown
   } catch {
     return null
   }
@@ -123,7 +131,12 @@ export async function completeAttachment(
 ): Promise<{ ok: true; missing?: number[] }> {
   const res = await send(`/attachments/${seg(id)}/complete`, { method: 'POST', token, signal })
   const body = await readBody(res)
-  if (res.ok) return { ok: true }
+  if (res.ok) {
+    // Only the contract's `{ ok: true }` closes the upload. Anything else is treated as a bad gateway (502): the
+    // uploader retries it and the session keeps the file, instead of a file marked done that the server never closed.
+    if ((body as { ok?: unknown } | null)?.ok !== true) throw new ApiError(502, 'bad_answer')
+    return { ok: true }
+  }
   const code = errorCode(res, body)
   if (res.status !== 409 || code !== 'missing_parts') throw new ApiError(res.status, code)
   const list = (body as Partial<ApiErrorBody>).missing

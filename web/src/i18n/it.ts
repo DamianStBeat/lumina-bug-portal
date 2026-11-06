@@ -67,7 +67,9 @@ export const it: Strings = {
   errLoad: 'Ora non riusciamo a caricarla. Controlla il Wi-Fi, poi premi Riprova.',
   errEmpty: 'Questo file è vuoto. Scegline un altro.',
   errRefused: 'Non possiamo aggiungere questo file. Toglilo, o premi Indietro per ricominciare.',
-  errCheck: 'Il controllo di sicurezza non si è caricato. Controlla il Wi-Fi, poi premi Riprova.',
+  errCheckLoad: 'Il controllo di sicurezza non si è caricato. Controlla il Wi-Fi, poi premi Riprova.',
   remove: 'Togli',
   errRemove: 'Questo file non è stato tolto. Controlla il Wi-Fi, poi premi di nuovo Togli.',
+  errRate: "Hai mandato tante segnalazioni in poco tempo. Riprova tra un'ora.",
+  errCheck: 'Il controllo di sicurezza non è passato. Aspetta un momento, poi mandala di nuovo.',
 }

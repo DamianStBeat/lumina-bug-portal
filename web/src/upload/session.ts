@@ -2,9 +2,11 @@
 // sessionStorage, not localStorage: the report token should not outlive the tab.
 // A file is saved before its attachment is asked for, so a reload at any moment finds it: `attachmentId: null` means
 // "not created yet" (create it on resume), never "failed".
+// `removing: true`: the player pressed Remove and the DELETE of its attachment has not been answered 200 or 404 yet.
+// Such a line is never offered for resume nor counted against the 3 places; the next load sends the DELETE again.
 export type SavedFile = { name: string; size: number; lastModified: number; done: boolean } & (
   | { attachmentId: null }
-  | { attachmentId: string; partSize: number; partCount: number }
+  | { attachmentId: string; partSize: number; partCount: number; removing?: true }
 )
 export type Session = { v: 2; code: string; reportToken: string; files: SavedFile[] }
 
@@ -18,8 +20,10 @@ function isSavedFile(v: unknown): v is SavedFile {
   if (!f || typeof f.name !== 'string' || !isNat(f.size) || !isNat(f.lastModified) || typeof f.done !== 'boolean') {
     return false
   }
-  // Not created yet cannot be done; created needs the part layout the server gave.
-  if (f.attachmentId === null) return !f.done
+  // Not created yet cannot be done, nor be removing (it goes at once, with no DELETE); created needs the part layout
+  // the server gave.
+  if (f.attachmentId === null) return !f.done && f.removing === undefined
+  if (f.removing !== undefined && f.removing !== true) return false
   return isStr(f.attachmentId) && isNat(f.partSize) && f.partSize > 0 && isNat(f.partCount) && f.partCount > 0
 }
 

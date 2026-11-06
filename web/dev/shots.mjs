@@ -142,8 +142,9 @@ async function settle(page) {
   }
 }
 
-// Width rule for every page; the 56 px rule on the player pages and on the desk under 820 px (touch layouts); from
-// 820 px the desk keeps the preview's filter pills, so only its action buttons are held to 56 px. Clipped: content
+// Width rule for every page; the 56 px rule on the player pages and on the desk under 1024 px (touch layouts, the
+// 820 px tablet included: decided B6); from 1024 px the desk keeps the preview's filter pills, so only its action
+// buttons are held to 56 px. Clipped: content
 // bigger than a box that hides its overflow, or spilling out of a control (the ellipsis on file names is meant).
 // Overlap: two controls whose boxes cross.
 function measure(page, desk) {
@@ -152,7 +153,7 @@ function measure(page, desk) {
     const name = (el) => `${el.tagName.toLowerCase()}.${String(el.className).trim().replace(/ +/g, '.')}`
     const over = Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) - window.innerWidth
     const small = []
-    const pc = desk && window.innerWidth >= 820
+    const pc = desk && window.innerWidth >= 1024
     for (const el of document.querySelectorAll(pc ? '.actions .btn' : 'button, a[href], input, textarea, select, .chip')) {
       if (!vis(el)) continue
       const r = el.getBoundingClientRect()

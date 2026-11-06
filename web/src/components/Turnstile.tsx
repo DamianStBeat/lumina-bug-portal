@@ -108,12 +108,12 @@ export function Turnstile({ onToken, ref }: { onToken(token: string | null): voi
     }
   }, [lang, tries])
 
-  if (!TURNSTILE_SITE_KEY) return <Err text={t.errCheck} />
+  if (!TURNSTILE_SITE_KEY) return <Err text={t.errCheckLoad} />
   return (
     <>
       {failed && (
         <>
-          <Err text={t.errCheck} />
+          <Err text={t.errCheckLoad} />
           <button
             type="button"
             className="btn ghost"

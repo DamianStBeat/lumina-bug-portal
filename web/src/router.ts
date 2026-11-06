@@ -34,6 +34,13 @@ export function navigate(to: string): void {
   window.scrollTo(0, 0)
 }
 
+// Corrects the address of the page shown, without a new history entry: Back still leads where it led before.
+export function replaceAddress(to: string): void {
+  if (to === snapshot()) return
+  history.replaceState(null, '', to)
+  window.dispatchEvent(new Event(NAVIGATE_EVENT))
+}
+
 const STATUS_PATH = /^\/status\/(LUM-\d{6})\/?$/i
 
 export function matchStatus(path: string): string | null {

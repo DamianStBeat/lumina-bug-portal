@@ -1,13 +1,14 @@
-import { useId, useRef, useState } from 'react'
-import { ApiError, attachSession } from '../api/client'
+import { useEffect, useId, useRef, useState } from 'react'
+import { attachSession } from '../api/client'
 import { Err, FilePicker } from '../components/FilePicker'
 import { Icon } from '../components/Icons'
 import { Shell } from '../components/Shell'
 import { WeHaveIt } from '../components/Tracker'
 import { Turnstile, type TurnstileHandle } from '../components/Turnstile'
 import { useI18n } from '../i18n'
-import { navigate, useRoute } from '../router'
+import { navigate, replaceAddress, useRoute } from '../router'
 import { useUpload } from '../upload/useUpload'
+import { sendLine, type SendLine } from './refusal'
 
 const CODE = /^LUM-\d{6}$/
 
@@ -25,7 +26,8 @@ export default function AddVideo() {
   const [badCode, setBadCode] = useState(false)
   const [token, setToken] = useState<string | null>(null)
   const [sending, setSending] = useState(false)
-  const [failed, setFailed] = useState(false)
+  // The line of the last refused Add to report (decided B4); null before it and while a new one is out.
+  const [failed, setFailed] = useState<SendLine | null>(null)
   const widget = useRef<TurnstileHandle>(null)
   const ids = { code: useId(), hint: useId() }
 
@@ -39,10 +41,15 @@ export default function AddVideo() {
       setBadCode(false)
     }
   }
+  // Decided B2: once bound, the screen, the address and the upload all name the bound report. Back or Forward to
+  // another code (or to none) puts its address back in place instead of showing one report under another's address.
+  useEffect(() => {
+    if (bound && addr !== bound) replaceAddress(`/add?code=${encodeURIComponent(bound)}`)
+  }, [addr, bound])
 
   const add = async () => {
     if (sending) return
-    setFailed(false)
+    setFailed(null)
     if (bound) {
       await up.start()
       return
@@ -52,6 +59,8 @@ export default function AddVideo() {
       return
     }
     if (!token) return
+    // A line from an earlier answer is not about this request.
+    setBadCode(false)
     setSending(true)
     // The page may be left or reset while attachSession is out; its answer then belongs to nobody.
     const still = up.guard()
@@ -62,9 +71,10 @@ export default function AddVideo() {
       await up.start({ code, reportToken })
     } catch (e) {
       if (!still()) return
-      // 404: the code is wrong, the player can fix it; anything else is the network or the server.
-      if (e instanceof ApiError && e.status === 404) setBadCode(true)
-      else setFailed(true)
+      // 404: the code is wrong, the player can fix it in its field; the other lines go under the check.
+      const line = sendLine(e, true)
+      if (line === 'errCode') setBadCode(true)
+      else setFailed(line)
       widget.current?.reset()
     } finally {
       setSending(false)
@@ -77,7 +87,7 @@ export default function AddVideo() {
     setBound(null)
     setCode('')
     setBadCode(false)
-    setFailed(false)
+    setFailed(null)
     navigate('/add')
   }
 
@@ -156,7 +166,7 @@ export default function AddVideo() {
       ) : (
         <>
           {!bound && <Turnstile ref={widget} onToken={setToken} />}
-          {failed && <Err text={t.errSend} />}
+          {failed && <Err text={t[failed]} />}
           <div className="gap" />
           <button
             type="button"

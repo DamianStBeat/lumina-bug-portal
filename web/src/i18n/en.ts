@@ -71,8 +71,11 @@ export const en = {
   // Red team round: a refusal that trying again cannot fix, the safety check that did not load, removing a file.
   errEmpty: 'This file is empty. Choose another file.',
   errRefused: "We can't add this file. Remove it, or press Back to start again.",
-  errCheck: 'The safety check did not load. Check your Wi-Fi, then press Try again.',
+  errCheckLoad: 'The safety check did not load. Check your Wi-Fi, then press Try again.',
   remove: 'Remove',
   // Critical round: a Remove the server did not answer; the file stays listed until its place is given back.
   errRemove: 'This file was not removed. Check your Wi-Fi, then press Remove again.',
+  // Final round (decided B4): what the server answered to Send or Add to report, so the player knows what to do.
+  errRate: 'You sent a lot of reports in a short time. Try again in an hour.',
+  errCheck: 'The safety check did not pass. Wait a moment, then send it again.',
 }

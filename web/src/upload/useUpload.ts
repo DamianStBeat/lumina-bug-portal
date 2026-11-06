@@ -43,6 +43,16 @@ const view = (e: Entry): FileItem => ({
 const sameFile = (a: Ident, b: Ident) => a.name === b.name && a.size === b.size && a.lastModified === b.lastModified
 const attOf = (f: SavedFile): Att | undefined =>
   f.attachmentId === null ? undefined : { attachmentId: f.attachmentId, partSize: f.partSize, partCount: f.partCount }
+// A line the player removed whose DELETE is not answered yet (session.ts): no longer one of the report's files.
+const marked = (f: SavedFile): boolean => f.attachmentId !== null && f.removing === true
+const unmark = (f: SavedFile): SavedFile => {
+  if (f.attachmentId === null) return f
+  const { name, size, lastModified, done, attachmentId, partSize, partCount } = f
+  return { name, size, lastModified, done, attachmentId, partSize, partCount }
+}
+// The saved line of a listed file: by its attachment once it has one, since a removed line may share its name.
+const lineOf = (e: Entry) => (f: SavedFile) =>
+  e.att ? f.attachmentId === e.att.attachmentId : !marked(f) && sameFile(f, e.file)
 
 const SERVER_REFUSAL: Record<string, Rejection> = {
   invalid_mime: 'type',
@@ -59,9 +69,11 @@ function refusalOf(e: unknown): Refusal | null {
 
 // Shown while a saved session still has unfinished files; `missing` lists the ones not picked again yet.
 function resumeOf(s: Session | null, list: Entry[]): Resume | null {
-  if (!s || s.files.every((f) => f.done)) return null
-  const missing = s.files
-    .filter((f) => !f.done && !list.some((e) => sameFile(e.file, f)))
+  // A removed file is never asked for again, even while its DELETE is still out.
+  const open = s ? s.files.filter((f) => !f.done && !marked(f)) : []
+  if (!s || open.length === 0) return null
+  const missing = open
+    .filter((f) => !list.some((e) => sameFile(e.file, f)))
     .map(({ name, size }) => ({ name, size }))
   return { code: s.code, missing }
 }
@@ -88,13 +100,20 @@ export function useUpload(only?: string) {
   // A removed file whose attachment is being deleted; and one whose delete failed, which stays in the list.
   const [removing, setRemoving] = useState(false)
   const [unremoved, setUnremoved] = useState(false)
+  // Attachments whose removal the server confirmed after the run that holds an older copy of the session began.
+  const dropped = useRef(new Set<string>())
 
   const sync = useCallback(() => setFiles(entries.current.map(view)), [])
   const store = useCallback((s: Session | null) => {
-    saved.current = s
-    if (s) saveSession(s)
+    // start() writes back its own copy of the session after every file: a line dropped meanwhile stays dropped.
+    const next = s && {
+      ...s,
+      files: s.files.filter((f) => !(f.attachmentId !== null && f.removing && dropped.current.has(f.attachmentId))),
+    }
+    saved.current = next
+    if (next) saveSession(next)
     else clearSession()
-    setResume(resumeOf(s, entries.current))
+    setResume(resumeOf(next, entries.current))
   }, [])
   // Entries are replaced, never edited in place, so a FileItem handed to React never changes under it.
   const patch = useCallback(
@@ -116,6 +135,34 @@ export function useUpload(only?: string) {
     }
   }, [])
 
+  // A Remove whose answer the last visit never saw (the page was left while its DELETE was out) is sent again here,
+  // in the background: 200 or 404 drops its line; any other failure keeps it marked for the next load. Picks and
+  // Send are not held up by it, and nothing is written after reset() or unmount.
+  useEffect(() => {
+    const s = saved.current
+    if (!s) return
+    let live = true
+    const at = epoch.current
+    const gone = (id: string) => {
+      if (!live || epoch.current !== at) return
+      dropped.current.add(id)
+      if (saved.current) store(saved.current)
+    }
+    for (const f of s.files) {
+      if (f.attachmentId === null || !f.removing) continue
+      const id = f.attachmentId
+      deleteAttachment(id, s.reportToken).then(
+        () => gone(id),
+        (err: unknown) => {
+          if (err instanceof ApiError && err.status === 404) gone(id)
+        },
+      )
+    }
+    return () => {
+      live = false
+    }
+  }, [store])
+
   // Taken by a page before its own await (createReport, attachSession): false afterwards when the page was left or
   // reset meanwhile, so a late answer never starts an upload nor overwrites the session of the one made since.
   const guard = useCallback(() => {
@@ -132,7 +179,8 @@ export function useUpload(only?: string) {
       for (const f of picked) {
         // The same file twice would upload twice and spend one of the 3 places.
         if ([...entries.current, ...known].some((e) => sameFile(f, e.file))) continue
-        const m = s?.files.find((sf) => sameFile(f, sf))
+        // A removed line is not this file's any more: picked again, it is a new file with a new attachment.
+        const m = s?.files.find((sf) => !marked(sf) && sameFile(f, sf))
         if (!m) {
           fresh.push(f)
           continue
@@ -141,7 +189,7 @@ export function useUpload(only?: string) {
       }
       const list = [...entries.current, ...known]
       // Saved files not picked again hold a place on the server (or will on resume), so they count against the 3.
-      const held = s ? s.files.filter((sf) => !list.some((e) => sameFile(e.file, sf))).length : 0
+      const held = s ? s.files.filter((sf) => !marked(sf) && !list.some((e) => sameFile(e.file, sf))).length : 0
       const { ok, rejection: why } = validatePick(list.length + held, fresh)
       setRejection(why)
       entries.current = [...list, ...ok.map((f) => entry(f, 'waiting', 0))]
@@ -155,16 +203,19 @@ export function useUpload(only?: string) {
     async (key: string): Promise<void> => {
       const e = entries.current.find((x) => x.key === key)
       if (!e || run.current || e.state === 'done') return
-      const token = saved.current?.reportToken
-      if (e.att && token) {
+      const before = saved.current
+      const att = e.att
+      if (att && before) {
         // Its attachment holds one of the report's 3 places, so the file leaves the list (and the session) only once
-        // the server has let it go; a failed delete keeps both, and pressing Remove again retries it.
+        // the server has let it go; a failed delete keeps both, and pressing Remove again retries it. The line is
+        // marked first, so a page left before the answer has the next load finish the removal.
         const ac = new AbortController()
         run.current = ac
         setRemoving(true)
         setUnremoved(false)
+        store({ ...before, files: before.files.map((f) => (f.attachmentId === att.attachmentId ? { ...f, removing: true } : f)) })
         try {
-          await deleteAttachment(e.att.attachmentId, token)
+          await deleteAttachment(att.attachmentId, before.reportToken)
         } catch (err) {
           // 404: the attachment is already gone, which is what removing it asked for.
           if (!(err instanceof ApiError && err.status === 404)) {
@@ -184,7 +235,8 @@ export function useUpload(only?: string) {
       if (e.previewUrl) URL.revokeObjectURL(e.previewUrl)
       entries.current = entries.current.filter((x) => x.key !== key)
       const s = saved.current
-      if (s) store({ ...s, files: s.files.filter((f) => !sameFile(f, e.file)) })
+      const mine = lineOf(e)
+      if (s) store({ ...s, files: s.files.filter((f) => !mine(f)) })
       sync()
     },
     [sync, store, patch],
@@ -203,9 +255,13 @@ export function useUpload(only?: string) {
         !same ? { ...e, att: undefined, state: 'waiting', confirmed: 0 } : e.state === 'done' ? e : { ...e, state: 'waiting' },
       )
       // Every file is written down before its attachment is asked for, so a reload from here on resumes this report.
-      const kept = same ? prev.files : []
+      // A listed file whose delete failed goes up with the rest, so its line is no longer marked; a line removed
+      // from the list stays marked for its DELETE (sent again on the next load) and is not part of this upload.
+      const kept = same
+        ? prev.files.map((f) => (marked(f) && entries.current.some((e) => e.att && lineOf(e)(f)) ? unmark(f) : f))
+        : []
       const added = entries.current
-        .filter((e) => !kept.some((f) => sameFile(f, e.file)))
+        .filter((e) => !kept.some((f) => !marked(f) && sameFile(f, e.file)))
         .map(({ file: f }): SavedFile => ({ name: f.name, size: f.size, lastModified: f.lastModified, done: false, attachmentId: null }))
       let s: Session = { v: 2, code: tgt.code, reportToken: tgt.reportToken, files: [...kept, ...added] }
       target.current = tgt
@@ -230,7 +286,7 @@ export function useUpload(only?: string) {
             if (!live()) return false
             const made: Att = { attachmentId: r.attachmentId, partSize: r.partSize, partCount: r.partCount }
             att = made
-            s = { ...s, files: s.files.map((x) => (sameFile(x, f) ? { ...x, ...made } : x)) }
+            s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(x, f) ? { ...x, ...made } : x)) }
             patch(key, { att })
             store(s)
           }
@@ -245,14 +301,18 @@ export function useUpload(only?: string) {
             },
           })
           if (!live()) return false
-          s = { ...s, files: s.files.map((x) => (sameFile(x, f) ? { ...x, done: true } : x)) }
+          s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(x, f) ? { ...x, done: true } : x)) }
           patch(key, { state: 'done', confirmed: f.size })
           store(s)
         }
         // Done only when every saved file is: one not picked again after a reload still waits for its bytes, and the
         // page shows the resume hint for it.
-        if (s.files.every((x) => x.done)) {
-          store(null)
+        if (s.files.every((x) => x.done || marked(x))) {
+          // A removed line still waiting for its DELETE outlives the upload, so the next load can finish it.
+          const left = s.files.filter(marked)
+          store(left.length > 0 ? { ...s, files: left } : null)
+          // Those lines may have been dropped meanwhile (store() filters them): nothing is left to keep then.
+          if (saved.current?.files.length === 0) store(null)
           setPhase('done')
           return true
         }
