@@ -6,12 +6,28 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { DiscordAPIError } from 'discord.js';
 import type { Config, Logger } from './config.ts';
-import { errorTag, type PortalApi, PortalError, type PortalEvent, type PublicStatus, toPublicStatus } from './portal.ts';
+import {
+  errorTag,
+  type PortalApi,
+  PortalError,
+  type PortalEvent,
+  type PublicStatus,
+  type ReportRow,
+  toPublicStatus,
+} from './portal.ts';
 import { type BotMessage, fixed, gameReportPost, sameBug } from './text.ts';
 
 // Measured in time, not ticks (fix round 2, decision 15): a Discord or worker outage longer than a few ticks must not
 // cost a player their "Fixed" post, while an event that never succeeds must still stop blocking the stream one day.
 const RETRY_WINDOW_MS = 6 * 60 * 60 * 1000;
+// A /bug report is created before its forum post exists and is linked after it (bugCommand.ts): an event arriving in
+// between finds no thread yet. Past this age a missing thread is taken as "never coming" (fix round 3, decision 21).
+const LINK_GRACE_MS = 10 * 60 * 1000;
+
+/** A discord report whose thread link may still be on its way: transient, so the event is retried. */
+class ThreadNotLinkedYet extends Error {
+  override name = 'ThreadNotLinkedYet';
+}
 
 /** "missing" is "never polled here" and "unparsable" a damaged file: neither is a cursor of 0. */
 export type CursorState = number | 'missing' | 'unparsable';
@@ -97,6 +113,12 @@ export class EventPoller {
   // Highest seq handled or skipped by this process. The cursor file may lag behind it (a failed write), and an
   // event at or below it is never handled twice; undefined until the first one.
   private handled: number | undefined;
+  // Last seq the cursor file is known to hold; behind `handled` after a failed write, which every tick retries.
+  private written: number | undefined;
+  // A catch-up over the history when there was no cursor file (`top` = the stream's end when it began, `done` = the
+  // last seq gone through). In memory only: the cursor file is written once at its end, so a restart midway begins it
+  // again, and the game reports it already posted are linked by then and not posted twice.
+  private catchUp: { top: number; done: number } | undefined;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
   private inFlight: Promise<void> | undefined;
@@ -113,6 +135,8 @@ export class EventPoller {
 
   /** One pass over the new events; rejects on a transient failure, after recording every event handled before it. */
   async tick(): Promise<void> {
+    // A file left behind by a failed write would make a restart repeat what this process already posted (decision 18).
+    if (this.handled !== undefined && this.written !== this.handled) await this.advance(this.handled);
     const cursor = await this.startCursor();
     if (cursor === undefined) return;
     const { events } = await this.api.getEvents(cursor);
@@ -123,34 +147,59 @@ export class EventPoller {
     }
   }
 
-  /** Where to read from; undefined when this tick skipped the history instead (no usable cursor file). */
+  /** Where to read from; undefined when this tick went through the history instead (no usable cursor file). */
   private async startCursor(): Promise<number | undefined> {
     const stored = await this.store.read();
     if (typeof stored === 'number') return Math.max(stored, this.handled ?? 0);
     // The file could not be written earlier in this process: memory knows where the stream is.
     if (this.handled !== undefined) return this.handled;
-    if (stored === 'unparsable') this.log.error('cursor file unparsable', { state: stored });
+    if (this.catchUp === undefined && stored === 'unparsable') this.log.error('cursor file unparsable', { state: stored });
     if (this.config.replay) {
       this.log.warn('no cursor: replaying every event from 0 (LUMINA_BOT_REPLAY=1)');
       return 0;
     }
-    // A lost or new state dir would otherwise repost every past "Fixed" and "Same bug" in its thread.
-    let after = 0;
-    for (;;) {
-      const { events } = await this.api.getEvents(after);
-      const top = Math.max(after, ...events.map((e) => e.seq));
-      if (top === after) break;
-      after = top;
-    }
-    this.log.warn('no cursor: event history skipped', { seq: after });
-    await this.advance(after);
+    await this.catchUpHistory();
     return undefined;
   }
 
+  /**
+   * No cursor file: a lost or new state dir would otherwise repost every past "Fixed" and "Same bug" in its thread, so
+   * those are skipped up to the stream's end as it is now; `created` events are still handled, so a game report that
+   * never got its forum post gets it (brief row 6, decision 19). Throws on a transient failure, resumed next tick.
+   */
+  private async catchUpHistory(): Promise<void> {
+    if (this.catchUp === undefined) {
+      let top = 0;
+      for (;;) {
+        const { events } = await this.api.getEvents(top);
+        const next = Math.max(top, ...events.map((e) => e.seq));
+        if (next === top) break;
+        top = next;
+      }
+      this.catchUp = { top, done: 0 };
+      this.log.warn('no cursor: old notifications skipped, game reports still posted', { seq: top });
+    }
+    const c = this.catchUp;
+    while (c.done < c.top) {
+      const { events } = await this.api.getEvents(c.done);
+      // Events past `top` arrived after the catch-up began: they are new, and the normal ticks handle them in full.
+      const ordered = events.filter((e) => e.seq > c.done && e.seq <= c.top).sort((a, b) => a.seq - b.seq);
+      if (ordered.length === 0) break;
+      for (const event of ordered) {
+        if (event.type === 'created') await this.handleOrSkip(event);
+        c.done = event.seq;
+      }
+    }
+    this.catchUp = undefined;
+    await this.advance(c.top);
+  }
+
   private async advance(seq: number): Promise<void> {
-    this.handled = Math.max(this.handled ?? 0, seq);
+    const top = Math.max(this.handled ?? 0, seq);
+    this.handled = top;
     try {
-      await this.store.write(this.handled);
+      await this.store.write(top);
+      this.written = top;
     } catch (err) {
       this.log.error('cursor not written, kept in memory', { seq, error: errorTag(err) });
     }
@@ -241,7 +290,7 @@ export class EventPoller {
     if (typeof status === 'string' && status !== 'fixed') return;
     const report = await this.api.getReport(event.code);
     if (typeof status !== 'string' && report.status !== 'fixed') return;
-    const threadId = report.discord_thread_id;
+    const threadId = this.threadOf(report);
     if (!threadId) return;
     const note = typeof event.data['note'] === 'string' ? event.data['note'] : undefined;
     await this.discord.sendToThread(threadId, fixed(event.code, note, report.discord_name));
@@ -250,13 +299,27 @@ export class EventPoller {
 
   private async onDuplicateLinked(event: CodedEvent): Promise<void> {
     const report = await this.api.getReport(event.code);
-    const threadId = report.discord_thread_id;
     // CONTRACT.md does not name the data key: both spellings are read.
     const named = event.data['duplicateOf'] ?? event.data['duplicate_of'];
     const original = report.duplicate_of ?? (typeof named === 'string' ? named : null);
-    if (!threadId || !original) return;
+    if (!original) return;
+    const threadId = this.threadOf(report);
+    if (!threadId) return;
     await this.discord.sendToThread(threadId, sameBug(event.code, original, await this.originalStatus(original)));
     this.log.info('same bug posted', { code: event.code, threadId });
+  }
+
+  /**
+   * The report's thread; undefined when it has none for good. A discord report younger than LINK_GRACE_MS without one
+   * throws instead (retried): /bug may still be making its post. A row without `created_at` counts as old.
+   */
+  private threadOf(report: ReportRow): string | undefined {
+    if (report.discord_thread_id) return report.discord_thread_id;
+    const created = report.created_at;
+    if (report.source === 'discord' && typeof created === 'number' && this.now() - created < LINK_GRACE_MS) {
+      throw new ThreadNotLinkedYet('thread not linked yet');
+    }
+    return undefined;
   }
 
   /** The original's public status; a vanished original reads as unknown, a worker failure is retried. */

@@ -18,11 +18,13 @@ import {
 } from 'discord.js';
 import type { Config, Logger } from './config.ts';
 import { copyAttachments, sanitiseFilename } from './files.ts';
+import type { CopyLimiter } from './limiter.ts';
 import { errorTag, type FetchLike, type PortalApi, type WhereArea } from './portal.ts';
 import { type BotReply, bugForumPost, cut, sentReply, tryAgain, weHaveIt } from './text.ts';
 
 export type BotDeps = { api: PortalApi; config: Config; log: Logger };
-export type FileDeps = BotDeps & { fetchImpl: FetchLike };
+/** `copies` defaults to the shared limiter (limiter.ts), so /bug and forum posts count against the same cap. */
+export type FileDeps = BotDeps & { fetchImpl: FetchLike; copies?: CopyLimiter };
 
 export const BUG_MODAL_ID = 'bug-modal';
 
@@ -163,7 +165,9 @@ export async function handleBugModalSubmit(i: ModalSubmitInteraction, deps: File
 
   // After the answer: a large video can take minutes, and the player should not wait on it.
   if (file) {
-    const res = await copyAttachments(api, code, reportToken, [file], deps.fetchImpl, log).catch(() => undefined);
+    const res = await copyAttachments(api, code, reportToken, [file], deps.fetchImpl, log, deps.copies).catch(
+      () => undefined,
+    );
     log.info('bug file copy', { code, ...res });
   }
 }

@@ -7,6 +7,7 @@ import { handleButton } from './buttons.ts';
 import { type Config, ConfigError, type Logger, loadConfig } from './config.ts';
 import { CursorStore, type DiscordSeam, EventPoller } from './events.ts';
 import { handleThreadCreate } from './forumPost.ts';
+import { copyLimiter } from './limiter.ts';
 import { errorTag, PortalApi } from './portal.ts';
 import { stopThenDestroy } from './shutdown.ts';
 
@@ -42,7 +43,7 @@ try {
 
 const api = new PortalApi({ base: config.apiBase, agentKey: config.agentKey });
 const deps: BotDeps = { api, config, log };
-const fileDeps = { ...deps, fetchImpl: (input: string, init?: RequestInit) => fetch(input, init) };
+const fileDeps = { ...deps, fetchImpl: (input: string, init?: RequestInit) => fetch(input, init), copies: copyLimiter };
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
@@ -100,13 +101,26 @@ client.once(Events.ClientReady, (c) => {
   poller.start();
 });
 
+const COPY_DRAIN_MS = 20000;
 let stopping = false;
 async function shutdown(signal: string): Promise<void> {
   if (stopping) return;
   stopping = true;
   log.info('stopping', { signal });
-  // A running tick is let finish (it writes its cursor), at most 5 s: systemd's own stop timeout is longer.
-  await stopThenDestroy(() => poller.stop(), () => client.destroy(), 5000);
+  // A running tick is let finish (it writes its cursor), at most 5 s. Then running archive copies get 20 s, after
+  // which they are aborted and their half-made attachments deleted (decision 22); copies still queued never start.
+  // Every step is capped, so the whole stop stays under systemd's 90 s.
+  await stopThenDestroy(
+    () => poller.stop(),
+    async () => {
+      try {
+        await copyLimiter.drain(COPY_DRAIN_MS);
+      } finally {
+        await client.destroy();
+      }
+    },
+    5000,
+  );
   process.exit(0);
 }
 process.on('SIGTERM', () => void shutdown('SIGTERM'));

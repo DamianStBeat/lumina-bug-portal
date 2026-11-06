@@ -62,7 +62,15 @@ export async function handleThreadCreate(thread: AnyThreadChannel, newlyCreated:
       log.warn('forum reply not sent', { code, threadId: thread.id, error: errorTag(e) });
     });
     if (starter.attachments.size > 0) {
-      const res = await copyAttachments(api, code, reportToken, starter.attachments.values(), deps.fetchImpl, log);
+      const res = await copyAttachments(
+        api,
+        code,
+        reportToken,
+        starter.attachments.values(),
+        deps.fetchImpl,
+        log,
+        deps.copies,
+      );
       log.info('forum file copy', { code, ...res });
     }
   } catch (err) {

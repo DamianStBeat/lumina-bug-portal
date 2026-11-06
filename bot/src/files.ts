@@ -1,6 +1,7 @@
 // Copies a Discord post's videos and pictures into the report's archive (CONTRACT.md "Limits": video/* or image/*,
 // at most 3, each <= 2 GiB). Anything else is never downloaded. One bad file never stops the others or the report.
 import type { Logger } from './config.ts';
+import { type CopyLimiter, copyLimiter } from './limiter.ts';
 import { errorTag, type FetchLike, type PortalApi } from './portal.ts';
 
 /** The fields of a discord.js Attachment this module reads (a real Attachment fits). */
@@ -36,19 +37,46 @@ export async function copyAttachments(
   attachments: Iterable<MediaAttachment>,
   fetchImpl: FetchLike,
   log?: Logger,
+  copies: CopyLimiter = copyLimiter,
 ): Promise<CopyResult> {
   const result: CopyResult = { copied: 0, skipped: 0, failed: 0 };
-  let attempted = 0;
+  // Chosen before the queue: a post with nothing to copy never waits for a slot.
+  const planned: { a: MediaAttachment; mime: string }[] = [];
   for (const a of attachments) {
     const mime = mediaType(a.contentType);
-    if (mime === undefined || a.size > MAX_BYTES || attempted >= MAX_FILES) {
-      result.skipped += 1;
-      continue;
-    }
-    attempted += 1;
+    if (mime === undefined || a.size > MAX_BYTES || planned.length >= MAX_FILES) result.skipped += 1;
+    else planned.push({ a, mime });
+  }
+  if (planned.length === 0) return result;
+  try {
+    // One slot per post, held for its files one after the other (decision 17: the cap counts copy runs).
+    await copies.run((signal) => copyPlanned(api, code, reportToken, planned, fetchImpl, signal, result, log));
+  } catch (err) {
+    // Only a copy that never started gets here (the limiter is draining at shutdown): every file failure inside
+    // copyPlanned is caught there.
+    result.failed += planned.length - result.copied - result.failed;
+    log?.warn('file copy not started', { code, error: errorTag(err) });
+  }
+  return result;
+}
+
+async function copyPlanned(
+  api: PortalApi,
+  code: string,
+  reportToken: string,
+  planned: { a: MediaAttachment; mime: string }[],
+  fetchImpl: FetchLike,
+  stop: AbortSignal,
+  result: CopyResult,
+  log?: Logger,
+): Promise<void> {
+  for (const { a, mime } of planned) {
     let res: Response | undefined;
     try {
-      res = await fetchImpl(a.url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+      // The shutdown abort (decision 22) errors the download stream, so the upload takes its failure path and the
+      // half-made attachment is deleted.
+      const signal = AbortSignal.any([stop, AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)]);
+      res = await fetchImpl(a.url, { signal });
       if (!res.ok || !res.body) throw new Error(`download ${res.status}`);
       if (!(a.size > 0)) throw new Error('download size');
       // Streamed part by part: the whole file is never in memory. The size Discord declared is the plan sent to
@@ -69,5 +97,4 @@ export async function copyAttachments(
       if (res?.body && !res.bodyUsed) await res.body.cancel().catch(() => undefined);
     }
   }
-  return result;
 }

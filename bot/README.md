@@ -43,9 +43,14 @@ worker (with the bearer `AGENT_KEY`). See `../CONTRACT.md` for the worker API.
 `bot.env.example`: `DISCORD_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`, `BUG_FORUM_CHANNEL_ID`,
 `PORTAL_API_BASE` (including `/api/v1`), `AGENT_KEY`, `SITE_BASE`, optional `LUMINA_BOT_STATE_DIR`.
 
-When the cursor file is missing (first start, or a lost state dir) or unreadable, the bot skips the event history
-and starts from the newest event, so past "Fixed" and "Same bug" posts are not repeated. To post every past event
-instead, start it once with `LUMINA_BOT_REPLAY=1` in `bot.env`, then remove the line.
+When the cursor file is missing (first start, or a lost state dir) or unreadable, the bot goes through the event
+history without posting past "Fixed" and "Same bug" messages, but a game report that never got its forum post still
+gets it; then it starts from the newest event. To post every past event instead, start it once with
+`LUMINA_BOT_REPLAY=1` in `bot.env`, then remove the line.
+
+Archive copies run at most 2 at once (for the 300 MB memory cap); the others wait their turn. On stop, the bot lets a
+running event round finish (up to 5 s), gives running copies 20 s, then aborts them and deletes their half-made
+files; copies still waiting are not started (their failure is logged with the report code).
 
 ## Register the command
 

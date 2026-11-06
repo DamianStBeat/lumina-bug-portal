@@ -43,7 +43,9 @@ export function toPublicStatus(status: unknown): PublicStatus | undefined {
 export type ReportRow = {
   code: string;
   source?: string;
-  status?: string;
+  status: string;
+  /** Unix ms (CONTRACT.md), not checked by getReport: whoever reads it checks it is a number. */
+  created_at?: unknown;
   title?: string | null;
   what?: string | null;
   discord_thread_id?: string | null;
@@ -123,7 +125,11 @@ export class PortalApi {
     // CONTRACT.md says "the full report row + attachments" without pinning the shape: a flat row and
     // `{ report, attachments }` are both read (the agent slice accepts both too).
     const row = isObject(body) && isObject(body['report']) ? body['report'] : body;
-    if (!isObject(row) || typeof row['code'] !== 'string') throw new PortalError('bad_response');
+    // Without a string status the bot would have to guess one, and a player must never read a status the worker
+    // did not send (fix round 3, decision 20).
+    if (!isObject(row) || typeof row['code'] !== 'string' || typeof row['status'] !== 'string') {
+      throw new PortalError('bad_response');
+    }
     return row as ReportRow;
   }
 
