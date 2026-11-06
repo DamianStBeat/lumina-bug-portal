@@ -3,7 +3,7 @@
 // no server: events in, state and effects out. The races two red team rounds found (bp-web-fix redteam-astra-2.md,
 // redteam-opus-2.md) are here as transitions; queue-races.spec.ts checks the same rows through the hook.
 import { describe, expect, it } from 'vitest'
-import { busy, initial, reduce, resumeOf, unremoved, viewState, type Att, type Effect, type Event, type State } from '../src/upload/queue'
+import { busy, initial, reduce, resumeOf, unremoved, viewState, type Att, type Effect, type Event, type Stage, type State } from '../src/upload/queue'
 import type { SavedFile, Session } from '../src/upload/session'
 import { MiB, file } from './helpers'
 
@@ -427,6 +427,12 @@ describe('queue: stale answers are dropped (the same state object)', () => {
       const u = fxOf(s, 'upload')[0]!
       return { s, ev: { t: 'uploaded', key: u.key, gen: u.gen, epoch: u.epoch }, gone: removeGone }
     },
+    // Red team r1 (Astra, queue.ts:31): where the uploader says the upload is (here: the network lost).
+    stage: () => {
+      const s = upload()
+      const u = fxOf(s, 'upload')[0]!
+      return { s, ev: { t: 'stage', key: u.key, gen: u.gen, epoch: u.epoch, stage: 'paused' }, gone: removeGone }
+    },
     // Red team r1 (Astra, test gap): a failed upload, Try again can pass it.
     failed: () => {
       const s = upload()
@@ -485,5 +491,183 @@ describe('queue: stale answers are dropped (the same state object)', () => {
     expect(reduce(s2, ev)).toBe(s2)
     // Its refusal too: an old "refused" never turns the retried upload into a refused file.
     expect(reduce(s2, { ...ev, why: 'size' })).toBe(s2)
+  })
+})
+
+// Red team r1 (bp-web-upload redteam-opus.md, redteam-astra.md; brief-build-4): the transitions that fix adds or
+// changes, one case each. completing and paused are the brief's states; the page shows both as uploading.
+describe('queue: completing, paused, and Remove wins at once', () => {
+  const sending = () => created(reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T }), 'A')
+  const ticketOf = (s: State) => {
+    const u = fxOf(s, 'upload')[0]!
+    return { key: u.key, gen: u.gen, epoch: u.epoch }
+  }
+  const stage = (s: State, t: ReturnType<typeof ticketOf>, st: Stage) => reduce(s, { t: 'stage', ...t, stage: st })
+
+  it('uploading → completing: shown as uploading, nothing else starts; uploaded from there: done, the next file created', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s1 = stage(s0, t, 'completing')
+    expect(item(s1, 'a.mp4')?.step).toBe('completing')
+    expect(viewState(item(s1, 'a.mp4')!)).toBe('uploading')
+    expect(s1.fx).toEqual([])
+    const s2 = reduce(s1, { t: 'uploaded', ...t })
+    expect(item(s2, 'a.mp4')).toMatchObject({ step: 'done', confirmed: SIZE })
+    expect(fxOf(s2, 'create')[0]?.body.filename).toBe('b.mp4')
+  })
+  it('completing → uploading: the parts the server lost go again, the file still uploading', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s2 = stage(stage(s0, t, 'completing'), t, 'uploading')
+    expect(item(s2, 'a.mp4')?.step).toBe('uploading')
+    expect(s2.fx).toEqual([])
+  })
+  it('uploading → paused → uploading: the network lost and back; shown as uploading, nothing else starts, a part confirmed meanwhile counts', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s1 = stage(s0, t, 'paused')
+    expect(item(s1, 'a.mp4')?.step).toBe('paused')
+    expect(viewState(item(s1, 'a.mp4')!)).toBe('uploading')
+    expect(s1.fx).toEqual([])
+    expect(item(reduce(s1, { t: 'confirmed', ...t, bytes: MiB }), 'a.mp4')?.confirmed).toBe(MiB)
+    expect(item(stage(s1, t, 'uploading'), 'a.mp4')?.step).toBe('uploading')
+  })
+  it('completing → paused → completing: the network lost while the complete is out comes back to completing', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s1 = stage(stage(s0, t, 'completing'), t, 'paused')
+    expect(item(s1, 'a.mp4')?.step).toBe('paused')
+    expect(item(stage(s1, t, 'completing'), 'a.mp4')?.step).toBe('completing')
+  })
+  it('paused, the retries spent: failed as before, the error phase, Try again sends it under a new generation', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s1 = reduce(stage(s0, t, 'paused'), { t: 'failed', ...t, why: null })
+    expect(item(s1, 'a.mp4')?.step).toBe('failed')
+    expect(s1.phase).toBe('error')
+    expect(fxOf(reduce(s1, { t: 'send' }), 'upload')[0]).toMatchObject({ gen: t.gen + 1 })
+  })
+  it('a stage for a file whose upload is not going (picked, done) changes nothing', () => {
+    const s0 = sending()
+    const b = item(s0, 'b.mp4')!
+    expect(stage(s0, { key: b.key, gen: b.gen, epoch: 0 }, 'paused')).toBe(s0)
+    const t = ticketOf(s0)
+    const s1 = reduce(s0, { t: 'uploaded', ...t })
+    expect(stage(s1, t, 'completing')).toBe(s1)
+  })
+  it('Remove while completing: the complete is stopped at once, before the DELETE; its answer is dropped; gone, the next file goes', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s1 = stage(s0, t, 'completing')
+    const s2 = reduce(s1, { t: 'remove', key: t.key })
+    expect(s2.fx.map((f) => f.t)).toEqual(['save', 'abort', 'delete'])
+    expect(item(s2, 'a.mp4')?.step).toBe('removing')
+    expect(reduce(s2, { t: 'uploaded', ...t })).toBe(s2)
+    const s3 = deletedFx(s2, true)
+    expect(names(s3)).toEqual(['b.mp4'])
+    expect(fxOf(s3, 'create')[0]?.body.filename).toBe('b.mp4')
+  })
+  it('Remove while paused: the upload is stopped at once and its DELETE goes', () => {
+    const s0 = sending()
+    const t = ticketOf(s0)
+    const s2 = reduce(stage(s0, t, 'paused'), { t: 'remove', key: t.key })
+    expect(s2.fx.map((f) => f.t)).toEqual(['save', 'abort', 'delete'])
+    expect(item(s2, 'a.mp4')?.step).toBe('removing')
+  })
+
+  // a.mp4 and b.mp4 saved with attachments A and B, both picked again and sent: a.mp4 uploading, b.mp4 waiting.
+  const bothSent = () =>
+    reduce(
+      ready(initial(session([saved('a.mp4', H1, att('A')), saved('b.mp4', H2, att('B'))])), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }),
+      { t: 'send', target: T },
+    )
+  it('Remove of an uploading file while another DELETE is out: aborted at once; its answers are dropped; its DELETE goes once the other is answered', () => {
+    const s0 = bothSent()
+    const t = ticketOf(s0)
+    expect(item(s0, 'a.mp4')?.step).toBe('uploading')
+    const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'b.mp4') })
+    expect(fxOf(s1, 'delete').map((d) => d.id)).toEqual(['B'])
+    const s2 = reduce(s1, { t: 'remove', key: t.key })
+    expect(s2.fx).toEqual([{ t: 'abort', key: t.key }])
+    const answers: Event[] = [
+      { t: 'uploaded', ...t },
+      { t: 'failed', ...t, why: null },
+      { t: 'confirmed', ...t, bytes: MiB },
+      { t: 'stage', ...t, stage: 'completing' },
+    ]
+    for (const ev of answers) expect(reduce(s2, ev)).toBe(s2)
+    const s3 = deletedFx(s2, true, s1)
+    expect(fxOf(s3, 'delete')).toEqual([{ t: 'delete', id: 'A', token: 'tok', epoch: 0, by: { k: 'remove', key: t.key, gen: t.gen + 1 } }])
+    expect(fxOf(s3, 'abort')).toEqual([])
+    expect(line(s3, 'a.mp4')).toMatchObject({ removing: true })
+    expect(reduce(s3, { t: 'uploaded', ...t })).toBe(s3)
+    const s4 = deletedFx(s3, true)
+    expect(names(s4)).toEqual([])
+    expect(s4.phase).toBe('done')
+    expect(s4.session).toBeNull()
+  })
+
+  it('Remove while its create is out: its open line leaves the session at once (saved), so a reload never asks for it; the create is not stopped', () => {
+    const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
+    const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'a.mp4') })
+    expect(line(s1, 'a.mp4')).toBeUndefined()
+    expect(fxOf(s1, 'save')).toEqual([{ t: 'save', session: s1.session }])
+    expect(fxOf(s1, 'abort')).toEqual([])
+    expect(resumeOf({ session: s1.session, items: [] })?.missing).toEqual([{ name: 'b.mp4', size: SIZE }])
+  })
+
+  // b.mp4 saved with attachment B, a.mp4 new; both sent: a.mp4's create out. Remove b.mp4 (its DELETE out), then
+  // Remove a.mp4, which waits for it.
+  const queuedWhileCreating = () => {
+    const s0 = reduce(ready(initial(session([saved('b.mp4', H2, att('B'))])), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
+    expect(item(s0, 'a.mp4')?.step).toBe('creating')
+    const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'b.mp4') })
+    expect(fxOf(s1, 'delete').map((d) => d.id)).toEqual(['B'])
+    const s2 = reduce(s1, { t: 'remove', key: keyOf(s0, 'a.mp4') })
+    expect(line(s2, 'a.mp4')).toBeUndefined()
+    return { s0, s1, s2 }
+  }
+  it('created for a file whose Remove waits behind another DELETE: no upload, the attachment written down marked, its turn deletes it', () => {
+    const { s0, s1, s2 } = queuedWhileCreating()
+    const s3 = created(s2, 'A', s0)
+    expect(fxOf(s3, 'upload')).toEqual([])
+    expect(fxOf(s3, 'delete')).toEqual([])
+    expect(line(s3, 'a.mp4')).toMatchObject({ attachmentId: 'A', removing: true })
+    const s4 = deletedFx(s3, true, s1)
+    expect(fxOf(s4, 'delete')[0]).toMatchObject({ id: 'A', by: { k: 'remove', key: keyOf(s0, 'a.mp4') } })
+    expect(fxOf(s4, 'upload')).toEqual([])
+    const s5 = deletedFx(s4, true)
+    expect(names(s5)).toEqual([])
+    expect(line(s5, 'a.mp4')).toBeUndefined()
+  })
+  it('the create of a file whose Remove waits behind another DELETE fails: it leaves at once, nothing to delete', () => {
+    const { s0, s1, s2 } = queuedWhileCreating()
+    const c = fxOf(s0, 'create')[0]!
+    const s3 = reduce(s2, { t: 'failed', key: c.key, gen: c.gen, epoch: c.epoch, why: null })
+    expect(names(s3)).toEqual(['b.mp4'])
+    expect(fxOf(s3, 'delete')).toEqual([])
+    expect(names(deletedFx(s3, true, s1))).toEqual([])
+  })
+
+  it('page left while a removed file\'s create is out: that create is kept; its answer afterwards sends its DELETE once and writes nothing', () => {
+    const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
+    const c = fxOf(s0, 'create')[0]!
+    const ans: Event = { t: 'created', key: c.key, gen: c.gen, epoch: c.epoch, att: att('A') }
+    // Not removed: the create is stopped and its answer dropped, as before.
+    const kept = reduce(s0, { t: 'closed' })
+    expect(fxOf(kept, 'stop')).toEqual([{ t: 'stop' }])
+    expect(reduce(kept, ans)).toBe(kept)
+
+    const s1 = reduce(s0, { t: 'remove', key: c.key })
+    const s2 = reduce(s1, { t: 'closed' })
+    expect(fxOf(s2, 'stop')).toEqual([{ t: 'stop', keep: [c.key] }])
+    expect(fxOf(s2, 'save')).toEqual([])
+    const s3 = reduce(s2, ans)
+    expect(s3.fx).toEqual([{ t: 'delete', id: 'A', token: 'tok', epoch: 0, by: { k: 'left' } }])
+    expect(s3.session).toBe(s2.session)
+    expect(reduce(s3, ans)).toBe(s3)
+    for (const gone of [true, false]) expect(reduce(s3, { t: 'deleted', id: 'A', epoch: 0, by: { k: 'left' }, gone })).toBe(s3)
+    // A reset keeps it the same way.
+    expect(fxOf(reduce(s1, { t: 'reset' }), 'stop')).toEqual([{ t: 'stop', keep: [c.key] }])
   })
 })

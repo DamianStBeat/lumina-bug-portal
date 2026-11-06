@@ -7,8 +7,13 @@
 //   picked ─Send→ creating ─created→ uploading ─uploaded→ done · creating|uploading ─failed→ failed (why: a refusal,
 //   or none when Try again can pass) · not done ─Remove→ removing ─gone→ leaves the list · ─not gone→ unremoved
 //   (orange line, line still marked, holds its place) ─Remove→ removing · unremoved ─Send pressed after→ picked.
-//   creating ─Remove→ removing without an attachment: its create answer is awaited and then deleted (an attachment
-//   never deleted would hold one of the 3 places); a failed create just leaves.
+//   uploading ⇄ completing (every part confirmed, the complete out; back while the parts the server lost go again) ·
+//   uploading|completing ─network lost→ paused ─network back→ where it was. The page shows both as uploading.
+//   creating ─Remove→ removing without an attachment: its open line leaves the session at once, so no reload asks for
+//   it; its create answer is awaited and then deleted (an attachment never deleted would hold one of the 3 places),
+//   even after the page was left; a failed create just leaves.
+// Remove wins at once: the upload of the file stops when it is pressed, even while it waits behind another DELETE,
+// and from then on no answer of that upload (a part, the complete, a failure) changes the file.
 // Picks, binds and Removes are jobs run in the order they were made. A Send waits while a job is queued or a file is
 // removing, starts one file at a time and none while a file is removing; a file removed since it was pressed (or still
 // removing then) is never part of it, even when its DELETE fails. It ends done, idle (a saved file not picked again)
@@ -17,9 +22,10 @@
 // generation, for a file no longer listed, or of an old epoch returns the same state object: the hook runs nothing.
 //
 // Left to the hook: the parts of one file (uploader.ts: 3 in flight, 5 retries, waiting for 'online', complete and its
-// missing parts) as one `upload` effect, files one at a time, so 3 parts in flight overall (no paused state here: the
-// last failure of a network loss arrives as `failed`); hashing; what a DELETE answer means (`gone`: 2xx { ok: true }
-// or 404); refusalOf; storage; previews. Decided here: resume matching and the places held by saved and removed lines.
+// missing parts) as one `upload` effect, files one at a time, so 3 parts in flight overall (the uploader reports
+// completing and paused as `stage`; the last failure of a network loss still arrives as `failed`); hashing; what a
+// DELETE answer means (`gone`: 2xx { ok: true } or 404); refusalOf; storage; previews. Decided here: resume matching
+// and the places held by saved and removed lines.
 import type { SavedFile, Session } from './session'
 import { validatePick, type Rejection } from './validate'
 
@@ -28,7 +34,9 @@ export type Refusal = Rejection | 'other'
 export type Att = { attachmentId: string; partSize: number; partCount: number }
 export type Target = { code: string; reportToken: string }
 export type Phase = 'idle' | 'uploading' | 'error' | 'done'
-export type Step = 'picked' | 'creating' | 'uploading' | 'done' | 'failed' | 'removing' | 'unremoved'
+// Where the uploader says an upload is (uploader.ts `onStage`).
+export type Stage = 'uploading' | 'completing' | 'paused'
+export type Step = 'picked' | 'creating' | Stage | 'done' | 'failed' | 'removing' | 'unremoved'
 // `head` (session.ts): undefined while still being hashed ("not yet", never a match), null when the browser could not
 // hash it. `why` only on a failed file the server refused.
 export type Item = { key: string; file: File; head?: string | null; att?: Att; gen: number; step: Step; confirmed: number }
@@ -44,7 +52,8 @@ type Job =
 // `keys`: null while waiting, then the files it sends, in order. `out`: files never part of it.
 type Send = { target: Target; keys: string[] | null; out: string[] }
 export type Ticket = { key: string; gen: number; epoch: number }
-export type DeleteBy = { k: 'remove'; key: string; gen: number } | { k: 'load' } | { k: 'held' }
+// `left`: the attachment a removed file's create got after the page was left; its answer changes nothing.
+export type DeleteBy = { k: 'remove'; key: string; gen: number } | { k: 'load' } | { k: 'held' } | { k: 'left' }
 export type Effect =
   | ({ t: 'hash'; file: File } & Ticket)
   | ({ t: 'create'; target: Target; body: { filename: string; size: number; mime: string } } & Ticket)
@@ -56,9 +65,9 @@ export type Effect =
   // The pick brought back the last saved file still missing: the hook calls its onBack. forget: revoke the preview.
   | { t: 'back'; pick: number }
   | { t: 'forget'; key: string }
-  // reset or unmount: abort every create and upload. A DELETE is let reach the server; its marked line has the next
-  // load send it again.
-  | { t: 'stop' }
+  // reset or unmount: abort every create and upload but the creates of `keep` (removed files: their answer is needed
+  // to delete what they made). A DELETE is let reach the server; its marked line has the next load send it again.
+  | { t: 'stop'; keep?: string[] }
 export type Event =
   | { t: 'mount' }
   | { t: 'reset' }
@@ -69,18 +78,22 @@ export type Event =
   | ({ t: 'hashed'; head: string | null } & Ticket)
   | ({ t: 'created'; att: Att } & Ticket)
   | ({ t: 'confirmed'; bytes: number } & Ticket)
+  | ({ t: 'stage'; stage: Stage } & Ticket)
   | ({ t: 'uploaded' } & Ticket)
   | ({ t: 'failed'; why: Refusal | null } & Ticket)
   | { t: 'deleted'; id: string; epoch: number; by: DeleteBy; gone: boolean }
 // `failed`: attachments of removed lines whose DELETE failed on this load. `fx`: what the last transition asks for.
+// `left`: creates of removed files still out when the page was left or reset (their epoch is gone).
+type Left = Ticket & { token: string }
 export type State = { epoch: number; session: Session | null; target: Target | null; items: Item[]; jobs: Job[] }
-  & { send: Send | null; phase: Phase; rejection: Rejection | null; failed: string[]; fx: Effect[] }
+  & { send: Send | null; phase: Phase; rejection: Rejection | null; failed: string[]; left: Left[]; fx: Effect[] }
 export type Resume = { code: string; missing: { name: string; size: number }[] }
 type Ident = { name: string; size: number; head: string | null }
 
 // `session`: the saved upload the page may use (the hook drops another report's first).
 export const initial = (session: Session | null): State => ({
-  epoch: 0, session, target: null, items: [], jobs: [], send: null, phase: 'idle', rejection: null, failed: [], fx: [],
+  epoch: 0, session, target: null, items: [], jobs: [], send: null, phase: 'idle', rejection: null, failed: [], left: [],
+  fx: [],
 })
 
 // The same file: name, size and the hash of its first 1 MiB (lastModified changes on every iPhone export). An
@@ -127,12 +140,15 @@ export function resumeOf({ session: s, items }: Pick<State, 'session' | 'items'>
   const missing = open.filter((f) => !answered(f, items) && !items.some((e) => sameFile(idOf(e), f)))
   return { code: s.code, missing: missing.map(({ name, size }) => ({ name, size })) }
 }
+// Its upload effect is running.
+const going = (step: Step): step is Stage => step === 'uploading' || step === 'completing' || step === 'paused'
 // While true the page takes no pick: a Send is going (or waiting) or a file's DELETE is out.
 export const busy = (s: State) => s.send !== null || s.items.some((x) => x.step === 'removing')
 export const unremoved = (s: State) => s.items.some((x) => x.step === 'unremoved')
 // What the list shows ('error': Try again can pass it; 'refused': only Remove can).
 export function viewState(it: Item): 'waiting' | 'uploading' | 'done' | 'error' | 'refused' {
-  if (it.step === 'uploading' || it.step === 'done') return it.step
+  if (going(it.step)) return 'uploading'
+  if (it.step === 'done') return 'done'
   if (it.step === 'failed') return it.why ? 'refused' : 'error'
   return it.step === 'unremoved' ? 'error' : 'waiting'
 }
@@ -144,6 +160,8 @@ const lines = (s: State, f: (l: SavedFile[]) => SavedFile[]): Session | null =>
 const live = (s: State, t: Ticket): Item | undefined =>
   t.epoch === s.epoch ? s.items.find((x) => x.key === t.key && x.gen === t.gen) : undefined
 const removing = (s: State) => s.items.some((x) => x.step === 'removing')
+// Pressed Remove, its turn not come yet (a hash or another file's DELETE before it): already not one of the files.
+const queued = (s: State, key: string) => s.jobs.some((j) => j.k === 'remove' && j.key === key)
 // The file leaves the list and its line the session.
 function leave(s: State, it: Item, fx: Effect[]): State {
   fx.push({ t: 'forget', key: it.key })
@@ -174,9 +192,15 @@ function apply(s: State, e: Event, fx: Effect[]): State {
       return pick(s, e.pick, e.files, fx)
     case 'remove': {
       const it = s.items.find((x) => x.key === e.key)
-      if (!it || it.step === 'removing' || s.jobs.some((j) => j.k === 'remove' && j.key === e.key)) return s
+      if (!it || it.step === 'removing' || queued(s, e.key)) return s
       const send = s.send && { ...s.send, out: [...s.send.out, e.key] }
-      return { ...s, send, jobs: [...s.jobs, { k: 'remove', key: e.key }] }
+      // Its upload stops now, not when its turn comes: behind another file's DELETE it could be completed meanwhile.
+      if (going(it.step)) fx.push({ t: 'abort', key: e.key })
+      // Its create is out, so its line has no attachment: it leaves the session now (saved first), so a reload never
+      // asks for it. What the create made is written down when it answers.
+      const open = it.step === 'creating' && !it.att
+      const session = open ? lines(s, (l) => l.filter((f) => !lineOf(it)(f))) : s.session
+      return { ...s, send, session, jobs: [...s.jobs, { k: 'remove', key: e.key }] }
     }
     case 'send': {
       // A refused file would be refused again: it has to be removed first.
@@ -184,15 +208,23 @@ function apply(s: State, e: Event, fx: Effect[]): State {
       const saved = s.session && { code: s.session.code, reportToken: s.session.reportToken }
       const target = e.target ?? s.target ?? saved
       if (!target) return s
-      const leaving = (k: string) => s.jobs.some((j) => j.k === 'remove' && j.key === k)
-      const out = s.items.filter((x) => x.step === 'removing' || leaving(x.key)).map((x) => x.key)
+      const out = s.items.filter((x) => x.step === 'removing' || queued(s, x.key)).map((x) => x.key)
       return { ...s, send: { target, keys: null, out } }
     }
     case 'reset':
     case 'closed': {
-      fx.push({ t: 'stop' })
+      // A removed file whose create is out keeps it: what it made is deleted when it answers (no state or storage is
+      // written for it then). Its line already left the session. A tab closed for good loses that answer: the
+      // attachment then stays on the server, holding one of the report's 3 places (known, not fixable from here).
+      const token = s.send?.target.reportToken
+      const left = s.items.flatMap((x): Left[] =>
+        token && !x.att && (x.step === 'removing' || (x.step === 'creating' && queued(s, x.key)))
+          ? [{ key: x.key, gen: x.gen, epoch: s.epoch, token }]
+          : [],
+      )
+      fx.push(left.length > 0 ? { t: 'stop', keep: left.map((x) => x.key) } : { t: 'stop' })
       s.items.forEach((x) => fx.push({ t: 'forget', key: x.key }))
-      const base = { ...s, epoch: s.epoch + 1, items: [], jobs: [], send: null }
+      const base = { ...s, epoch: s.epoch + 1, items: [], jobs: [], send: null, left: [...s.left, ...left] }
       if (e.t === 'closed') return base
       // Cleared even when nothing is held here: storage may hold another report's upload, as before.
       if (s.session === null) fx.push({ t: 'save', session: null })
@@ -208,33 +240,46 @@ function apply(s: State, e: Event, fx: Effect[]): State {
       return { ...s, jobs: s.jobs.map((x, i) => (i === ji ? { ...j, files } : x)) }
     }
     case 'created': {
+      if (e.epoch !== s.epoch) return leftCreated(s, e, fx)
       const it = live(s, e)
       // A create is only out during a Send, which wrote the session first.
       if (!it || it.att || !s.session || (it.step !== 'creating' && it.step !== 'removing')) return s
-      const id = idOf(it)
-      const gone = it.step === 'removing'
-      // Only a line with no attachment yet takes the new one; from here on the line is known by it.
-      const bound = (x: SavedFile): SavedFile =>
-        x.attachmentId !== null || !sameFile(id, x) ? x : gone ? { ...x, ...e.att, removing: true } : { ...x, ...e.att }
-      const session = lines(s, (l) => l.map(bound))
-      if (!gone) {
+      if (it.step === 'creating' && !queued(s, it.key)) {
         if (!s.send) return s
+        const id = idOf(it)
+        // Only a line with no attachment yet takes the new one; from here on the line is known by it.
+        const bound = (x: SavedFile): SavedFile => (x.attachmentId !== null || !sameFile(id, x) ? x : { ...x, ...e.att })
+        const session = lines(s, (l) => l.map(bound))
         const token = s.send.target.reportToken
         fx.push({ t: 'upload', key: it.key, gen: it.gen, epoch: s.epoch, file: it.file, att: e.att, token })
         return { ...setItem(s, it.key, { att: e.att, step: 'uploading' }), session }
       }
-      // Removed while its create was out: the attachment it got is deleted at once, under a new generation.
+      // Removed while its create was out (its open line left then): what it made is written down marked, so a page
+      // left before its DELETE is answered has the next load send it again.
+      const { name, size } = it.file
+      const line: SavedFile = { name, size, head: it.head ?? null, done: false, ...e.att, removing: true }
+      const session = lines(s, (l) => [...l, line])
+      // Its Remove still waits for its turn (another DELETE is out): that turn sends the DELETE.
+      if (it.step === 'creating') return { ...setItem(s, it.key, { att: e.att }), session }
+      // Its Remove's turn came already: the attachment is deleted at once, under a new generation.
       const by: DeleteBy = { k: 'remove', key: it.key, gen: it.gen + 1 }
       fx.push({ t: 'delete', id: e.att.attachmentId, token: s.session.reportToken, epoch: s.epoch, by })
       return { ...setItem(s, it.key, { att: e.att, gen: by.gen }), session }
     }
     case 'confirmed': {
       const it = live(s, e)
-      return it?.step === 'uploading' ? setItem(s, it.key, { confirmed: e.bytes }) : s
+      return it && going(it.step) && !queued(s, it.key) ? setItem(s, it.key, { confirmed: e.bytes }) : s
+    }
+    case 'stage': {
+      // Where the uploader is now (uploading, completing, paused): only an upload still going, never a removed file's.
+      const it = live(s, e)
+      if (!it || !going(it.step) || it.step === e.stage || queued(s, it.key)) return s
+      return setItem(s, it.key, { step: e.stage })
     }
     case 'uploaded': {
       const it = live(s, e)
-      if (it?.step !== 'uploading' || !it.att) return s
+      // A file whose Remove was pressed is not completed into the report, whatever the server answered.
+      if (!it || !going(it.step) || !it.att || queued(s, it.key)) return s
       const sent = it.att.attachmentId
       const session = lines(s, (l) => l.map((x) => (x.attachmentId === sent ? { ...x, done: true } : x)))
       return { ...setItem(s, it.key, { step: 'done', confirmed: it.file.size }), session }
@@ -242,9 +287,11 @@ function apply(s: State, e: Event, fx: Effect[]): State {
     case 'failed': {
       const it = live(s, e)
       if (!it) return s
+      const removed = it.step === 'removing' || queued(s, it.key)
       // A create failed for a file removed meanwhile: nothing holds a place on the server, it just leaves.
-      if (it.step === 'removing' && !it.att) return leave(s, it, fx)
-      if (it.step !== 'creating' && it.step !== 'uploading') return s
+      if (removed && !it.att) return leave(s, it, fx)
+      // The upload of a removed file answers its abort here: its Remove's DELETE settles it.
+      if (removed || (it.step !== 'creating' && !going(it.step))) return s
       // The Send ends here: the file shows why, and Try again (or Remove) is the player's.
       const failed = setItem(s, it.key, { step: 'failed', why: e.why ?? undefined })
       return { ...failed, send: null, phase: e.why ? 'idle' : 'error' }
@@ -252,6 +299,15 @@ function apply(s: State, e: Event, fx: Effect[]): State {
     case 'deleted':
       return deleted(s, e, fx)
   }
+}
+
+// The create of a removed file answered after the page was left or reset: what it made is deleted, and only that
+// (the DELETE's answer is of an old epoch, so it changes nothing). Any other answer of an old epoch is dropped.
+function leftCreated(s: State, e: Extract<Event, { t: 'created' }>, fx: Effect[]): State {
+  const o = s.left.find((x) => x.key === e.key && x.gen === e.gen && x.epoch === e.epoch)
+  if (!o) return s
+  fx.push({ t: 'delete', id: e.att.attachmentId, token: o.token, epoch: o.epoch, by: { k: 'left' } })
+  return { ...s, left: s.left.filter((x) => x !== o) }
 }
 
 function deleted(s: State, e: Extract<Event, { t: 'deleted' }>, fx: Effect[]): State {
@@ -393,13 +449,15 @@ function drop(s: State, key: string, fx: Effect[]): State {
   const it = s.items.find((x) => x.key === key)
   if (!it || it.step === 'done') return s
   const n = { ...s, send: s.send && { ...s.send, keys: s.send.keys && s.send.keys.filter((k) => k !== key) } }
-  if (it.step === 'creating') return setItem(n, key, { step: 'removing' })
+  // Its create is out: the answer is awaited (created, failed). One that answered while this Remove waited has its
+  // attachment already, deleted below.
+  if (it.step === 'creating' && !it.att) return setItem(n, key, { step: 'removing' })
   if (!it.att || !n.session) return leave(n, it, fx)
   // Its attachment holds one of the 3 places: the file leaves only once the server let it go. The line is marked
-  // first, so a page left before the answer has the next load finish the removal.
+  // first, so a page left before the answer has the next load finish the removal. Its upload was stopped when Remove
+  // was pressed, and nothing started it again since (no upload starts while a Remove is queued).
   const id = it.att.attachmentId
   const gen = it.gen + 1
-  if (it.step === 'uploading') fx.push({ t: 'abort', key })
   fx.push({ t: 'delete', id, token: n.session.reportToken, epoch: n.epoch, by: { k: 'remove', key, gen } })
   const session = lines(n, (l) => l.map((f) => (f.attachmentId === id ? { ...f, removing: true } : f)))
   return { ...setItem(n, key, { step: 'removing', gen }), session }
@@ -409,7 +467,7 @@ function run(s: State, fx: Effect[]): State {
   if (!s.send || s.jobs.length > 0 || removing(s)) return s
   const n = s.send.keys === null ? begin(s, s.send) : s
   const send = n.send
-  if (!send || n.items.some((x) => x.step === 'creating' || x.step === 'uploading')) return n
+  if (!send || n.items.some((x) => x.step === 'creating' || going(x.step))) return n
   const next = n.items.find((x) => x.step === 'picked' && send.keys?.includes(x.key))
   if (next) {
     const t = { key: next.key, gen: next.gen, epoch: n.epoch }

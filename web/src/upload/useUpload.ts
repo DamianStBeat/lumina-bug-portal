@@ -2,7 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from 'react'
 import { ApiError, createAttachment, deleteAttachment } from '../api/client'
 import { clearSession, loadSession, saveSession, type Session } from './session'
 import { retryable, uploadFile } from './uploader'
-import { initial, reduce, resumeOf, unremoved, viewState, type Effect, type Event, type Item, type Refusal, type State } from './queue'
+import { initial, reduce, resumeOf, unremoved, viewState, type Effect, type Event, type Item, type Refusal, type Stage, type State } from './queue'
 import type { Rejection } from './validate'
 
 // The hook only dispatches the player's actions and the answers of the requests it ran to the queue (queue.ts), and
@@ -53,7 +53,7 @@ const SERVER_REFUSAL: Record<string, Rejection> = {
 }
 // null: Try again can work (the network, the server, parts the server lost). Anything else is a refusal. A network
 // lost for good arrives here as status 0 'network' after uploader.ts waited for 'online' and spent its retries: the
-// file fails with no reason, the phase is 'error' and Try again carries on (the queue has no paused state).
+// file fails with no reason, the phase is 'error' and Try again carries on (paused is only the wait before that).
 function refusalOf(e: unknown): Refusal | null {
   if (!(e instanceof ApiError)) return 'other'
   // Status 0 is also the uploader's own 'bad_parts' (the file does not fit the server's parts): not the network.
@@ -114,7 +114,8 @@ function machine(boot: Session | null) {
       case 'upload': {
         const ac = controller(f.key)
         const onConfirmed = (bytes: number) => dispatch({ t: 'confirmed', ...ticket(f), bytes })
-        uploadFile({ file: f.file, ...f.att, token: f.token, signal: ac.signal, onConfirmed }).then(
+        const onStage = (stage: Stage) => dispatch({ t: 'stage', ...ticket(f), stage })
+        uploadFile({ file: f.file, ...f.att, token: f.token, signal: ac.signal, onConfirmed, onStage }).then(
           () => {
             release(f.key, ac)
             dispatch({ t: 'uploaded', ...ticket(f) })
@@ -131,8 +132,12 @@ function machine(boot: Session | null) {
         ctl.delete(f.key)
         return
       case 'stop':
-        ctl.forEach((ac) => ac.abort())
-        ctl.clear()
+        // `keep`: creates of removed files, let answer so the queue can delete what they made.
+        ctl.forEach((ac, key) => {
+          if (f.keep?.includes(key)) return
+          ac.abort()
+          ctl.delete(key)
+        })
         return
       case 'delete':
         void gone(f.id, f.token).then((g) => dispatch({ t: 'deleted', id: f.id, epoch: f.epoch, by: f.by, gone: g }))
@@ -246,7 +251,8 @@ export function useUpload(only?: string) {
   const { s, files } = useSyncExternalStore(m.watch, m.get)
 
   // The load sends again the DELETE of a Remove the last visit never saw answered; leaving the page stops every
-  // create and upload, and moves the epoch so nothing answered afterwards writes state or storage.
+  // create and upload (but a removed file's create, whose attachment is then deleted), and moves the epoch so nothing
+  // answered afterwards writes state or storage.
   useEffect(() => {
     m.dispatch({ t: 'mount' })
     return () => m.dispatch({ t: 'closed' })

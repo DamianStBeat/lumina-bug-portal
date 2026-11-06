@@ -17,6 +17,10 @@ export type UploadOptions = {
   signal?: AbortSignal
   // Bytes the server has answered 200 for, never bytes merely sent: a bar that lies at 99 % is worse than a slow one.
   onConfirmed(bytesConfirmed: number): void
+  // Where the upload is, told when it changes: 'completing' while a complete is out (every part confirmed), 'paused'
+  // while the network is lost, then where it was. Only reported: the queue (queue.ts) decides what it means, and the
+  // retries and their limit are the same either way.
+  onStage?(stage: 'uploading' | 'completing' | 'paused'): void
 }
 
 // Network, timeouts, rate limits and server errors can pass; any other 4xx will answer the same way next time.
@@ -62,8 +66,27 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
   // Losing the network cancels the parts in flight at once instead of waiting for the browser to time out; each
   // then waits in its backoff for 'online'.
   const inFlight = new Set<AbortController>()
-  const onOffline = () => inFlight.forEach((c) => c.abort())
-  if (hasWindow) window.addEventListener('offline', onOffline)
+  let stage: 'uploading' | 'completing' = 'uploading'
+  let paused = false
+  const tell = (next: 'uploading' | 'completing') => {
+    stage = next
+    if (!paused) o.onStage?.(next)
+  }
+  const onOffline = () => {
+    inFlight.forEach((c) => c.abort())
+    if (paused) return
+    paused = true
+    o.onStage?.('paused')
+  }
+  const onOnline = () => {
+    if (!paused) return
+    paused = false
+    o.onStage?.(stage)
+  }
+  if (hasWindow) {
+    window.addEventListener('offline', onOffline)
+    window.addEventListener('online', onOnline)
+  }
 
   const confirmed = new Map<number, number>()
   const report = () => {
@@ -140,18 +163,24 @@ export async function uploadFile(o: UploadOptions): Promise<void> {
     await readServer()
     await sendParts(unconfirmed())
     halt()
+    tell('completing')
     const first = await attempt((signal) => completeAttachment(id, token, signal))
     if (!first.missing) return
     // The server knows better than our map: forget what it says is missing, and ask it when it gave no list.
+    tell('uploading')
     first.missing.forEach((n) => confirmed.delete(n))
     if (first.missing.length === 0) await readServer()
     else report()
     await sendParts(unconfirmed())
     halt()
+    tell('completing')
     const second = await attempt((signal) => completeAttachment(id, token, signal))
     if (second.missing) throw new ApiError(409, 'missing_parts')
   } finally {
     o.signal?.removeEventListener('abort', onStop)
-    if (hasWindow) window.removeEventListener('offline', onOffline)
+    if (hasWindow) {
+      window.removeEventListener('offline', onOffline)
+      window.removeEventListener('online', onOnline)
+    }
   }
 }
