@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode, type Ref } from 'react'
 import { ApiError, deskReport, deskSetStatus, deskStreamUrl } from '../../api/client'
-import type { DeskReport, DeskReportRow, DeskTriage, Verdict } from '../../api/types'
+import type { DeskReport, DeskReportRow, Verdict } from '../../api/types'
 import { Icon } from '../../components/Icons'
-import { githubPr } from './ReportList'
+import { githubPr, VERDICT } from './ReportList'
 
 // Cloudflare Access sits in front of /desk; a 401/403 means the session is missing, never "no reports".
 export const isDenied = (e: unknown) => e instanceof ApiError && (e.status === 401 || e.status === 403)
@@ -26,46 +26,57 @@ function spans(s: string): ReactNode[] {
 const record = (v: unknown): Record<string, unknown> | undefined =>
   typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined
 
-// The list's words for each verdict (ReportList VERDICT), so the panel says what the row says.
-const VERDICT: Record<Verdict, string> = {
-  simple_fix: 'Simple fix',
-  needs_person: 'Needs a person',
-  duplicate: 'Duplicate',
-  not_bug: 'Not a bug',
-  unclear: 'Unclear',
-}
-
-// `path:line` then why: line 0 is a line, a null line leaves the path alone, an item without a text path is dropped.
-function likelyFiles(v: unknown): ReactNode[] {
-  return (Array.isArray(v) ? v : []).flatMap((item) => {
+// `path:line` then why, with the text the part ends on: line 0 is a line, a null line leaves the path alone, an item
+// without a text path is dropped.
+type Part = [node: ReactNode, end: string]
+function likelyFiles(v: unknown): Part[] {
+  return (Array.isArray(v) ? v : []).flatMap((item): Part[] => {
     const f = record(item)
     const path = text(f?.path)
     if (!f || !path) return []
     const at = typeof f.line === 'number' && Number.isInteger(f.line) && f.line >= 0 ? `:${f.line}` : ''
     const why = text(f.why)
-    return [<><code>{path + at}</code>{why && <> {spans(why)}</>}</>]
+    return [[<><code>{path + at}</code>{why && <> {spans(why)}</>}</>, why ?? path + at]]
   })
 }
 
-// The verdict is the report's and has no label in the preview's panel: when the agent failed or the triage was too
-// large for the worker both stages are null, but the AI did read the report.
-function lines(verdict: unknown, t: DeskTriage | undefined): [string | null, ReactNode][] {
-  const a = record(t?.stage_a)
-  const b = record(t?.stage_b)
+// "; " between the parts of the cause, or only a space after a part that already ends in punctuation: the agent's
+// own full stop is kept as written and never reads as `.;`.
+function joined(parts: Part[]): ReactNode[] {
+  return parts.map(([node], i) => {
+    const before = i > 0 ? parts[i - 1]?.[1] : undefined
+    const sep = before === undefined ? null : /[.;,:!?]\s*$/.test(before) ? ' ' : '; '
+    return <span key={i}>{sep}{node}</span>
+  })
+}
+
+// The preview's rows, in its order. The verdict is the report's and the list already shows it as a chip, so it is a
+// line only when no stage has a row: the agent failed or the triage was too large for the worker (both stages
+// null), yet the AI did read the report. "none" is said only for a real empty `risk_paths`; a wrong type is unknown.
+function lines(r: DeskReport): [string | null, ReactNode][] {
+  const a = record(r.triage?.stage_a)
+  const b = record(r.triage?.stage_b)
   const what = text(a?.what)
   const cause = text(b?.summary)
-  const why = [...(cause ? [spans(cause)] : []), ...likelyFiles(b?.likely_files)]
-  const risks = Array.isArray(b?.risk_paths) ? b.risk_paths.map(text).filter((s) => s !== undefined) : []
+  const why = [...(cause ? [[spans(cause), cause] as Part] : []), ...likelyFiles(b?.likely_files)]
+  const listed = Array.isArray(b?.risk_paths) ? (b.risk_paths as unknown[]) : undefined
+  const risks = listed?.map(text).filter((s) => s !== undefined) ?? []
+  // The codes the worker links to this report are the same bug as the one the agent named; only with a stage.
+  const linked = b || a ? (r.duplicates as unknown[]).map(text) : []
+  const same = [...new Set([text(b?.duplicate_of), ...linked])].filter((c) => c !== undefined)
   const fix = b?.fix_size
-  const all: [string | null, ReactNode | undefined][] = [
-    [null, typeof verdict === 'string' && Object.hasOwn(VERDICT, verdict) ? VERDICT[verdict as Verdict] : undefined],
+  const all: [string, ReactNode | undefined][] = [
     ['What it is', what && spans(what)],
-    ['Likely cause', why.length ? why.map((n, i) => <span key={i}>{i > 0 && '; '}{n}</span>) : undefined],
-    ['Risk path', risks.length ? risks.join(', ') : undefined],
-    ['Same bug', text(b?.duplicate_of)],
+    ['Likely cause', why.length ? joined(why) : undefined],
+    ['Risk path', listed?.length === 0 ? 'none' : risks.length ? risks.join(', ') : undefined],
+    ['Same bug', same.length ? same.join(', ') : undefined],
     ['Fix', typeof fix === 'string' && ['small', 'medium', 'large', 'unknown'].includes(fix) ? fix : undefined],
   ]
-  return all.filter((l): l is [string | null, ReactNode] => l[1] !== undefined)
+  const shown = all.filter((l): l is [string, ReactNode] => l[1] !== undefined)
+  if (shown.length) return shown
+  const verdict: unknown = r.verdict
+  const label = typeof verdict === 'string' && Object.hasOwn(VERDICT, verdict) ? VERDICT[verdict as Verdict][1] : null
+  return label ? [[null, label]] : []
 }
 
 function clock(secs: number): string {
@@ -153,7 +164,7 @@ export function ReportDetail({ ref, code, onDenied, onChanged }: Props) {
   // Nothing to play yet is not the same as nothing sent: a file still arriving says so.
   const pending = r.attachments.some((a) => a.status === 'uploading' && (a.kind === 'video' || a.kind === 'image'))
   const frames = r.frames.filter((a) => a.status === 'complete')
-  const ai = lines(r.verdict, r.triage)
+  const ai = lines(r)
   const pr = githubPr(r.prUrl)
   const secs = media && dur?.id === media.id ? dur.secs : undefined
 

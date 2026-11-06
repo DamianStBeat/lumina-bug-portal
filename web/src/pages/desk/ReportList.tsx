@@ -18,7 +18,8 @@ const WHERE: Record<string, string> = {
   other: 'Other',
 }
 const DEVICE: Record<string, string> = { phone: 'Phone', tablet: 'Tablet', computer: 'Computer', console: 'Console' }
-const VERDICT: Record<Verdict, [string, string]> = {
+// The chip class and the words of each verdict; the detail's AI panel reads the same words, so both say one thing.
+export const VERDICT: Record<Verdict, [string, string]> = {
   simple_fix: ['t-fix', 'Simple fix'],
   needs_person: ['t-human', 'Needs a person'],
   duplicate: ['t-dup', 'Duplicate'],

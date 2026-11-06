@@ -49,6 +49,9 @@ type State = {
 type SeedFile = [kind: AttachmentKind, filename: string, mime: string, sizeBytes: number]
 type Seed = [ageMin: number, report: Omit<Report, 'createdAt' | 'updatedAt' | 'source'>, files: SeedFile[]]
 const TOP = 'LUM-482193'
+// The preview's second "Same bug" code for TOP (index.html:313): an older report linked to it as a duplicate, which
+// the preview's five list rows do not include, so the mock adds it only to TOP's `duplicates`.
+const OLDER_LINKS: Record<string, string[]> = { [TOP]: ['LUM-479093'] }
 // A triage in the shape the agent posts it (agent/lumina_bug_agent/run.py post_triage): both stages answered.
 function triage(a: Pick<DeskStageA, 'what' | 'where' | 'device'>, b: Omit<DeskStageB, 'confidence'>): DeskTriage {
   const stageA: DeskStageA = {
@@ -61,7 +64,10 @@ const SEEDS: Seed[] = [
   [4, {
     code: TOP, status: 'looking', what: 'The boss stopped on the bridge and the wave never ended.', whereArea: 'match',
     device: 'phone', lang: 'en', verdict: 'simple_fix', prUrl: 'https://github.com/DamianStBeat/Lumina2/pull/1402',
-    triage: triage({ what: 'on the Bridge map the boss waits at the last waypoint', where: 'match', device: 'phone' }, {
+    triage: triage({
+      what: 'on the Bridge map the boss waits forever at the last waypoint (frame 4, 1:52).', where: 'match',
+      device: 'phone',
+    }, {
       verdict: 'simple_fix', summary: 'BossPath expects 9 waypoints; the Bridge path has 8.',
       likely_files: [{ path: 'src/server/Waves/BossPath.luau', line: 212, why: 'reads waypoint 9' }],
       risk_paths: [], duplicate_of: null, fix_size: 'small',
@@ -163,7 +169,10 @@ function detail(rec: Rec): DeskReportWire {
     },
     // Frames among the attachments, in creation order, as the worker lists them.
     attachments: [...state.atts.values()].filter((a) => a.code === r.code).map(wire),
-    duplicates: [...state.reports.values()].filter((d) => d.report.duplicateOf === r.code).map((d) => d.report.code),
+    duplicates: [
+      ...[...state.reports.values()].filter((d) => d.report.duplicateOf === r.code).map((d) => d.report.code),
+      ...(OLDER_LINKS[r.code] ?? []),
+    ],
   }
 }
 
