@@ -1,0 +1,57 @@
+/* Stage D: the team desk. The preview's .dash, .filters, .tag, .video, .frames and .ai rules live in app.css; these
+   are the parts a real list, player and narrow screen need. Loaded with the desk chunk only. */
+.desk header{flex-wrap:wrap}
+/* The desk's Cloudflare Access pill is a label, not a control: the preview's size, not the 56 px touch target. */
+.desk header .lang{min-height:0;padding:8px 14px}
+@media(max-width:1023px){.dash{grid-template-columns:minmax(0,1fr)}}
+@media(max-width:599px){.dash{padding:8px 16px 30px}.desk .detail{padding:16px}}
+.dash.one{grid-template-columns:minmax(0,720px);justify-content:center}
+.desk-line{color:var(--slate);font-size:14px;line-height:1.5;padding:10px 0}
+.desk-err{color:var(--setback)}
+.desk-link{color:var(--glow-blue);text-decoration:underline;padding:6px 2px}
+.desk .btn:disabled{opacity:.55;cursor:default}
+
+/* The list: a grid of row buttons instead of a <table>, so a row is one keyboard target and can fold into a card. */
+.desk-list{--cols:118px minmax(0,2.3fr) minmax(76px,.6fr) minmax(140px,1.15fr) minmax(0,.9fr);container-type:inline-size}
+.desk-th,.desk-row{display:grid;grid-template-columns:var(--cols)}
+.desk-th span{text-align:left;color:var(--slate);font-weight:600;font-size:12px;letter-spacing:.08em;text-transform:uppercase;padding:10px 12px;border-bottom:1px solid rgba(142,220,255,.14)}
+.desk-rows{list-style:none}
+.desk-row{width:100%;text-align:left;font-size:14px;line-height:1.3;border-bottom:1px solid rgba(142,220,255,.08)}
+.desk-row:hover{background:rgba(142,220,255,.05)}
+.desk-row.sel{background:rgba(215,154,43,.10)}
+.desk-row>span{padding:13px 12px;min-width:0;overflow-wrap:anywhere;color:var(--soft-white)}
+.desk-row .sub{display:block;color:var(--slate);font-size:12.5px;margin-top:3px}
+.desk-row .c-ai .sub{margin-top:6px}
+.desk-row .c-code{white-space:nowrap}
+.desk-more{margin-top:14px}
+
+/* Stacked rows: one card per report, below 820 px or when the list column itself is narrow (1024-1360 px). */
+@media(max-width:819px){
+  .desk-th{display:none}
+  .desk-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"code where" "what what" "ai status";border:1px solid rgba(142,220,255,.12);border-radius:14px;margin-bottom:10px;padding:4px 0}
+  .desk-row>span{padding:7px 14px}
+  .c-code{grid-area:code}.c-where{grid-area:where;text-align:right}.c-what{grid-area:what}.c-ai{grid-area:ai}.c-status{grid-area:status;text-align:right}
+}
+@container (max-width:660px){
+  .desk-th{display:none}
+  .desk-row{grid-template-columns:minmax(0,1fr) auto;grid-template-areas:"code where" "what what" "ai status";border:1px solid rgba(142,220,255,.12);border-radius:14px;margin-bottom:10px;padding:4px 0}
+  .desk-row>span{padding:7px 14px}
+  .c-code{grid-area:code}.c-where{grid-area:where;text-align:right}.c-what{grid-area:what}.c-ai{grid-area:ai}.c-status{grid-area:status;text-align:right}
+}
+
+/* The detail: a real player replaces the preview's picture, so its dark fade (which would cover the controls) goes. */
+.video.live{background:#000}
+.video.live::after{content:none}
+.video img{display:block;width:100%;height:100%;object-fit:contain}
+.desk-meta{color:var(--slate);font-size:13px;margin-top:8px;overflow-wrap:anywhere}
+.frames button{display:block;padding:0;min-width:0;border-radius:6px}
+@media(max-width:479px){.frames{grid-template-columns:repeat(3,1fr)}}
+/* Three frames across a 320 px phone are 50 px tall: two keep each one a 56 px finger target. */
+@media(max-width:379px){.frames{grid-template-columns:repeat(2,1fr)}}
+.ai{overflow-wrap:anywhere}
+.actions{flex-wrap:wrap}
+.actions>*{flex:1 1 160px}
+.actions a.btn{text-decoration:none}
+.desk-big{margin:auto;max-width:min(92vw,1100px);padding:14px;border-radius:var(--radius);border:1px solid rgba(255,255,255,.14);background:var(--midnight);color:var(--soft-white)}
+.desk-big::backdrop{background:rgba(3,8,18,.82)}
+.desk-big img{display:block;max-width:100%;max-height:78vh;border-radius:10px;margin:0 auto 12px}

@@ -1,0 +1,25 @@
+import js from '@eslint/js'
+import globals from 'globals'
+import reactHooks from 'eslint-plugin-react-hooks'
+import tseslint from 'typescript-eslint'
+import { defineConfig } from 'eslint/config'
+
+export default defineConfig([
+  { ignores: ['dist', 'node_modules'] },
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [js.configs.recommended, ...tseslint.configs.recommended, reactHooks.configs.flat.recommended],
+    languageOptions: { ecmaVersion: 2022, globals: globals.browser },
+  },
+  {
+    files: ['eslint.config.js'],
+    extends: [js.configs.recommended],
+    languageOptions: { ecmaVersion: 2022, sourceType: 'module', globals: globals.node },
+  },
+  {
+    // dev/shots.mjs runs in Node, and hands some functions to the page, where the browser globals exist.
+    files: ['dev/**/*.mjs'],
+    extends: [js.configs.recommended],
+    languageOptions: { ecmaVersion: 2024, sourceType: 'module', globals: { ...globals.node, ...globals.browser } },
+  },
+])
