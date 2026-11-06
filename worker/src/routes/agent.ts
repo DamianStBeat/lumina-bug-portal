@@ -203,14 +203,20 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
       guardedEvent(env, report.id, "triaged", JSON.stringify({ verdict }), now, guard),
       guardedEvent(env, report.id, "duplicate_linked", linked, now, guard),
       // Each report re-pointed below gets the event the bot posts "Same bug" from, as this one does: the same data
-      // string, written before the UPDATE moves them and while they still point here.
+      // string, written before the UPDATE moves them and while they still point here. Same row set as the UPDATE.
       env.DB.prepare(
-        `INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'duplicate_linked', ? FROM reports WHERE duplicate_of = ? AND ${guard.sql}`,
-      ).bind(now, linked, code, ...guard.binds),
+        `INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'duplicate_linked', ? FROM reports
+         WHERE status = 'duplicate' AND duplicate_of = ? AND code <> ? AND ${guard.sql}`,
+      ).bind(now, linked, code, duplicateOf, ...guard.binds),
       // Reports already linked to this one were linked while it was an original; now that it points at a root, they
       // point there too. Storing the root covers links made later, this covers the ones made earlier, so every chain
       // stays one hop whatever order the links are made in, and the read guard's depth limit is never reached.
-      env.DB.prepare(`UPDATE reports SET duplicate_of = ? WHERE duplicate_of = ? AND ${guard.sql}`).bind(duplicateOf, code, ...guard.binds),
+      // Only rows still in `duplicate` move: a report a person un-duplicated keeps its stored duplicate_of, untouched.
+      // The root itself is never one of them: it may still point here from before a person un-duplicated it, and
+      // moving it would link it to itself.
+      env.DB.prepare(
+        `UPDATE reports SET duplicate_of = ? WHERE status = 'duplicate' AND duplicate_of = ? AND code <> ? AND ${guard.sql}`,
+      ).bind(duplicateOf, code, duplicateOf, ...guard.binds),
     ]);
     if (updated!.meta.changes === 1) return json({ ok: true });
     if (attempt === 2) {
