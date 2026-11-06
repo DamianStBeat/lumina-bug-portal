@@ -338,6 +338,9 @@ export class FakeServer {
         this.completes.set(a.id, k)
         this.beforeComplete(a, k)
         if (a.status === 'complete') return json(200, { ok: true })
+        // An aborted (DELETEd) attachment is never brought back: the worker on main answers before it looks at the
+        // parts, worker/src/routes/uploads.ts:139 `if (a.status !== "uploading") throw new HttpError(409, "not_uploading");`
+        if (a.status !== 'uploading') return fail(409, 'not_uploading')
         const missing: number[] = []
         for (let n = 1; n <= a.partCount; n++) if (!a.parts.has(n)) missing.push(n)
         if (missing.length) return fail(409, 'missing_parts', { missing })
