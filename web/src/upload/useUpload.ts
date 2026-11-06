@@ -23,8 +23,12 @@ export type Target = { code: string; reportToken: string }
 type Resume = { code: string; missing: { name: string; size: number }[] }
 type Att = { attachmentId: string; partSize: number; partCount: number }
 // The File and its attachment stay out of React state: the upload loop reads and replaces them across awaits.
-type Entry = Omit<FileItem, 'name' | 'size'> & { file: File; att?: Att }
-type Ident = { name: string; size: number; lastModified: number }
+// `head` (session.ts): undefined while the pick is still being hashed ("not yet", never a match), null when the
+// browser could not hash it.
+type Entry = Omit<FileItem, 'name' | 'size'> & { file: File; att?: Att; head?: string | null }
+type Ident = { name: string; size: number; head: string | null }
+// What the identity reads from the start of a file: enough to tell two exports apart, little enough for a phone.
+const HEAD_BYTES = 1024 * 1024
 
 let seq = 0
 
@@ -39,20 +43,40 @@ const view = (e: Entry): FileItem => ({
   previewUrl: e.previewUrl,
 })
 
-// The browser gives a re-picked file no other identity; the same three values also find its saved line.
-const sameFile = (a: Ident, b: Ident) => a.name === b.name && a.size === b.size && a.lastModified === b.lastModified
+// A re-picked file is the same one when name, size and the hash of its first 1 MiB match; the same three values find
+// its saved line. lastModified does not decide: iPhone Photos gives the same video a new one on every export. Two
+// files the browser could not hash (head null on both) fall back to name and size, all it gives then.
+const sameFile = (a: Ident | null, b: Ident) => a !== null && a.name === b.name && a.size === b.size && a.head === b.head
+const idOf = (e: Entry): Ident | null => (e.head === undefined ? null : { name: e.file.name, size: e.file.size, head: e.head })
+// Name and size alone: two such files may be the same one, which only their hashes can tell.
+const twins = (a: { name: string; size: number }, b: { name: string; size: number }) => a.name === b.name && a.size === b.size
+
+// The SHA-256 (hex) of the first 1 MiB. A file the browser cannot read or hash gets null, not a failed pick: it can
+// still be sent, it is only known again by name and size.
+async function hashHead(f: File): Promise<string | null> {
+  try {
+    const d = await crypto.subtle.digest('SHA-256', await f.slice(0, HEAD_BYTES).arrayBuffer())
+    return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('')
+  } catch {
+    return null
+  }
+}
 const attOf = (f: SavedFile): Att | undefined =>
   f.attachmentId === null ? undefined : { attachmentId: f.attachmentId, partSize: f.partSize, partCount: f.partCount }
-// A line the player removed whose DELETE is not answered yet (session.ts): no longer one of the report's files.
+// A line the player removed whose DELETE is not answered yet (session.ts): no longer one of the report's files, but
+// still holding its place (heldBy).
 const marked = (f: SavedFile): boolean => f.attachmentId !== null && f.removing === true
 const unmark = (f: SavedFile): SavedFile => {
   if (f.attachmentId === null) return f
-  const { name, size, lastModified, done, attachmentId, partSize, partCount } = f
-  return { name, size, lastModified, done, attachmentId, partSize, partCount }
+  const { name, size, head, done, attachmentId, partSize, partCount } = f
+  return { name, size, head, done, attachmentId, partSize, partCount }
 }
 // The saved line of a listed file: by its attachment once it has one, since a removed line may share its name.
 const lineOf = (e: Entry) => (f: SavedFile) =>
-  e.att ? f.attachmentId === e.att.attachmentId : !marked(f) && sameFile(f, e.file)
+  e.att ? f.attachmentId === e.att.attachmentId : !marked(f) && sameFile(idOf(e), f)
+// Saved lines no listed file stands for. Each holds a place on the server, so it counts against the 3: an open file
+// not picked again, and a removed one until its DELETE is answered, as the server still counts its attachment.
+const heldBy = (s: Session | null, list: Entry[]) => (s ? s.files.filter((f) => !list.some((e) => lineOf(e)(f))).length : 0)
 
 const SERVER_REFUSAL: Record<string, Rejection> = {
   invalid_mime: 'type',
@@ -73,7 +97,7 @@ function resumeOf(s: Session | null, list: Entry[]): Resume | null {
   const open = s ? s.files.filter((f) => !f.done && !marked(f)) : []
   if (!s || open.length === 0) return null
   const missing = open
-    .filter((f) => !list.some((e) => sameFile(e.file, f)))
+    .filter((f) => !list.some((e) => sameFile(idOf(e), f)))
     .map(({ name, size }) => ({ name, size }))
   return { code: s.code, missing }
 }
@@ -102,6 +126,10 @@ export function useUpload(only?: string) {
   const [unremoved, setUnremoved] = useState(false)
   // Attachments whose removal the server confirmed after the run that holds an older copy of the session began.
   const dropped = useRef(new Set<string>())
+  // Picks waiting for their hashes, one after the other, so they are decided in the order they were made. start()
+  // and removeFile() wait for it; `waiting` counts the picks queued whole, which every later pick must wait behind.
+  const queue = useRef<Promise<void>>(Promise.resolve())
+  const waiting = useRef(0)
 
   const sync = useCallback(() => setFiles(entries.current.map(view)), [])
   const store = useCallback((s: Session | null) => {
@@ -170,37 +198,123 @@ export function useUpload(only?: string) {
     return () => epoch.current === at
   }, [])
 
-  const addFiles = useCallback(
-    (picked: File[]) => {
-      if (run.current) return
+  // Runs `job` after every pick queued before it. A job does not throw (hashHead turns a failure into null); if one
+  // ever did, its rejection is left unhandled, so the browser reports it, and the queue still goes on.
+  const enqueue = useCallback((job: () => Promise<void>): Promise<void> => {
+    const p = queue.current.then(job)
+    queue.current = p.then(
+      () => undefined,
+      () => undefined,
+    )
+    return p
+  }, [])
+
+  // A pick whose files are hashed: a file already listed is dropped, a saved one is bound to its line (it already
+  // holds its place), the rest count against the 3. Files keep the order they were picked in. True when the pick
+  // brought back a saved file and none is missing any more.
+  const decide = useCallback(
+    (got: { file: File; head: string | null }[]): boolean => {
       const s = saved.current
-      const known: Entry[] = []
-      const fresh: File[] = []
-      for (const f of picked) {
+      let list = entries.current
+      let count = list.length + heldBy(s, list)
+      let why: Rejection | null = null
+      let back = false
+      for (const { file: f, head } of got) {
+        const id: Ident = { name: f.name, size: f.size, head }
         // The same file twice would upload twice and spend one of the 3 places.
-        if ([...entries.current, ...known].some((e) => sameFile(f, e.file))) continue
+        if (list.some((e) => sameFile(idOf(e), id))) continue
         // A removed line is not this file's any more: picked again, it is a new file with a new attachment.
-        const m = s?.files.find((sf) => !marked(sf) && sameFile(f, sf))
-        if (!m) {
-          fresh.push(f)
+        const m = s?.files.find((sf) => !marked(sf) && sameFile(id, sf))
+        if (m) {
+          list = [...list, entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, attOf(m), head)]
+          back ||= !m.done
           continue
         }
-        known.push(entry(f, m.done ? 'done' : 'waiting', m.done ? f.size : 0, attOf(m)))
+        const v = validatePick(count, [f])
+        why ??= v.rejection
+        if (v.ok.length === 0) continue
+        list = [...list, entry(f, 'waiting', 0, undefined, head)]
+        count++
       }
-      const list = [...entries.current, ...known]
-      // Saved files not picked again hold a place on the server (or will on resume), so they count against the 3.
-      const held = s ? s.files.filter((sf) => !marked(sf) && !list.some((e) => sameFile(e.file, sf))).length : 0
-      const { ok, rejection: why } = validatePick(list.length + held, fresh)
       setRejection(why)
-      entries.current = [...list, ...ok.map((f) => entry(f, 'waiting', 0))]
+      entries.current = list
       sync()
-      setResume(resumeOf(s, entries.current))
+      const r = resumeOf(s, list)
+      setResume(r)
+      return back && r !== null && r.missing.length === 0
     },
     [sync],
   )
 
+  // `onBack`: called when the pick turns out to bring back the last saved file still missing, which after a reload is
+  // the whole action (FilePicker then starts the upload). Returns nothing on purpose: a pick whose outcome no hash
+  // can change is listed within this call, so the page (and React's act) sees the list at once, and only the binding
+  // to a saved line waits for the hash; any other pick is listed once hashed, in the order the picks were made.
+  const addFiles = useCallback(
+    (picked: File[], onBack?: () => void) => {
+      if (run.current) return
+      const at = epoch.current
+      const s = saved.current
+      const list = entries.current
+      // Name and size alike may be the same file: listing or dropping it needs the hashes.
+      const twinned = picked.some((f, i) => list.some((e) => twins(e.file, f)) || picked.slice(0, i).some((g) => twins(g, f)))
+      // Saved lines this pick, or a listed file not hashed yet, may turn out to stand for (each frees a place then).
+      const unhashed = [...picked, ...list.filter((e) => e.head === undefined).map((e) => e.file)]
+      const maybe = s
+        ? s.files.filter((f) => !marked(f) && !list.some((e) => lineOf(e)(f)) && unhashed.some((x) => twins(x, f))).length
+        : 0
+      const held = heldBy(s, list)
+      const worst = validatePick(list.length + held, picked)
+      const best = validatePick(list.length + held - maybe, picked)
+      if (waiting.current > 0 || twinned || worst.ok.length !== best.ok.length || worst.rejection !== best.rejection) {
+        waiting.current++
+        void enqueue(async () => {
+          try {
+            const got = await Promise.all(picked.map(async (file) => ({ file, head: await hashHead(file) })))
+            // reset() or unmount came first: the list is no longer this pick's to change.
+            if (epoch.current === at && decide(got)) onBack?.()
+          } finally {
+            waiting.current--
+          }
+        })
+        return
+      }
+      setRejection(worst.rejection)
+      const added = worst.ok.map((f) => entry(f, 'waiting', 0))
+      entries.current = [...list, ...added]
+      sync()
+      setResume(resumeOf(s, entries.current))
+      if (added.length === 0) return
+      // Each file is hashed once, now; its head goes into its saved line, and a saved file is bound to its line.
+      const hashed = Promise.all(added.map(async (e) => ({ key: e.key, head: await hashHead(e.file) })))
+      void enqueue(async () => {
+        const got = await hashed
+        if (epoch.current !== at) return
+        const now = saved.current
+        let back = false
+        entries.current = entries.current.map((e) => {
+          const head = got.find((g) => g.key === e.key)?.head
+          if (head === undefined) return e
+          // A removed line is not this file's any more: picked again, it is a new file with a new attachment.
+          const m = now?.files.find((f) => !marked(f) && sameFile({ name: e.file.name, size: e.file.size, head }, f))
+          if (!m) return { ...e, head }
+          back ||= !m.done
+          return { ...e, head, state: m.done ? 'done' : 'waiting', confirmed: m.done ? e.file.size : 0, att: attOf(m) }
+        })
+        sync()
+        const r = resumeOf(now, entries.current)
+        setResume(r)
+        if (back && r !== null && r.missing.length === 0) onBack?.()
+      })
+    },
+    [sync, enqueue, decide],
+  )
+
   const removeFile = useCallback(
     async (key: string): Promise<void> => {
+      if (run.current || !entries.current.some((x) => x.key === key)) return
+      // A file still being hashed may turn out to be a saved one with an attachment: Remove then has a DELETE to send.
+      await queue.current
       const e = entries.current.find((x) => x.key === key)
       if (!e || run.current || e.state === 'done') return
       const before = saved.current
@@ -246,38 +360,45 @@ export function useUpload(only?: string) {
     async (t?: Target): Promise<boolean> => {
       // A refused file would be refused again: it has to be removed first.
       if (run.current || entries.current.some((e) => e.state === 'refused')) return false
-      const prev = saved.current
-      const tgt = t ?? target.current ?? (prev ? { code: prev.code, reportToken: prev.reportToken } : null)
+      const tgt = t ?? target.current ?? (saved.current ? { code: saved.current.code, reportToken: saved.current.reportToken } : null)
       if (!tgt) return false
-      // Attachments bound to another report's session cannot be reused for this one.
-      const same = prev?.code === tgt.code
-      entries.current = entries.current.map((e) =>
-        !same ? { ...e, att: undefined, state: 'waiting', confirmed: 0 } : e.state === 'done' ? e : { ...e, state: 'waiting' },
-      )
-      // Every file is written down before its attachment is asked for, so a reload from here on resumes this report.
-      // A listed file whose delete failed goes up with the rest, so its line is no longer marked; a line removed
-      // from the list stays marked for its DELETE (sent again on the next load) and is not part of this upload.
-      const kept = same
-        ? prev.files.map((f) => (marked(f) && entries.current.some((e) => e.att && lineOf(e)(f)) ? unmark(f) : f))
-        : []
-      const added = entries.current
-        .filter((e) => !kept.some((f) => !marked(f) && sameFile(f, e.file)))
-        .map(({ file: f }): SavedFile => ({ name: f.name, size: f.size, lastModified: f.lastModified, done: false, attachmentId: null }))
-      let s: Session = { v: 2, code: tgt.code, reportToken: tgt.reportToken, files: [...kept, ...added] }
-      target.current = tgt
-      store(s)
       const ac = new AbortController()
       // After reset() or unmount nothing may be written: no storage, no state.
       const live = () => !ac.signal.aborted
+      // Set before the wait below, so no pick, Remove or second Send slips in while the last picks are hashed.
       run.current = ac
-      setPhase('uploading')
-      // The file whose delete failed goes up with the rest: it is no longer a file waiting to be removed.
-      setUnremoved(false)
-      sync()
       let current: string | null = null
       try {
+        // Resume or new is decided on what the picked files are: the picks still being hashed are settled first.
+        await queue.current
+        if (!live()) return false
+        const prev = saved.current
+        // Attachments bound to another report's session cannot be reused for this one.
+        const same = prev?.code === tgt.code
+        entries.current = entries.current.map((e) =>
+          !same ? { ...e, att: undefined, state: 'waiting', confirmed: 0 } : e.state === 'done' ? e : { ...e, state: 'waiting' },
+        )
+        // Every file is written down before its attachment is asked for, so a reload from here on resumes this report.
+        // A listed file whose delete failed goes up with the rest, so its line is no longer marked; a line removed
+        // from the list stays marked for its DELETE (sent again on the next load) and is not part of this upload.
+        const kept = same
+          ? prev.files.map((f) => (marked(f) && entries.current.some((e) => e.att && lineOf(e)(f)) ? unmark(f) : f))
+          : []
+        // After the wait every listed file is hashed, so `?? null` never stands in for a head not known yet.
+        const added = entries.current
+          .filter((e) => !kept.some((f) => !marked(f) && sameFile(idOf(e), f)))
+          .map((e): SavedFile => ({ name: e.file.name, size: e.file.size, head: e.head ?? null, done: false, attachmentId: null }))
+        let s: Session = { v: 3, code: tgt.code, reportToken: tgt.reportToken, files: [...kept, ...added] }
+        target.current = tgt
+        store(s)
+        setPhase('uploading')
+        // The file whose delete failed goes up with the rest: it is no longer a file waiting to be removed.
+        setUnremoved(false)
+        sync()
         // Files go one after the other (see the pool note in uploader.ts); the list cannot change while `run` is set.
-        for (const { key, file: f, att: known } of entries.current.filter((e) => e.state !== 'done')) {
+        for (const e of entries.current.filter((x) => x.state !== 'done')) {
+          const { key, file: f, att: known } = e
+          const id = idOf(e)
           current = key
           let att = known
           if (!att) {
@@ -286,7 +407,7 @@ export function useUpload(only?: string) {
             if (!live()) return false
             const made: Att = { attachmentId: r.attachmentId, partSize: r.partSize, partCount: r.partCount }
             att = made
-            s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(x, f) ? { ...x, ...made } : x)) }
+            s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(id, x) ? { ...x, ...made } : x)) }
             patch(key, { att })
             store(s)
           }
@@ -301,7 +422,7 @@ export function useUpload(only?: string) {
             },
           })
           if (!live()) return false
-          s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(x, f) ? { ...x, done: true } : x)) }
+          s = { ...s, files: s.files.map((x) => (!marked(x) && sameFile(id, x) ? { ...x, done: true } : x)) }
           patch(key, { state: 'done', confirmed: f.size })
           store(s)
         }
@@ -372,7 +493,7 @@ export function useUpload(only?: string) {
   }
 }
 
-function entry(file: File, state: Entry['state'], confirmed: number, att?: Att): Entry {
+function entry(file: File, state: Entry['state'], confirmed: number, att?: Att, head?: string | null): Entry {
   const kind = file.type.startsWith('image/') ? 'image' : 'video'
   return {
     key: `f${++seq}`,
@@ -383,5 +504,6 @@ function entry(file: File, state: Entry['state'], confirmed: number, att?: Att):
     // Only pictures get a thumbnail; a video's object URL would pin a 2 GB file for nothing.
     previewUrl: kind === 'image' ? URL.createObjectURL(file) : undefined,
     att,
+    head,
   }
 }

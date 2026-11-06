@@ -150,8 +150,14 @@ export async function completeAttachment(
   return { ok: true, missing: Array.isArray(list) ? list.filter((n) => Number.isInteger(n)) : [] }
 }
 
-export function deleteAttachment(id: string, token: string): Promise<void> {
-  return callVoid(`/attachments/${seg(id)}`, { method: 'DELETE', token })
+// Only the contract's `{ ok: true }` means the attachment is gone. Any other 2xx (a proxy page, `{}`) is a bad gateway
+// (502): the caller keeps the file, its marked line and its place, since the server may still count the attachment.
+// 404 stays an ApiError the caller reads as "already gone".
+export async function deleteAttachment(id: string, token: string): Promise<void> {
+  const res = await send(`/attachments/${seg(id)}`, { method: 'DELETE', token })
+  const body = await readBody(res)
+  if (!res.ok) throw new ApiError(res.status, errorCode(res, body))
+  if ((body as { ok?: unknown } | null)?.ok !== true) throw new ApiError(502, 'bad_answer')
 }
 
 export function getStatus(code: string): Promise<StatusRes> {

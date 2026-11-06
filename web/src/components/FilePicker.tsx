@@ -25,12 +25,9 @@ export function FilePicker({ up, locked }: { up: Upload; locked: boolean }) {
 
   const take = (list: FileList | null) => {
     if (busy || !list || list.length === 0) return
-    const picked = Array.from(list)
-    const missing = up.resume?.missing ?? []
-    up.addFiles(picked)
     // After a reload, picking the last missing file is the whole action: the upload continues on the same report.
-    const allBack = missing.every((m) => picked.some((f) => f.name === m.name && f.size === m.size))
-    if (up.resume && missing.length > 0 && allBack) void up.start()
+    // Whether a pick is that file (name, size and its first 1 MiB) is known once it is hashed, so the hook says so.
+    up.addFiles(Array.from(list), () => void up.start())
   }
 
   const text = { type: t.errType, size: t.errSize, count: t.errCount, empty: t.errEmpty, other: t.errRefused }
