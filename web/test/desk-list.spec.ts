@@ -221,3 +221,141 @@ describe('desk: a 2xx without the worker\'s envelope is an error, never an empty
     expect(screen.queryByText('The reports did not load.', { exact: false })).toBeNull()
   })
 })
+
+// bp-web-fix audit finding 5: the field mapping beyond nextCursor, attachment_count, frames and the envelope.
+describe('desk: the worker\'s columns reach the page (snake_case in, null as not set)', () => {
+  const PR = 'https://github.com/DamianStBeat/Lumina2/pull/12'
+
+  it('fields, list row: device, title, where_area and verdict show in the row', async () => {
+    // The selected row is refreshed from its detail answer (Desk patchRow), so the detail carries the same verdict.
+    const d = detail(A, [])
+    serve(
+      () => ({
+        reports: [{ ...row(A, 1), device: 'phone', title: 'Boss froze on the bridge', where_area: 'match', verdict: 'simple_fix' }],
+        nextCursor: null,
+      }),
+      () => ({ ...d, report: { ...d.report, verdict: 'simple_fix' } }),
+    )
+    open()
+    await screen.findByRole('heading', { name: A })
+    await listed(A)
+    const text = rowOf(A).textContent ?? ''
+    expect(text).toContain('1 file · Phone')
+    expect(text).toContain('Boss froze on the bridge')
+    expect(text).not.toContain(`What happened in ${A}`)
+    expect(text).toContain('Match')
+    expect(text).toContain('Simple fix')
+  })
+
+  it('fields, list row: a row that is not selected (never refreshed from a detail) shows its own verdict', async () => {
+    serve(() => ({ reports: [row(A, 0), { ...row(B, 2), verdict: 'not_bug', device: 'console' }], nextCursor: null }))
+    open()
+    await screen.findByRole('heading', { name: A })
+    const text = rowOf(B).textContent ?? ''
+    expect(text).toContain('Not a bug')
+    expect(text).toContain('2 files · Console')
+  })
+
+  it('fields, list client: every column is renamed and null becomes absent', async () => {
+    serve(() => ({
+      reports: [row(A, 0), { ...row(B, 3), title: 'T', where_area: 'shop', device: 'computer', verdict: 'unclear' }],
+      nextCursor: null,
+    }))
+    const { reports } = await deskList('all')
+    expect(reports[1]).toMatchObject({ code: B, createdAt: AT, updatedAt: AT, title: 'T', whereArea: 'shop', device: 'computer', verdict: 'unclear', fileCount: 3 })
+    for (const k of ['title', 'whereArea', 'device', 'verdict'] as const) expect(reports[0]![k]).toBeUndefined()
+  })
+
+  it('fields, list row edge: null columns are "not set": no device, the text, "—" and "Waiting for AI"', async () => {
+    serve(() => ({ reports: [row(A, 1)], nextCursor: null }))
+    open()
+    await listed(A)
+    const text = rowOf(A).textContent ?? ''
+    expect(text).toContain('1 file')
+    expect(text).not.toContain('·')
+    expect(text).toContain(`What happened in ${A}`)
+    expect(text).toContain('—')
+    expect(text).toContain('Waiting for AI')
+  })
+
+  it('fields, detail: the AI triage shows, pr_url gives Open PR #12, and duplicate_of reaches the row', async () => {
+    const d = detail(A, [])
+    serve(
+      () => ({ reports: [row(A, 0)], nextCursor: null }),
+      () => ({
+        ...d,
+        report: {
+          ...d.report,
+          verdict: 'duplicate',
+          duplicate_of: B,
+          pr_url: PR,
+          triage: { summary: 'The boss script stops on the bridge.', cause: 'A nil target after the wave ends.' },
+        },
+      }),
+    )
+    open()
+    await screen.findByText('The boss script stops on the bridge.', { exact: false })
+    expect(screen.getByText('A nil target after the wave ends.', { exact: false })).toBeTruthy()
+    expect(screen.queryByText('The AI has not looked at this report yet.')).toBeNull()
+    expect(screen.getByRole('link', { name: 'Open PR #12' }).getAttribute('href')).toBe(PR)
+    await waitFor(() => expect(rowOf(A).textContent).toContain(`of ${B}`))
+  })
+
+  it('fields, detail client: every column is renamed, null becomes absent, and a 0 stays 0', async () => {
+    const d = detail(A, [])
+    serve(
+      () => null,
+      () => ({
+        ...d,
+        report: {
+          ...d.report,
+          title: 'T',
+          where_area: 'lobby',
+          device: 'tablet',
+          lang: 'it',
+          roblox_name: 'kev',
+          roblox_user_id: 0,
+          discord_name: 'kev#1',
+          game_context: { wave: 3 },
+          verdict: 'needs_person',
+          triage: { summary: 'S' },
+          duplicate_of: B,
+          pr_url: PR,
+        },
+      }),
+    )
+    expect(await deskReport(A)).toMatchObject({
+      code: A,
+      title: 'T',
+      whereArea: 'lobby',
+      device: 'tablet',
+      lang: 'it',
+      robloxName: 'kev',
+      robloxUserId: 0,
+      discordName: 'kev#1',
+      gameContext: { wave: 3 },
+      verdict: 'needs_person',
+      triage: { summary: 'S' },
+      duplicateOf: B,
+      prUrl: PR,
+    })
+    serve(
+      () => null,
+      () => d,
+    )
+    const empty = await deskReport(A)
+    for (const k of ['title', 'whereArea', 'device', 'lang', 'robloxName', 'robloxUserId', 'discordName', 'gameContext', 'verdict', 'triage', 'duplicateOf', 'prUrl'] as const) {
+      expect(k in empty ? empty[k] : undefined).toBeUndefined()
+    }
+  })
+
+  it('fields, detail edge: a triage stored as text that is not JSON is "not looked at yet", never shown as data', async () => {
+    const d = detail(A, [])
+    serve(
+      () => ({ reports: [row(A, 0)], nextCursor: null }),
+      () => ({ ...d, report: { ...d.report, triage: 'not json {' } }),
+    )
+    open()
+    await screen.findByText('The AI has not looked at this report yet.')
+  })
+})

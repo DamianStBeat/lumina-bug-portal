@@ -59,18 +59,14 @@ async function firstVisitLeftHalfWay(lastModified: number) {
 }
 
 describe('web-fix row 1 on /add: the same video picked again after the reload, with another lastModified', () => {
+  // Also audit finding 2: no press on Add to report here.
   it('row 1: it carries on from the missing parts and the page shows "We have it" with the code', async () => {
     const att = await firstVisitLeftHalfWay(1000)
     const mark = server.log.length
     page()
     await screen.findByText(t.resumeHint, { exact: false })
+    // Picking the last missing file is the whole action (FilePicker): the upload starts by itself, nothing is pressed.
     pick(file('clip.mp4', 3 * PART, 'video/mp4', 2000, VIDEO))
-    // Picking the last missing file starts the upload by itself; when it has not, Add to report is the Send.
-    await waitFor(() =>
-      expect(screen.queryByText(t.h4) ?? screen.queryByRole('button', { name: t.addSend })).toBeTruthy(),
-    )
-    const send = screen.queryByRole('button', { name: t.addSend }) as HTMLButtonElement | null
-    if (!screen.queryByText(t.h4) && send && !send.disabled) fireEvent.click(send)
     await screen.findByText(t.h4, undefined, { timeout: 4000 })
     expect(screen.getByText(CODE)).toBeTruthy()
     const after = server.log.slice(mark)
