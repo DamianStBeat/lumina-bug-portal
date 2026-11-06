@@ -40,6 +40,8 @@ import {
   type ReportRow,
   type TestEnv,
 } from "./helpers";
+// The read limit the chain walk and the cycle guard are built on: the edges below are counted from it, not copied.
+import { MAX_DUPLICATE_DEPTH } from "../src/lib/status";
 
 const HOUR = 3_600_000;
 // Most cron runs a 12-month report may need before it is fully gone (lead's decision 1: "after a few runs").
@@ -1647,5 +1649,159 @@ describe("redteam-4 (audit): the chain is read once more before duplicate_busy, 
     const changes = (await eventsAfter(b, before)).filter((e) => e.type === "status_changed");
     expect(changes.length, "B: one status_changed").toBe(1);
     expect(changes[0]!.data).toEqual({ from: "looking", to: "duplicate", note, prUrl: VALID_PR });
+  });
+});
+
+// ===============================================================================================================
+// Round 5 (red team round 1 of slice worker-status, redteam-opus.md, brief-redteam-fix.md). Lead's decisions:
+// 1. A loop the cycle guard sees is a definite "no": after the second guarded write fails, a chain that, walked as the
+//    guard walks it (through duplicate rows, up to MAX_DUPLICATE_DEPTH + 1 steps from the root), reaches the triaged
+//    report is 409 duplicate_cycle, never duplicate_busy. A legacy chain longer than the read limit is such a loop.
+// 2. Outside the duplicate path (triage looking/not_bug, both status routes), a report retention removed between the
+//    lookup and the batch is 404 not_found and nothing is written, no event on its id.
+// ===============================================================================================================
+
+/**
+ * Old data written before the root rule: an original S (`looking`) and `links` reports stored link by link towards it,
+ * as storedChain does, T0 -> T1 -> ... -> T(links-1) -> S. Returns every row, T0 first.
+ */
+async function legacyChainTo(links: number): Promise<{ s: ReportRow; chain: ReportRow[] }> {
+  const s = await seedReport({ status: "looking" });
+  const reversed: ReportRow[] = [];
+  let previous = s.code;
+  for (let i = 0; i < links; i++) {
+    const t = await seedReport({ status: "duplicate", duplicate_of: previous });
+    reversed.push(t);
+    previous = t.code;
+  }
+  return { s, chain: reversed.reverse() };
+}
+
+/** S -> T0 refused as a loop: 409 duplicate_cycle without retryAfter or Retry-After, and nothing written anywhere. */
+async function expectLoopRefused(res: Response, s: ReportRow, chain: ReportRow[], beforeS: FullSnapshot, beforeChain: FullSnapshot[], seq: number): Promise<void> {
+  const b = await expectError(res, 409, "duplicate_cycle");
+  expect(b, "a loop, not busy: no retryAfter").toEqual({ error: "duplicate_cycle" });
+  expect(res.headers.get("Retry-After"), "no Retry-After on a definite no").toBeNull();
+  expect(await fullSnapshot(s), "S unchanged").toEqual(beforeS);
+  const after: FullSnapshot[] = [];
+  for (const t of chain) after.push(await fullSnapshot(t));
+  expect(after, "the stored chain unchanged").toEqual(beforeChain);
+  expect(await eventsSince(seq, [s.id, ...chain.map((t) => t.id)]), "no event for S or the chain").toEqual([]);
+  await expectNoLoopFrom(s.code);
+}
+
+function deskStatusWith(code: string, payload: Record<string, unknown>, envOverride: Partial<TestEnv>): Promise<Response> {
+  return call(`/desk/reports/${code}/status`, jsonInit("POST", payload), { ...devDeskEnv, ...envOverride });
+}
+
+describe("redteam-5: a loop past the read limit and vanished reports outside the duplicate path", () => {
+  describe("redteam-5: a legacy loop past the read limit is duplicate_cycle, never duplicate_busy (decision 1)", () => {
+    // links = D: the read itself reaches S (green before the fix, the edge below). links = D + 1: the finding, the guard
+    // walks one step past the read. links = 2D: from the root the read stops at (T(D-1)), S is D + 1 steps away, the
+    // last step the guard walks.
+    const D = MAX_DUPLICATE_DEPTH;
+    const lengths: [string, number][] = [
+      [`${D} links, the read reaches S (edge below)`, D],
+      [`${D + 1} links, one past the read limit (the finding)`, D + 1],
+      [`${D + 2} links, two past the read limit`, D + 2],
+      [`${2 * D} links, S at the guard's last step from the root`, 2 * D],
+    ];
+
+    it.each(lengths)("redteam-5: triage S -> T0 on a legacy chain T0 -> ... -> S of %s is 409 duplicate_cycle, S unchanged, no event", async (_label, links) => {
+      const { s, chain } = await legacyChainTo(links);
+      const beforeS = await fullSnapshot(s);
+      const beforeChain: FullSnapshot[] = [];
+      for (const t of chain) beforeChain.push(await fullSnapshot(t));
+      const seq = await maxSeq();
+
+      const res = await linkDuplicate(s.code, chain[0]!.code);
+
+      await expectLoopRefused(res, s, chain, beforeS, beforeChain, seq);
+    });
+
+    it("redteam-5: the same triage retried on the still chain is again 409 duplicate_cycle (a no stays a no)", async () => {
+      const { s, chain } = await legacyChainTo(D + 1);
+      const beforeS = await fullSnapshot(s);
+      const beforeChain: FullSnapshot[] = [];
+      for (const t of chain) beforeChain.push(await fullSnapshot(t));
+      const seq = await maxSeq();
+
+      await expectLoopRefused(await linkDuplicate(s.code, chain[0]!.code), s, chain, beforeS, beforeChain, seq);
+      await expectLoopRefused(await linkDuplicate(s.code, chain[0]!.code), s, chain, beforeS, beforeChain, seq);
+    });
+
+    const routeCases = statusRoutes.flatMap(([route, post]) => lengths.slice(1).map(([label, links]) => [route, label, links, post] as const));
+
+    it.each(routeCases)("redteam-5: %s status duplicate S -> T0 on a legacy chain of %s is 409 duplicate_cycle, S unchanged, no event", async (_route, _label, links, post) => {
+      const { s, chain } = await legacyChainTo(links);
+      const beforeS = await fullSnapshot(s);
+      const beforeChain: FullSnapshot[] = [];
+      for (const t of chain) beforeChain.push(await fullSnapshot(t));
+      const seq = await maxSeq();
+
+      const res = await post(s.code, { status: "duplicate", duplicateOf: chain[0]!.code });
+
+      await expectLoopRefused(res, s, chain, beforeS, beforeChain, seq);
+    });
+  });
+
+  describe("redteam-5: a report deleted between the lookup and the write outside the duplicate path is 404, nothing written (decision 2)", () => {
+    const verdicts = ["needs_person", "not_bug", "simple_fix", "unclear"] as const;
+    // `received`: the triage changes the status; `looking`: needs_person keeps it, so only the triaged event is at stake.
+    const triageCases = verdicts.flatMap((verdict) => (["received", "looking"] as const).map((from) => [verdict, from] as const));
+
+    it.each(triageCases)("redteam-5: retention deletes C (%s, C %s) before the triage batch: 404 not_found, no event row with C's id", async (verdict, from) => {
+      const c = await seedReport({ status: from });
+      const seq = await maxSeq();
+      const { db, gaps } = dbWithGapBeforeEveryWrite(() => deleteAsRetention(c), 1);
+
+      const res = await triage(c.code, { verdict, triage: { summary: "looked at it" } }, { DB: db });
+
+      expect(gaps(), "the triage wrote after its lookup").toBe(1);
+      await expectError(res, 404, ERRORS.notFound);
+      expect(await eventsSince(seq, [c.id]), "no event orphaned on C's id").toEqual([]);
+      expect(await reportByCode(c.code), "C stays deleted").toBeNull();
+    });
+
+    const statusWith: [string, (code: string, payload: Record<string, unknown>, envOverride: Partial<TestEnv>) => Promise<Response>][] = [
+      ["agent", agentStatus],
+      ["desk", deskStatusWith],
+    ];
+    // `fixed` from `looking` is a change; `fixed` on a report already fixed is a write that changes no status, the edge.
+    const statusCases = statusWith.flatMap(([route, post]) => (["looking", "fixed"] as const).map((from) => [route, from, post] as const));
+
+    it.each(statusCases)("redteam-5: %s status fixed, retention deletes C (C %s) before the batch: 404 not_found, no event row with C's id", async (_route, from, post) => {
+      const c = await seedReport({ status: from });
+      const seq = await maxSeq();
+      const { db, gaps } = dbWithGapBeforeEveryWrite(() => deleteAsRetention(c), 1);
+
+      const res = await post(c.code, { status: "fixed", prUrl: VALID_PR, note: "fix is live" }, { DB: db });
+
+      expect(gaps(), "the status route wrote after its lookup").toBe(1);
+      await expectError(res, 404, ERRORS.notFound);
+      expect(await eventsSince(seq, [c.id]), "no event orphaned on C's id").toEqual([]);
+      expect(await reportByCode(c.code), "C stays deleted").toBeNull();
+    });
+
+    it.each(statusWith)("redteam-5 (edge): %s status fixed on C with no gap is still 200 with one status_changed", async (_route, post) => {
+      const c = await seedReport({ status: "looking" });
+      const { db, gaps } = dbWithGapBeforeEveryWrite(async () => {}, 1);
+
+      expect((await post(c.code, { status: "fixed" }, { DB: db })).status).toBe(200);
+
+      expect(gaps()).toBe(1);
+      expect((await reportByCode(c.code))!.status).toBe("fixed");
+      expect((await statusChanges(c.id)).length).toBe(1);
+    });
+
+    it.each(verdicts)("redteam-5 (edge): triage %s on C with no gap is still 200 with one triaged event", async (verdict) => {
+      const c = await seedReport();
+      const { db } = dbWithGapBeforeEveryWrite(async () => {}, 1);
+
+      expect((await triage(c.code, { verdict, triage: { summary: "looked at it" } }, { DB: db })).status).toBe(200);
+
+      expect((await eventTypesOf(c.id)).filter((t) => t === "triaged").length).toBe(1);
+      expect((await reportByCode(c.code))!.verdict).toBe(verdict);
+    });
   });
 });
