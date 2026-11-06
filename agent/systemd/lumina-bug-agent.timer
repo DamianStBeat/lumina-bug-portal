@@ -1,0 +1,12 @@
+# Starts one round POLL_SECONDS after the previous one ended (install.sh fills it, default 120),
+# so two rounds never overlap even when one runs for hours; the lock file covers a manual start.
+[Unit]
+Description=Lumina bug agent: a round every @POLL_SECONDS@ s
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=@POLL_SECONDS@s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

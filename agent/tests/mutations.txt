@@ -1,0 +1,33 @@
+# Mutation targets for the auditor (one per spec group). The production code did not exist when these specs were
+# written, so `old` is a description of the line to mutate, not its exact text: the auditor fills in the real text
+# once the code exists. quality-gate/mutation_run.py drives Lune, so for this Python slice run each mutation by hand
+# (copy of the tree, edit, `python3 -m unittest discover tests -k <filter>`), or adapt the runner's --cmd.
+# file|line to mutate|mutation|spec filter that must turn red
+agent/lumina_bug_agent/run.py|claim before download|skip the claim POST|test_row01_claims_downloads
+agent/lumina_bug_agent/run.py|rmtree of the report temp dir in finally|remove the rmtree|test_row01_nothing_left_behind
+agent/lumina_bug_agent/media.py|magic-byte sniff returning not_media|always accept as video|test_row02
+agent/lumina_bug_agent/media.py|size_bytes > 2 GiB refused before download|use >= 3 GiB|test_row02_declared_size_over_2gib
+agent/lumina_bug_agent/media.py|duration > 1800 s → too_long|compare with 3600|test_row02_video_longer_than_30_minutes
+agent/lumina_bug_agent/media.py|frame cap 48|cap 480|test_row01_video_under_30_minutes_gets_at_most_48_frames
+agent/lumina_bug_agent/media.py|-an in every ffmpeg argv|drop -an|test_row01_audio_is_never_extracted
+agent/lumina_bug_agent/media.py|images scaled to 1280|scale to 2560|test_row01_image_goes_to_stage_a_scaled
+agent/lumina_bug_agent/schemas.py|local injection pattern forces injection_suspected|keep the model's value|test_row03
+agent/lumina_bug_agent/claude_cli.py|player data inside the nonce block|append the raw text after the block|test_row03_player_text_is_only_inside
+agent/lumina_bug_agent/schemas.py|extra key rejected / required key missing rejected|accept extra and default missing to False|test_row04
+agent/lumina_bug_agent/run.py|invalid stage A → unclear and no stage B|run stage B anyway|test_row04
+agent/lumina_bug_agent/guard.py|**/Inventory* in the risk list|remove it|test_row05_builder_edits_inventory_service
+agent/lumina_bug_agent/fix.py|untracked files counted (--untracked-files=all)|use git diff --name-only only|test_row05_builder_adds_a_new_untracked_file
+agent/lumina_bug_agent/fix.py|likely_files on the risk list → not eligible|skip that check|test_row05_likely_files
+agent/lumina_bug_agent/fix.py|confidence >= 0.8|> 0.8|test_row05_confidence_exactly_0_8
+agent/lumina_bug_agent/fix.py|fixes started today < DAILY_FIX_CAP|<=|test_row06
+agent/lumina_bug_agent/cache.py|fix count persisted per UTC day|keep it in memory only|test_row06_cap_holds_across_rounds
+agent/lumina_bug_agent/fix.py|both red teams must exit 0|only check the first|test_row07_second_red_team_fails
+agent/lumina_bug_agent/fix.py|branch -D on failure|remove it|test_row07_first_red_team_fails
+agent/lumina_bug_agent/fix.py|title cleaning of backtick and @|skip cleaning|test_row07_draft_pr_with_the_pinned_title
+agent/lumina_bug_agent/claude_cli.py|child env allowlist|pass os.environ|test_row07_children_get_a_clean_environment
+agent/lumina_bug_agent/run.py|connection error → worker unreachable, exit 0|let the URLError propagate|test_row08
+agent/lumina_bug_agent/run.py|dry run: no claim POST|claim in dry run too|test_row09
+agent/lumina_bug_agent/lock.py|LOCK_NB busy → exit 0 before any request|block on the lock (no LOCK_NB)|test_row10_lock_held
+agent/lumina_bug_agent/run.py|409 leased → skip|treat 409 as success|test_row10_claim_409
+agent/lumina_bug_agent/config.py|missing AGENT_KEY → exit 2|default to empty string|test_config_missing_agent_key
+agent/lumina_bug_agent/run.py|mkdtemp + chmod 700|chmod 755|test_report_temp_dir_is_private
