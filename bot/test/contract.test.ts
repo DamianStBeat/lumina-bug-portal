@@ -10,6 +10,7 @@
 // mutation, and the line below them describes the builder's code, not yet written.
 // bot/src/events.ts|if (typeof status === 'string' && status !== 'fixed') return;|if (typeof status === 'string' && status !== 'looking') return;|k1 (green) agent and desk shapes post
 // bot/src/events.ts|status_changed: act only on data.to === 'fixed' (no `status`, no lookup guess)|read `status` / ask the report when `to` is absent (9dfbb0a)|k2 off-contract data ignored
+// bot/src/events.ts|if (to !== 'fixed' || typeof from !== 'string' || from === to) return;|if (to !== 'fixed' || from === to) return;|k2 `to: fixed` without `from` (audit 1 finding 5)
 // bot/src/portal.ts|getEvents: data used only when it is an object|parse a JSON string (9dfbb0a)|k3 string data ignored
 // bot/src/events.ts|status_changed: from === 'fixed' and to === 'fixed' posts nothing|post on every to = fixed (9dfbb0a)|k4 row 7 resend
 // bot/src/events.ts|an event at or below the highest seq handled is not handled again|handle every listed event (9dfbb0a)|k5 row 7 same seq twice
@@ -179,6 +180,7 @@ describe('contract: status_changed read by its pinned keys', () => {
     ['`status: fixed` with a note, no from/to', { status: 'fixed', note: 'n' }],
     ['a nested row', { report: contractRow(CODE) }],
     ['`from` without `to`', { from: 'looking', note: null, prUrl: null }],
+    ['`to: fixed` without `from`', { to: 'fixed', note: null, prUrl: null }],
     ['an empty object', {}],
     ['null', null],
   ] as const) {

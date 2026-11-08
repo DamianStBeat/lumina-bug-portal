@@ -490,8 +490,10 @@ class CasWorker(FakeWorker):
     and nothing written; outside the statuses → 400 `invalid_expected_status`; absent → the base fake's behaviour.
 
     `before[(route, code)]`: a function run once, inside the request, just before the check (a person's write landing
-    while the agent's request is on its way, the interleaving of row 6). `answers` records (route, code, http status
-    sent, error) for every triage/status request, so a spec can tell an accepted write from a refused one."""
+    while the agent's request is on its way, the interleaving of row 6). Route `claim` too: nothing is checked there, the
+    hook is the person's write landing after the queue listed the report and before the agent reads it. `answers` records
+    (route, code, http status sent, error) for every triage/status request, so a spec can tell an accepted write from a
+    refused one."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -505,6 +507,11 @@ class CasWorker(FakeWorker):
 
     def _handle(self, h: http.server.BaseHTTPRequestHandler, method: str) -> None:
         parsed = urllib.parse.urlsplit(h.path)
+        claim = re.match(r"^/api/v1/agent/reports/(?P<code>[^/]+)/claim$", parsed.path)
+        if method == "POST" and claim:
+            claim_hook = self.before.pop(("claim", claim.group("code")), None)
+            if claim_hook is not None:
+                claim_hook()
         m = re.match(r"^/api/v1/agent/reports/(?P<code>[^/]+)/(?P<route>triage|status)$", parsed.path)
         if method != "POST" or not m:
             return super()._handle(h, method)

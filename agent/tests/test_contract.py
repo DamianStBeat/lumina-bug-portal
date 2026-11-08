@@ -20,6 +20,10 @@ agent/lumina_bug_agent/fix.py|status body carries expectedStatus = the status th
 agent/lumina_bug_agent/fix.py|post_status: 409 status_changed → no retry, no pending, `status superseded`|treat 409 like any failure (3 tries, then pending)|test_contract_status_409_*
 agent/lumina_bug_agent/run.py|post_triage: 409 status_changed → drop the triage, nothing more for the report|raise as a report failure, or go on to stage C|test_contract_triage_409_*
 agent/lumina_bug_agent/fix.py|send_pending: resend carries expectedStatus = the status just read; 409 → dropped|resend without the key, or keep it pending|test_contract_pending_*
+agent/lumina_bug_agent/fix.py|{**json.loads(body), "expectedStatus": current}|json.loads(body)|test_contract_pending_resend_of_a_body_stored_without_the_key_* (audit 1 finding 6)
+agent/lumina_bug_agent/run.py|self.post_triage(code, "unclear", None, None, [], ["agent_failed"], "received")|... "looking")|test_contract_give_up_* (audit 1 finding 2)
+agent/lumina_bug_agent/run.py|after the report GET: a status other than `received` skips the report (`status superseded`)|no check: the status read goes on the triage|test_contract_row6_a_person_sets_fixed_on_the_claim_*, test_contract_every_other_status_* (audit 1 finding 1; red on b17d8f4, which is that mutation)
+agent/lumina_bug_agent/run.py|the skip applies to a string status only|anything but `received` skips|test_contract_a_row_with_no_string_status_*
 """
 
 from __future__ import annotations
@@ -78,6 +82,19 @@ def _pending_codes(h: Harness) -> set[str]:
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     try:
         return {str(r[0]) for r in conn.execute("SELECT code FROM pending_status").fetchall()}
+    finally:
+        conn.close()
+
+
+def _store_pending_without_the_key(h: Harness, code: str) -> dict[str, Any]:
+    """Rewrites the status waiting in the agent's cache as an agent older than `expectedStatus` stored it; the body left."""
+    conn = sqlite3.connect(h.state_dir / "cache.sqlite3")
+    try:
+        stored = json.loads(conn.execute("SELECT body FROM pending_status WHERE code = ?", (code,)).fetchone()[0])
+        stored.pop("expectedStatus", None)
+        with conn:
+            conn.execute("UPDATE pending_status SET body = ? WHERE code = ?", (json.dumps(stored), code))
+        return dict(stored)
     finally:
         conn.close()
 
@@ -211,6 +228,175 @@ class ContractPendingResend(unittest.TestCase):
         self.assertRegex(lines[0], r"\bcurrent=fixed\b")
         _, later = _round(h)
         self.assertEqual(_bodies(later, "status", self.CODE), [], "nothing resent afterwards")
+
+
+    def test_contract_pending_resend_of_a_body_stored_without_the_key_carries_the_status_just_read(self) -> None:
+        h, w = self._pending_after_round1()
+        stored = _store_pending_without_the_key(h, self.CODE)
+        self.assertNotIn("expectedStatus", stored, "scenario: the body predates the key")
+        _, reqs = _round(h)
+        sent = _bodies(reqs, "status", self.CODE)
+        self.assertEqual(len(sent), 1, f"the pending status is sent once: {sent}")
+        self.assertEqual(sent[0].get("expectedStatus"), "looking", f"the key is added, with the status just read: {sent[0]}")
+        self.assertEqual({k: v for k, v in sent[0].items() if k != "expectedStatus"}, stored, "the rest of the body as stored")
+        self.assertEqual(w.accepted("status", self.CODE), 1)
+        self.assertNotIn(self.CODE, _pending_codes(h))
+
+    def test_contract_pending_resend_of_a_body_stored_without_the_key_cannot_overwrite_a_person(self) -> None:
+        h, w = self._pending_after_round1()
+        _store_pending_without_the_key(h, self.CODE)
+        # The window the key closes: send_pending reads `looking`, then the desk's `fixed` lands before its POST.
+        w.before[("status", self.CODE)] = lambda: w.person_sets_status(self.CODE, "fixed")
+        p, _ = _round(h)
+        self.assertEqual(w.reports[self.CODE]["status"], "fixed", "an old body cannot overwrite the person's fixed")
+        self.assertEqual(w.accepted("status", self.CODE), 0)
+        self.assertNotIn(self.CODE, _pending_codes(h))
+        lines = _superseded_lines(p.stderr, self.CODE)
+        self.assertEqual(len(lines), 1, f"one log line:\n{p.stderr[-3000:]}")
+        self.assertRegex(lines[0], r"\bcurrent=fixed\b")
+
+
+class ContractGiveUp(unittest.TestCase):
+    """Il triage `unclear` dopo tre tentativi falliti porta `expectedStatus: "received"` (quello che la coda ha mostrato)
+    e il worker lo accetta; un `expectedStatus` sbagliato lo farebbe rifiutare ogni volta, e il report non uscirebbe mai
+    dalla coda. Audit 1, finding 2: il solo test del give-up girava su un fake che ignora la chiave."""
+
+    CODE = "LUM-670001"
+
+    def _after_three_failed_rounds(self) -> tuple[Harness, CasWorker]:
+        h, w = _cas_harness(self)
+        w.add_report(self.CODE)
+        w.fail("report", 503)
+        for _ in range(3):
+            _round(h)
+            w.expire_lease(self.CODE)
+        del w.always_fail["report"]
+        self.assertEqual(w.calls("triage", self.CODE), [], "scenario: no give-up before the fourth round")
+        self.assertEqual(w.reports[self.CODE]["status"], "received", "scenario: nothing was written")
+        return h, w
+
+    def test_contract_give_up_triage_carries_received_and_is_accepted(self) -> None:
+        h, w = self._after_three_failed_rounds()
+        p, reqs = _round(h)
+        triages = _bodies(reqs, "triage", self.CODE)
+        self.assertEqual(len(triages), 1, f"one give-up triage: {triages}\n{p.stderr[-3000:]}")
+        self.assertEqual(triages[0].get("verdict"), "unclear")
+        self.assertIn("agent_failed", triages[0]["triage"]["notes"])
+        self.assertEqual(triages[0].get("expectedStatus"), "received", "the status the queue listed it under")
+        self.assertEqual(w.accepted("triage", self.CODE), 1, "the worker's compare-and-set accepts it")
+        self.assertEqual(w.reports[self.CODE]["status"], "looking", "the report leaves the queue")
+        self.assertEqual(_superseded_lines(p.stderr, self.CODE), [], "nobody moved it: nothing is superseded")
+        self.assertEqual(h.claude_calls(), [], "a give-up runs no stage")
+
+    def test_contract_give_up_triage_refused_because_a_person_moved_it_leaves_the_person_s_status(self) -> None:
+        h, w = self._after_three_failed_rounds()
+        w.before[("triage", self.CODE)] = lambda: w.person_sets_status(self.CODE, "fixed")
+        p, _ = _round(h)
+        self.assertEqual(w.accepted("triage", self.CODE), 0)
+        self.assertEqual(w.reports[self.CODE]["status"], "fixed", "the person's fixed stays")
+        lines = _superseded_lines(p.stderr, self.CODE)
+        self.assertEqual(len(lines), 1, f"one log line:\n{p.stderr[-3000:]}")
+        self.assertRegex(lines[0], r"\bcurrent=fixed\b")
+
+
+class ContractNoLongerReceivedIsSkipped(unittest.TestCase):
+    """Decisione del lead (audit 1, finding 1): l'agente legge un report dalla coda, e se la GET risponde uno stato che
+    non è `received` lo lascia a chi l'ha spostato: nessuna fase, nessun triage, nessuno stato, una riga di log `status
+    superseded` col codice e lo stato attuale; il giro va avanti. La coda si legge una volta sola a inizio giro e i report
+    girano uno dopo l'altro: senza questo controllo una modifica umana arrivata prima della GET diventerebbe lo stato
+    "atteso" del triage, che la sovrascriverebbe."""
+
+    A, B = "LUM-660001", "LUM-660002"
+    OTHER_STATUSES = {"LUM-660011": "looking", "LUM-660012": "duplicate", "LUM-660013": "not_bug", "LUM-660014": "closed"}
+
+    def _assert_skipped(self, h: Harness, w: CasWorker, p: Any, code: str, current: str) -> None:
+        self.assertTrue(w.calls("report", code), f"scenario: {code} was read after its claim")
+        self.assertEqual(w.calls("triage", code), [], f"no triage POST for {code}:\n{p.stderr[-3000:]}")
+        self.assertEqual(w.calls("status", code), [], f"no status POST for {code}")
+        self.assertEqual(w.calls("frames", code), [], f"no frames for {code}")
+        lines = _superseded_lines(p.stderr, code)
+        self.assertEqual(len(lines), 1, f"one `status superseded` line for {code}:\n{p.stderr[-3000:]}")
+        self.assertRegex(lines[0], rf"\bcurrent={current}\b", "the line names the current status")
+        self.assertNotIn(f"report error code={code}", p.stderr, "a skip is not a failed report")
+        self.assertNotIn(f"report failed code={code}", p.stderr, "a skip is not a failed report")
+        self.assertNotIn(code, _pending_codes(h), "nothing waits for a later round")
+
+    def _assert_round_went_on(self, h: Harness, w: CasWorker, reqs: list[dict[str, Any]]) -> None:
+        triages = _bodies(reqs, "triage", self.B)
+        self.assertEqual(len(triages), 1, f"the round went on, B was triaged: {triages}")
+        self.assertEqual(triages[0].get("expectedStatus"), "received", "a report still received is processed as before")
+        self.assertEqual(w.accepted("triage", self.B), 1)
+        self.assertEqual(w.reports[self.B]["status"], "looking")
+        self.assertEqual(len(h.claude_calls("stage_a")), 1, "stage A ran for B and nothing else")
+        self.assertEqual(len(h.claude_calls("stage_b")), 1, "stage B ran for B and nothing else")
+
+    def test_contract_row6_a_person_sets_fixed_on_the_claim_the_report_is_skipped_and_stays_fixed(self) -> None:
+        h, w = _cas_harness(self)
+        w.add_report(self.A, attachments=[{"id": "att-skip-a", "data": b"never read: the report is skipped first"}])
+        w.add_report(self.B)
+        h.set_stage("stage_b", mode="json", object=dict(LOW_CONFIDENCE))
+        # After the queue listed A as received and before the agent reads it: the window of finding 1.
+        w.before[("claim", self.A)] = lambda: w.person_sets_status(self.A, "fixed")
+        p, reqs = _round(h)
+
+        self.assertEqual(w.reports[self.A]["status"], "fixed", "row 6: the report stays fixed")
+        self._assert_skipped(h, w, p, self.A, "fixed")
+        self.assertEqual(w.calls("download"), [], "its files are not fetched")
+        self._assert_round_went_on(h, w, reqs)
+
+    def test_contract_every_other_status_read_after_the_claim_is_skipped_and_left_as_it_is(self) -> None:
+        h, w = _cas_harness(self)
+        for code, status in self.OTHER_STATUSES.items():
+            w.add_report(code)
+            w.before[("claim", code)] = lambda c=code, s=status: w.person_sets_status(c, s)
+        w.add_report(self.B)
+        h.set_stage("stage_b", mode="json", object=dict(LOW_CONFIDENCE))
+        p, reqs = _round(h)
+        for code, status in self.OTHER_STATUSES.items():
+            with self.subTest(status=status):
+                self.assertEqual(w.reports[code]["status"], status, "the status stays what the person set")
+                self._assert_skipped(h, w, p, code, status)
+        self._assert_round_went_on(h, w, reqs)
+
+    def test_contract_a_status_outside_the_list_is_also_skipped_and_reaches_the_log_only_as_a_safe_word(self) -> None:
+        # "A status other than received" (brief 1e): a future status the agent does not know is someone else's too.
+        h, w = _cas_harness(self)
+        future, odd = "LUM-660021", "LUM-660022"
+        w.add_report(future)
+        w.add_report(odd)
+        w.add_report(self.B)
+        w.answer_report(future, body=dict(w.reports[future], status="archived"), times=None)
+        w.answer_report(odd, body=dict(w.reports[odd], status="Odd Status\ninjected line"), times=None)
+        h.set_stage("stage_b", mode="json", object=dict(LOW_CONFIDENCE))
+        p, reqs = _round(h)
+        self._assert_skipped(h, w, p, future, "archived")
+        self.assertEqual(w.calls("triage", odd), [], "no triage POST for the odd status")
+        self.assertEqual(len(_superseded_lines(p.stderr, odd)), 1, f"one line for it:\n{p.stderr[-3000:]}")
+        self.assertNotIn("injected line", p.stderr, "a value from the worker never reaches the log raw")
+        self._assert_round_went_on(h, w, reqs)
+
+    def test_contract_a_row_with_no_string_status_is_a_failed_read_not_a_person_s_change(self) -> None:
+        # Not yet / unknown is not "someone moved it": today's handling (brief 1e), a failed attempt, retried later.
+        h, w = _cas_harness(self)
+        missing, null, number = "LUM-660031", "LUM-660032", "LUM-660033"
+        w.add_report(missing)
+        w.add_report(null)
+        w.add_report(number)
+        w.add_report(self.B)
+        without = {k: v for k, v in w.reports[missing].items() if k != "status"}
+        w.answer_report(missing, body=without, times=None)
+        w.answer_report(null, body=dict(w.reports[null], status=None), times=None)
+        w.answer_report(number, body=dict(w.reports[number], status=42), times=None)
+        h.set_stage("stage_b", mode="json", object=dict(LOW_CONFIDENCE))
+        p, reqs = _round(h)
+        for code in (missing, null, number):
+            with self.subTest(code=code):
+                self.assertEqual(_superseded_lines(p.stderr, code), [], f"nobody moved {code}:\n{p.stderr[-3000:]}")
+                self.assertIn(f"report error code={code} error=ValueError attempts=1", p.stderr, "counted as a failed attempt")
+                self.assertEqual(w.calls("triage", code), [])
+                self.assertEqual(w.calls("status", code), [])
+                self.assertEqual(w.reports[code]["status"], "received")
+        self._assert_round_went_on(h, w, reqs)
 
 
 class ContractRow6EndToEnd(unittest.TestCase):

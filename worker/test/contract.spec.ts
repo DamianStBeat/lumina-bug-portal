@@ -24,6 +24,10 @@
 // worker/src/routes/agent.ts (builder)|the status condition inside the write (`UPDATE ... WHERE status = ?`)|check with a read before an unconditional write|c7, d4 (race)
 // worker/src/lib/duplicates.ts (builder)|the status condition in every statement of the link batch|condition only on the report's UPDATE, or none|c8, d5 (race, duplicate path)
 // worker/src/routes/agent.ts (builder)|400 invalid_expected_status for a value outside STATUSES|accept any string|c5
+// worker/src/routes/agent.ts|'triaged', ? FROM reports WHERE id = ? AND (? IS NULL OR status = ?)|'triaged', ? FROM reports WHERE id = ? AND (? IS NULL OR ? IS NOT NULL)|d4 refused triage writes no triaged event (audit 1 finding 4)
+// worker/src/routes/agent.ts|status <> ?\n         AND (? IS NULL OR status = ?)|status <> ?\n         AND (? IS NULL OR ? IS NOT NULL)|d4 refused triage writes no status_changed event (finding 4)
+// worker/src/routes/agent.ts|the triage's UPDATE last in its batch|back before the `triaged` event (the guard then sees the new status)|d2 non-duplicate events (finding 3)
+// worker/src/lib/duplicates.ts|the report's own UPDATE last in the link batch|back in second place|d2 duplicate events (finding 3)
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
@@ -624,17 +628,34 @@ describe("contract: triage POST compare-and-set (expectedStatus)", () => {
     expect(row!.duplicate_of).toBeNull();
   });
 
-  it("d2: expectedStatus received matching -> 200, written as today (non-duplicate and duplicate)", async () => {
+  it("d2: expectedStatus received matching -> 200, written as today, and every event in the pinned order (non-duplicate and duplicate)", async () => {
     const { code } = await createReport();
     await ok(agentTriage(code, { verdict: "simple_fix", triage: { s: 1 }, expectedStatus: "received" }), "triage");
     let row = await reportByCode(code);
     expect([row!.status, row!.verdict]).toEqual(["looking", "simple_fix"]);
+    const events = await eventsOf(code, 0);
+    // CONTRACT.md "Event data": within one write status_changed, then triaged, then duplicate_linked, all with one `at`.
+    expect(events.map((e) => e.type), "the agent's triage keeps its events").toEqual(["created", "status_changed", "triaged"]);
+    expect(events[1]!.data).toEqual({ from: "received", to: "looking" });
+    expect(events[2]!.data).toEqual({ verdict: "simple_fix" });
+    expect(events[2]!.at).toBe(events[1]!.at);
 
     const original = (await createReport()).code;
     const dup = (await createReport()).code;
     await ok(agentTriage(dup, { verdict: "duplicate", triage: {}, duplicateOf: original, expectedStatus: "received" }), "dup triage");
     row = await reportByCode(dup);
     expect([row!.status, row!.duplicate_of]).toEqual(["duplicate", original]);
+    const dupEvents = await eventsOf(dup, 0);
+    expect(dupEvents.map((e) => e.type), "the duplicate keeps triaged and duplicate_linked").toEqual([
+      "created",
+      "status_changed",
+      "triaged",
+      "duplicate_linked",
+    ]);
+    expect(dupEvents[1]!.data).toEqual({ from: "received", to: "duplicate" });
+    expect(dupEvents[2]!.data).toEqual({ verdict: "duplicate" });
+    expect(dupEvents[3]!.data).toEqual({ duplicateOf: original });
+    expect(new Set(dupEvents.slice(1).map((e) => e.at)).size, "one write, one `at`").toBe(1);
   });
 
   it("d3: a bad expectedStatus -> 400 invalid_expected_status; absent -> today's behaviour onto a fixed report", async () => {
@@ -648,17 +669,22 @@ describe("contract: triage POST compare-and-set (expectedStatus)", () => {
     expect((await reportByCode(code))!.status).toBe("looking");
   });
 
-  it("d4 (race): the desk's fixed between the triage's read and its write -> 409, verdict not written", async () => {
+  it("d4 (race): the desk's fixed between the triage's read and its write -> 409, verdict not written, no event of the refused write", async () => {
     const { code } = await createReport();
     await ok(claim(code), "claim");
     const gap = dbWithGapBeforeFirstWrite(async () => {
       await ok(deskStatus(code, { status: "fixed" }), "desk fixed in the gap");
     });
+    const before = await maxSeq();
     const res = await agentTriage(code, { verdict: "simple_fix", triage: { s: 1 }, expectedStatus: "received" }, { DB: gap.db });
     expect(gap.fired()).toBe(true);
     await expectStatusChanged(res, "fixed");
     const row = await reportByCode(code);
     expect([row!.status, row!.verdict, row!.triage]).toEqual(["fixed", null, null]);
+    // CONTRACT.md: a refused write leaves "no column, no event"; the one event left is the desk's.
+    const events = await eventsOf(code, before);
+    expect(events.map((e) => e.type), "only the desk's event").toEqual(["status_changed"]);
+    expect(events[0]!.data).toMatchObject({ to: "fixed", by: "desk" });
   });
 
   it("d5 (race, duplicate path): the desk's fixed in the gap -> 409, no link, no triaged or duplicate_linked event", async () => {
