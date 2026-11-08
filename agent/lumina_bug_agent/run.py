@@ -151,8 +151,13 @@ class Round:
             raise ValueError("report answer is not an object")
         row = answer  # CONTRACT.md "Agent report shape": one flat object
         expected = row.get("status")  # named on the triage POST: a person's change after this read wins over the triage
-        if expected not in STATUSES:
+        if not isinstance(expected, str):
             raise ValueError("report answer has no status")
+        if expected != "received":
+            # The queue, read once at the start of the round, listed it as `received`: someone moved it since. Naming
+            # this status on the triage would make the worker accept a write over that person's decision.
+            fix.note_superseded(self.cache, code, expected)
+            return
         attachments = row.get("attachments")
         files, images, uploads = self.files(code, attachments if isinstance(attachments, list) else [], tmp)
         for att_id, n, sheet in uploads:

@@ -241,7 +241,7 @@ Note: the desk's `GET /desk/reports/{code}` is a different shape (nested under `
 ### Event data
 
 `GET /agent/events?after=<seq>&limit=n`: `after` defaults to 0, `limit` to 100 and is capped at 500; a value that is
-not a whole number (or `limit` < 1) is 400 `invalid_after` / `invalid_limit`. <!-- worker/src/routes/agent.ts:258-267 -->
+not a whole number (or `limit` < 1) is 400 `invalid_after` / `invalid_limit`. <!-- worker/src/routes/agent.ts:288-298 -->
 
 ```json
 { "events": [ { "seq": 41, "code": "LUM-482193", "at": 1762400300000, "type": "status_changed",
@@ -264,19 +264,19 @@ value is absent (SQLite `json_object` keeps null keys); no writer omits a key it
 
 | Type | Writer | `data` keys |
 |---|---|---|
-| `created` | every create: web, game, discord (`POST /agent/reports`) <!-- worker/src/lib/reports.ts:29 (called from routes/public.ts:36, routes/game.ts:32, routes/agent.ts:247) --> | `source`: `web` · `game` · `discord`, always |
+| `created` | every create: web, game, discord (`POST /agent/reports`) <!-- worker/src/lib/reports.ts:29 (called from routes/public.ts:36, routes/game.ts:32, routes/agent.ts:277) --> | `source`: `web` · `game` · `discord`, always |
 | `file_added` | public upload complete (player video/image) <!-- worker/src/routes/uploads.ts:171,176 --> | `attachmentId`: string; `kind`: `video` · `image`; `size`: integer (declared bytes); all always. Written once per attachment (a repeated complete adds none) |
-| `file_added` | agent frames <!-- worker/src/routes/agent.ts:129,141 --> | `attachmentId`: string; `kind`: `frames`; `size`: integer (real bytes); all always |
-| `triaged` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:191 --> | `verdict`: string, always. Written on every triage POST, status change or not |
-| `triaged` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:76 (via routes/agent.ts:173) --> | `verdict`: `"duplicate"`, always |
-| `status_changed` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:187 --> | `from`, `to` (`looking` or `not_bug`): internal statuses, always. **No** `note`/`prUrl` keys. Written only when the stored status differs from `to` |
-| `status_changed` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:69 (via routes/agent.ts:167-174) --> | `from`, `to` (`"duplicate"`), always. No `note`/`prUrl`. Written only when the stored status is not already `duplicate` |
-| `status_changed` | agent status POST, any status but `duplicate` <!-- worker/src/routes/agent.ts:224 --> | `from`, `to`: internal statuses; `note`: string or null; `prUrl`: string or null; all always. Written on every POST, also when `from` equals `to` |
-| `status_changed` | agent status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:69 (via routes/agent.ts:207-214) --> | `from`, `to` (`"duplicate"`), `note`, `prUrl`, as the row above; written on every POST, also from `duplicate` |
+| `file_added` | agent frames <!-- worker/src/routes/agent.ts:135,147 --> | `attachmentId`: string; `kind`: `frames`; `size`: integer (real bytes); all always |
+| `triaged` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:203 --> | `verdict`: string, always. Written on every triage POST, status change or not |
+| `triaged` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:91 (via routes/agent.ts:180) --> | `verdict`: `"duplicate"`, always |
+| `status_changed` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:198 --> | `from`, `to` (`looking` or `not_bug`): internal statuses, always. **No** `note`/`prUrl` keys. Written only when the stored status differs from `to` |
+| `status_changed` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:174-182) --> | `from`, `to` (`"duplicate"`), always. No `note`/`prUrl`. Written only when the stored status is not already `duplicate` |
+| `status_changed` | agent status POST, any status but `duplicate` <!-- worker/src/routes/agent.ts:247 --> | `from`, `to`: internal statuses; `note`: string or null; `prUrl`: string or null; all always. Written on every POST, also when `from` equals `to` |
+| `status_changed` | agent status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:227-235) --> | `from`, `to` (`"duplicate"`), `note`, `prUrl`, as the row above; written on every POST, also from `duplicate` |
 | `status_changed` | desk status POST, any status but `duplicate` <!-- worker/src/routes/desk.ts:182 --> | `from`, `to`, `note`, `prUrl` as the agent's; plus `by`: `"desk"` and `email`: string or null (null for an Access service token and the dev bypass); all always. Written on every POST, also when `from` equals `to` |
-| `status_changed` | desk status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:69 (via routes/desk.ts:164-172) --> | as the desk row above, `to` = `"duplicate"` |
-| `duplicate_linked` | the linked report itself (triage `duplicate`, agent or desk status `duplicate`) <!-- worker/src/lib/duplicates.ts:77 --> | `duplicateOf`: string, the root original's code (may differ from the `duplicateOf` sent, when that one was itself a duplicate), always |
-| `duplicate_linked` | each report re-pointed by that link (it pointed at the report just linked) <!-- worker/src/lib/duplicates.ts:81 --> | `duplicateOf`: string, the new root code, always. No `status_changed` comes with it (it stays `duplicate`) |
+| `status_changed` | desk status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/desk.ts:164-172) --> | as the desk row above, `to` = `"duplicate"` |
+| `duplicate_linked` | the linked report itself (triage `duplicate`, agent or desk status `duplicate`) <!-- worker/src/lib/duplicates.ts:92 --> | `duplicateOf`: string, the root original's code (may differ from the `duplicateOf` sent, when that one was itself a duplicate), always |
+| `duplicate_linked` | each report re-pointed by that link (it pointed at the report just linked) <!-- worker/src/lib/duplicates.ts:96 --> | `duplicateOf`: string, the new root code, always. No `status_changed` comes with it (it stays `duplicate`) |
 
 No other writer exists: the retention cron and the public, game and discord-thread routes write no event besides
 `created` and `file_added` above (the cron only deletes a removed report's events). <!-- worker/src/cron.ts:208 -->
