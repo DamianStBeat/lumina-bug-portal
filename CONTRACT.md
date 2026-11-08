@@ -338,3 +338,67 @@ gender are never asked). In the game the four audiences of `lumina2-four-audienc
 No email, no real name, Roblox name optional on the web; audio stripped before the AI sees a video; videos deleted
 at 60 days; testers and moderators only until a lawyer has reviewed it; no analytics or third-party scripts on the
 site except Cloudflare Turnstile.
+
+## Supabase deployment (official site, Damian 8 Nov 2026: «Inside the Lovable site»)
+
+The API moves from the Cloudflare Worker to the Supabase Edge Function `bug-portal` of the site's project. Everything
+above holds (paths, shapes, errors, limits, statuses, events, `expectedStatus`, retention) except what this section
+replaces. Base: `https://<project>.supabase.co/functions/v1/bug-portal/api/v1`, configured by `PORTAL_API_BASE` (agent,
+bot), `VITE_BUG_PORTAL_API_BASE` (site), Lumina2's config (game). `verify_jwt = false` for this function: it does its
+own authentication on every route.
+
+### Storage (replaces D1 + R2 wording)
+
+- Postgres schema `bug_portal`, same tables and columns (`INTEGER` ms stay `bigint`; `r2_key` is named `storage_prefix`;
+  `events.seq` is `bigint generated always as identity`). RLS on every table, no policy, no grant to `anon` or
+  `authenticated`. The function reaches it through `SUPABASE_DB_URL` (one connection per invocation, `prepare: false`),
+  because PostgREST does not expose extra schemas. Every "one atomic step" above is one Postgres transaction or one
+  conditional `UPDATE`.
+- Private bucket `bug-portal`, `public = false`, `file_size_limit = 16777216`, allowed types `application/octet-stream`,
+  `image/jpeg`, `image/png`. A file is its parts: `<attachmentId>/part-NNNNN` (5 digits, from 00001). Frames are one
+  object `<attachmentId>/frame` written by the function. The function never carries video or player-image bytes.
+
+### Upload routes
+
+`PUT /attachments/{id}/parts/{n}` no longer exists. New:
+
+| Method, path | Body / headers | Answer |
+|---|---|---|
+| `POST /attachments/{id}/parts/{n}/upload-url` | header `X-Report-Token`; n = 1..partCount | `200 {n, url, expiresIn}`; 409 `not_uploading` when the attachment is not `uploading` |
+
+The client `PUT`s the part's raw bytes to `url` with `Content-Type: application/octet-stream`; re-sending replaces it
+(signed with upsert). Supabase fixes these URLs at 2 hours (`expiresIn: 7200`); an expired one is simply asked again.
+`GET /attachments/{id}/parts` answers from the objects present in the bucket. `POST .../complete` also checks each
+object's size (`partSize`, the last one the remainder): a wrong size counts as missing in 409 `missing_parts`, and the
+object is removed. `DELETE` removes the objects present.
+
+### Download routes (replace the streamed routes)
+
+`GET /agent/attachments/{id}/download` and the new `GET /desk/attachments/{id}/parts` (replaces `/stream`) answer
+`200 {mime, sizeBytes, expiresIn, parts: [{n, size, url}]}`, ascending `n`, signed download URLs valid 900 s; the reader
+joins the parts in order and asks again when a URL expired. `frames` attachments have one part. 409 `not_available`
+when the attachment is not `complete`.
+
+### Desk authentication (replaces Cloudflare Access)
+
+Header `Authorization: Bearer <Supabase user JWT>` (Google sign-in on the site). The function validates it with Supabase
+Auth and requires the lowercased email in table `bug_portal.desk_team(email primary key)`. Missing or invalid token: 401
+`unauthorized`; valid but not listed: 403 `not_team`, the same answer on every desk route and with no desk data. An
+empty table closes the desk. `by: "desk"`, `email` of the events are this user's. Desk routes follow the same CORS rule
+as the public ones.
+
+### CORS, IP, retention
+
+- `ALLOWED_ORIGINS` (function secret, comma separated) covers every browser route, desk included; `Authorization`,
+  `X-Report-Token`, `Content-Type` allowed. No wildcard.
+- `ip_hash` input: first address of `x-forwarded-for`; none: the literal `unknown`.
+- Retention: `POST /internal/retention` runs one bounded batch and answers `{done: boolean}`; the caller repeats until
+  `done`. Auth: header `X-Cron-Token` equal to `bug_portal.cron_token.token` (generated inside the database by the
+  migration, never in a repo or chat), or `Authorization: Bearer <AGENT_KEY>` (the documented fallback when pg_cron or
+  pg_net is not available: the agent's timer calls it). Besides the rules above it removes objects of `aborted` and
+  `deleted` attachments for 3 hours after that status (a signed URL issued before it can still land).
+
+### Secrets
+
+`TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`, `ALLOWED_ORIGINS` (function); `VITE_TURNSTILE_SITE_KEY`
+(site). `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_DB_URL` are provided by the platform.
