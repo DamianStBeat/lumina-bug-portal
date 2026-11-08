@@ -53,10 +53,11 @@ The `mount` event, the first one of a load, does in one transition (one save), b
   still that machine). With an owner, the hook dispatches `{ t: 'adopt', ... }` to it: if its session has the same
   code and reportToken (or is null, then a session with only that line is made, as `run` does at queue.ts:488), the
   line is written (or its id-less twin filled) and a DELETE `by: 'load'` goes under the owner's epoch, so its failure
-  is kept in `failed` and the place held. Without an owner, the hook writes the line into storage (read, check code
-  and token, or empty storage, write) and sends the DELETE `by: 'left'`; its answer changes nothing, and the next load
-  sends it again (one extra DELETE, answered 200 since DELETE is idempotent). If the stored or owned session is
-  another report's, nothing is written (row 2) and the DELETE still goes, untracked (known limit: one storage key).
+  is kept in `failed` and the place held. Without an owner, the hook sends the DELETE first; a gone answer writes
+  nothing (redteam-r1.spec.ts finding 1: exactly one DELETE, storage as the close left it); a failed one goes to a
+  page opened since, else into storage (read, check code and token, or empty storage, write), and the next load sends
+  it again. If the stored or owned session is another report's, nothing is written (row 2) and the DELETE still goes,
+  untracked (known limit: one storage key).
 - The gap between the boot read (`useState`) and the mount effect: the `mount` event carries `stored: loadSession()`
   (filtered by `only`) and adopts marked lines of the same code and token missing from the state's session.
 
@@ -115,6 +116,7 @@ a `stored` or `adopt` of `CODE`, and nothing is written for `CODE` once `OTHER`'
 - queue.ts (~170): `apply` 'remove' (mark, flip or pending at press, `was`), 'mount' (stored, pending, id-less drop,
   `loading`), 'created' (fill id), `leftCreated` (adopt effect), new 'adopt' event, `bind` (resolve pending), `drop`
   (mark idempotent), `deleted` (`loading`), `run` (wait on `loading`), `viewState`, `unremoved`, and a `struck(f)`
-  beside `marked(f)` used by `lineOf`, `heldBy`, `resumeOf`, `bind`, `plan`, `begin`.
+  beside `marked(f)` used by `resumeOf`, `pick`, `bind`, `plan`, `run`; `lineOf` keeps `marked`, so a file whose
+  create is out still owns its id-less removing line (it is not counted twice by `heldBy`, and `leave` removes it).
 - useUpload.ts (~40): `owner`, the `adopt` runner (dispatch or storage write plus DELETE), `mount` with `stored`.
   Total about 225 lines, under the 400 of one slice.
