@@ -94,19 +94,25 @@ export type Event =
   | { t: 'deleted'; id: string; epoch: number; by: DeleteBy; gone: boolean }
 // `failed`: attachments of removed lines whose DELETE failed on this load. `fx`: what the last transition asks for.
 // `left`: creates of removed files still out when the page was left or reset (their epoch is gone). `loading`: DELETEs
-// the load sent, not answered yet; no Send starts before the places they hold are known.
+// the load sent, not answered yet; no Send starts before the places they hold are known. `unsaved`: `initial` struck
+// lines in memory that storage still holds as the last visit left them; the mount saves them.
 type Left = Ticket & { code: string; token: string; id: Ident }
 export type State = { epoch: number; session: Session | null; target: Target | null; items: Item[]; jobs: Job[] }
   & { send: Send | null; phase: Phase; rejection: Rejection | null; failed: string[]; left: Left[]; fx: Effect[] }
-  & { loading: string[] }
+  & { loading: string[]; unsaved: boolean }
 export type Resume = { code: string; missing: { name: string; size: number }[] }
 type Ident = { name: string; size: number; head: string | null }
 
-// `session`: the saved upload the page may use (the hook drops another report's first).
-export const initial = (session: Session | null): State => ({
-  epoch: 0, session, target: null, items: [], jobs: [], send: null, phase: 'idle', rejection: null, failed: [], left: [],
-  fx: [], loading: [],
-})
+// `boot`: the saved upload the page may use (the hook drops another report's first). What the last visit removed is
+// struck here and not at mount: the first render reads `resume` from this state, before any effect, and the pages keep
+// what it says (Report.tsx and AddVideo.tsx open on that report). Storage is written at mount, render stays pure.
+export function initial(boot: Session | null): State {
+  const session = replay(boot, null)
+  return {
+    epoch: 0, session, target: null, items: [], jobs: [], send: null, phase: 'idle', rejection: null, failed: [], left: [],
+    fx: [], loading: [], unsaved: session !== boot,
+  }
+}
 
 // The same file: name, size and the hash of its first 1 MiB (lastModified changes on every iPhone export). An
 // unhashable file never binds to a line with an attachment: name and size cannot tell two videos apart, and resuming
@@ -225,7 +231,8 @@ function pressed(s: State, it: Item): Session | null {
   return sess.files.some(lineOf(it)) ? lines(s, (l) => l.filter((f) => !lineOf(it)(f))) : sess
 }
 
-// The first transition of a load, one save: the Removes the last visit pressed but never saw answered.
+// The Removes the last visit pressed but never saw answered: from the boot read (`initial`), then from what storage
+// holds at mount.
 function replay(own: Session | null, stored: Session | null): Session | null {
   let s = own
   // Marked lines a late create wrote to storage after this page read it at boot (useUpload.ts `adopt`).
@@ -256,12 +263,13 @@ function apply(s: State, e: Event, fx: Effect[]): State {
   switch (e.t) {
     case 'mount': {
       // A Remove whose answer the last visit never saw is sent again in the background: picks go on, a Send waits for
-      // the answers (`loading`).
+      // the answers (`loading`). The first transition of a load: one save, before those DELETEs.
       const session = replay(s.session, e.stored ?? null)
       const ids = (session?.files ?? []).flatMap((f) => (marked(f) ? [f.attachmentId] : []))
-      if (!session || (session === s.session && ids.length === 0)) return session === s.session ? s : { ...s, session }
+      if (!session || (session === s.session && ids.length === 0 && !s.unsaved)) return session === s.session ? s : { ...s, session }
+      if (s.unsaved) fx.push({ t: 'save', session })
       for (const id of ids) fx.push({ t: 'delete', id, token: session.reportToken, epoch: s.epoch, by: { k: 'load' } })
-      return { ...s, session, loading: ids }
+      return { ...s, session, loading: ids, unsaved: false }
     }
     case 'adopt': {
       // Another report's session is never written (row 2); the attachment is still deleted, untracked.

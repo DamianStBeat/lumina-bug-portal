@@ -29,7 +29,10 @@ let seq = 0
 let picks = 0
 // The mounted queue: a removed file's create answering after its page was left is adopted by it, so a failed DELETE
 // stays tracked there (held place, sent again by a pick that needs it).
-let owner: { dispatch: (e: Event) => void } | null = null
+let owner: { dispatch: (e: Event) => void; adopts: () => boolean } | null = null
+// The page that takes a late create's line. Never one with no session of its own while storage holds one (a report's
+// upload `only` hid from it): the session it would make would be saved over that upload. The line goes the no-page way.
+const adopter = () => (owner?.adopts() ? owner : null)
 
 // The SHA-256 (hex) of the first 1 MiB. A file the browser cannot read or hash gets null, not a failed pick: it can
 // still be sent, it is only known again by name and size.
@@ -90,7 +93,7 @@ function machine(boot: Session | null, only?: string) {
   const sends: ((ok: boolean) => void)[] = []
   const removals: { key: string; done: () => void }[] = []
 
-  const self = { dispatch: (e: Event) => dispatch(e) }
+  const self = { dispatch: (e: Event) => dispatch(e), adopts: () => s.session !== null || loadSession() === null }
   const ticket = (f: { key: string; gen: number; epoch: number }) => ({ key: f.key, gen: f.gen, epoch: f.epoch })
   const controller = (key: string) => {
     const ac = new AbortController()
@@ -153,13 +156,15 @@ function machine(boot: Session | null, only?: string) {
         void gone(f.id, f.token).then((g) => dispatch({ t: 'deleted', id: f.id, epoch: f.epoch, by: f.by, gone: g }))
         return
       case 'adopt': {
-        if (owner) return owner.dispatch(f)
-        // No page open: the DELETE goes now, and only a failed one is written down (to a page opened since, else to
-        // storage of its report only), so the next load sends it again. A gone one writes nothing (red team r1,
+        const page = adopter()
+        if (page) return page.dispatch(f)
+        // No page that can take it: the DELETE goes now, and only a failed one is written down (to a page opened since,
+        // else to storage of its report only), so the next load sends it again. A gone one writes nothing (red team r1,
         // tests-commit 12: a late create answer leaves storage as the close left it).
         void gone(f.line.attachmentId, f.token).then((g) => {
           if (g) return
-          if (owner) return owner.dispatch(f)
+          const since = adopter()
+          if (since) return since.dispatch(f)
           const next = adoptInto(loadSession(), f)
           if (next) saveSession(next)
         })

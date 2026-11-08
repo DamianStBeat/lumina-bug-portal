@@ -30,7 +30,10 @@ its hash answers on this page (resolved to the exact line, below) or when the ne
 
 ## 2. Replay on the next load
 
-The `mount` event, the first one of a load, does in one transition (one save), before any pick or Send can run:
+Steps 1 and 2 are applied in memory by `initial`, from the boot read, because the first render reads `resume` from that
+state before any effect runs and the pages keep what it says (audit-3 finding 2); render writes and sends nothing. The
+`mount` event, the first one of a load, saves that result (`State.unsaved`) and sends the DELETEs, in one transition
+(one save), before any pick or Send can run:
 1. `pending`: every saved line with that name and size, not done and not removing, is struck: one with an attachment
    gets `removing: true`, one without is dropped. `pending` is removed.
 2. Lines `removing` without an attachment are dropped: their create died with the old tab, its id unknowable (no
@@ -50,7 +53,9 @@ The `mount` event, the first one of a load, does in one transition (one save), b
   size, head), which keeps `removing: true`; append only when none is found. Then the DELETE goes now or at its turn.
 - Old epoch (`leftCreated`): instead of a bare DELETE it emits `{ t: 'adopt', code, token, line }` (line marked, with
   the id). useUpload.ts keeps one module-level `owner`: the mounted machine (set on mount, cleared on closed if it is
-  still that machine). With an owner, the hook dispatches `{ t: 'adopt', ... }` to it: if its session has the same
+  still that machine). An owner with no session of its own while storage holds one (a report's upload its `only` hid)
+  does not count: the session it would make would be saved over that upload (audit-3 finding 1); the line goes the
+  no-owner way. With an owner, the hook dispatches `{ t: 'adopt', ... }` to it: if its session has the same
   code and reportToken (or is null, then a session with only that line is made, as `run` does at queue.ts:488), the
   line is written (or its id-less twin filled) and a DELETE `by: 'load'` goes under the owner's epoch, so its failure
   is kept in `failed` and the place held. Without an owner, the hook sends the DELETE first; a gone answer writes
