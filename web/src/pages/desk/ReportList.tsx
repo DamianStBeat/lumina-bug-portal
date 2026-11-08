@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { DeskFilter, DeskListRes, DeskReportRow, ReportStatus, Verdict } from '../../api/types'
+import type { DeskFile, DeskFilter, DeskListRes, DeskReportRow, ReportStatus, Verdict } from '../../api/types'
 
 const FILTERS: [DeskFilter, string][] = [
   ['all', 'All'],
@@ -55,11 +55,14 @@ export function githubPr(url: string | undefined): { href: string; n?: string } 
   }
 }
 
-// The list answer counts the player's files without their kind or size; the detail shows which file it is.
-function media(files: number, device?: string): string {
+// The row names one file: the first video, else the first picture; the detail shows them all. Files not known (an
+// answer that did not carry them) leave the line empty, so the row never says "No video" about a report that has one.
+function media(files: DeskFile[] | undefined, device?: string): string {
+  if (!files) return ''
+  const f = files.find((x) => x.kind === 'video') ?? files.find((x) => x.kind === 'image')
+  if (!f) return 'No video'
   const where = device && DEVICE[device] ? ` · ${DEVICE[device]}` : ''
-  if (files > 0) return `${files > 1 ? `${files} files` : '1 file'}${where}`
-  return 'No video'
+  return `${f.kind === 'video' ? 'Video' : 'Picture'} ${Math.max(1, Math.round(f.sizeBytes / 1_000_000))} MB${where}`
 }
 
 function Row({ r, now, sel, onSelect }: { r: DeskReportRow; now: number; sel: boolean; onSelect: () => void }) {
@@ -68,6 +71,7 @@ function Row({ r, now, sel, onSelect }: { r: DeskReportRow; now: number; sel: bo
   const open = r.status === 'received' || r.status === 'looking'
   const head = pr && open ? `PR #${pr.n ?? ''}`.trim() : STATUS[r.status]
   const tail = pr && open ? STATUS[r.status] : r.updatedAt - r.createdAt > 60_000 ? `updated ${ago(r.updatedAt, now)}` : ''
+  const line = media(r.files, r.device)
   return (
     <li>
       <button type="button" className={sel ? 'desk-row sel' : 'desk-row'} aria-current={sel} onClick={onSelect}>
@@ -77,7 +81,7 @@ function Row({ r, now, sel, onSelect }: { r: DeskReportRow; now: number; sel: bo
         </span>
         <span className="c-what">
           {r.title || r.what}
-          <span className="sub">{media(r.fileCount, r.device)}</span>
+          {line && <span className="sub">{line}</span>}
         </span>
         <span className="c-where">{(r.whereArea && WHERE[r.whereArea]) || '—'}</span>
         <span className="c-ai">

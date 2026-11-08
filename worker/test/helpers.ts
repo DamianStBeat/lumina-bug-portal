@@ -330,3 +330,18 @@ export async function partRowsOf(attachmentId: string): Promise<number> {
     .first<{ n: number }>();
   return r!.n;
 }
+
+// ---------- Desk data (specs for the list's counts and files) ----------
+
+/** One event with exactly this `data` text (or null): the writers only ever store JSON objects, a spec needs the rest. */
+export async function seedEventData(reportId: string, type: string, data: string | null): Promise<number> {
+  const r = await env.DB.prepare("INSERT INTO events (report_id, at, type, data) VALUES (?, ?, ?, ?) RETURNING seq")
+    .bind(reportId, Date.now(), type, data)
+    .first<{ seq: number }>();
+  return r!.seq;
+}
+
+/** Empties what the desk list reads: its counts are over the whole table, so a spec that checks them owns the table. */
+export async function clearDeskTables(): Promise<void> {
+  await env.DB.batch([env.DB.prepare("DELETE FROM events"), env.DB.prepare("DELETE FROM attachments"), env.DB.prepare("DELETE FROM reports")]);
+}

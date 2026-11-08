@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""The `gh` of the end-to-end rows: `gh pr create` prints a PR URL, as the real one does, without touching GitHub.
+Scenario key `gh`: `desk_post` (a person changing the report while the PR is opened, row 6), `exit` (default 0)."""
+
+import sys
+
+sys.dont_write_bytecode = True  # the fakes run from the repo's e2e/fakes: no __pycache__ left there
+import fakelib  # noqa: E402
+
+fakelib.record({"tool": "gh", "argv": sys.argv[1:]})
+sc = fakelib.scenario().get("gh") or {}
+fakelib.desk_post(sc.get("desk_post"))
+code = int(sc.get("exit", 0))
+if code == 0:
+    print("https://github.com/DamianStBeat/Lumina2/pull/123")
+sys.exit(code)

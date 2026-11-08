@@ -135,11 +135,161 @@ Header `Authorization: Bearer <AGENT_KEY>`.
 | `GET /agent/reports/{code}` | | the full report row (minus token and ip hashes) + attachments |
 | `GET /agent/attachments/{id}/download` | | the R2 object, streamed |
 | `POST /agent/reports/{code}/frames` | raw `image/jpeg` or `image/png` <= 10 MB, header `X-Filename` | `201 {attachmentId}` (kind `frames`) |
-| `POST /agent/reports/{code}/triage` | `{verdict, triage, duplicateOf?}` | `200`; sets `status=looking` (or `duplicate`/`not_bug`); 400 `invalid_duplicate_of`; 404 `not_found`; 409 `duplicate_cycle`; 409 `duplicate_busy {retryAfter}` (retry after that many seconds) |
-| `POST /agent/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?}` | `200`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link |
+| `POST /agent/reports/{code}/triage` | `{verdict, triage, duplicateOf?, expectedStatus?}` | `200`; sets `status=looking` (or `duplicate`/`not_bug`); 400 `invalid_duplicate_of`; 404 `not_found`; 409 `duplicate_cycle`; 409 `duplicate_busy {retryAfter}` (retry after that many seconds); 409 `status_changed` (see below) |
+| `POST /agent/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?, expectedStatus?}` | `200`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link; 409 `status_changed` (see below) |
 | `POST /agent/reports` | `{source:"discord", discordUserId, discordName, threadId?, what, title?, where?}` | `201 {code, reportToken}` |
 | `POST /agent/reports/{code}/discord` | `{threadId}` | `200` |
-| `GET /agent/events?after=<seq>&limit=n` | | `200 {events:[{seq, code, at, type, data}], last}` |
+| `GET /agent/events?after=<seq>&limit=n` | | `200 {events:[{seq, code, at, type, data}], last}` (shape: "Event data" below) |
+
+`expectedStatus` (triage and status routes, optional): one of the internal statuses of "Statuses" (any other value, JSON null included:
+400 `invalid_expected_status`). When it is present and differs from the report's current internal status, nothing is
+written (no column, no event) and the worker answers `409 {"error":"status_changed","status":"<current internal
+status>"}`. Absent: today's behaviour, unchanged. The check and the write are one atomic step: one conditional
+`UPDATE … WHERE status = ?`, or a D1 batch whose every statement carries the same condition, so no other write can
+land between them; this holds on the duplicate-link path too (`lib/duplicates.ts`). The desk status route has no
+`expectedStatus` (a key sent there is ignored): a person always wins.
+
+The agent sends `expectedStatus` on every status POST: the status it read; on 409 `status_changed` it drops its write
+and logs it. It sends `expectedStatus` on every triage POST too: the status it read when it claimed the report
+(normally `received`); on 409 `status_changed` it drops the triage and logs it.
+
+### Agent report shape
+
+`GET /agent/reports/{code}` answers one flat JSON object: the report row's columns under their **snake_case** D1 names
+(never camelCase, never nested under a `report` key), with `game_context` and `triage` parsed, plus an `attachments`
+array. The columns are an allow-list (`REPORT_COLUMNS`): `report_token_hash` and `ip_hash` are never sent. 404
+`not_found` for an unknown code. <!-- worker/src/routes/agent.ts:79-93 -->
+
+```json
+{
+  "id": "01JC8Z6Q4M2V7K9T3N5R1B0XYZ",
+  "code": "LUM-482193",
+  "created_at": 1762400000000,
+  "updated_at": 1762400300000,
+  "source": "game",
+  "status": "looking",
+  "title": "Tower vanished",
+  "what": "My tower disappeared after wave 12.",
+  "where_area": null,
+  "device": null,
+  "lang": "en",
+  "roblox_name": "PlayerOne",
+  "roblox_user_id": 123456789,
+  "discord_user_id": null,
+  "discord_name": null,
+  "discord_thread_id": "1301234567890123456",
+  "game_context": { "placeId": 1, "placeVersion": 42, "wave": 12, "fps": 58, "pingMs": 90, "at": 1762399990,
+                    "jobId": "abc", "map": "Forest", "mode": "normal", "platform": "pc", "device": "computer",
+                    "errors": ["..."] },
+  "verdict": "needs_person",
+  "triage": { "stage_a": {}, "stage_b": {}, "files": [], "notes": [], "agent": "0.1.0" },
+  "duplicate_of": null,
+  "pr_url": null,
+  "lease_until": 1762403600000,
+  "lease_by": "valor1-agent",
+  "attachments": [
+    { "id": "01JC8Z7A...", "kind": "video", "filename": "clip.mp4", "mime": "video/mp4", "size_bytes": 48211234,
+      "status": "complete", "created_at": 1762400100000, "completed_at": 1762400200000 }
+  ]
+}
+```
+
+| Key | Type | Null when |
+|---|---|---|
+| `id` | string (ulid) | never |
+| `code` | string `LUM-dddddd` | never |
+| `created_at`, `updated_at` | integer, unix ms | never |
+| `source` | `web` · `game` · `discord` | never |
+| `status` | internal status ("Statuses") | never |
+| `title` | string <= 200 | not given (always null on web reports) |
+| `what` | string 1..2000 | never |
+| `where_area` | `lobby` · `match` · `shop` · `crates` · `clan` · `other` | not given (game reports never have it) |
+| `device` | `phone` · `tablet` · `computer` · `console` | not given (only web reports set it) |
+| `lang` | string <= 10 | not given (discord reports never have it) |
+| `roblox_name` | string <= 20 | not given (discord reports never have it) |
+| `roblox_user_id` | integer | not a game report |
+| `discord_user_id` | string (snowflake) | not a discord report |
+| `discord_name` | string 1..100 (required on the discord create) | not a discord report |
+| `discord_thread_id` | string (snowflake) | no thread linked yet (any source: the bot links game reports too) |
+| `game_context` | **object**, parsed: the game `context` keys that passed the filter (numbers `placeId`, `placeVersion`, `wave`, `fps`, `pingMs`, `at`; strings `jobId`, `map`, `mode`, `platform`; `device`; `errors` string array), each key present only when the game sent it with the right type | not a game report, the game sent none, or the stored text is not JSON |
+| `verdict` | one of the verdicts of "Statuses" | not triaged yet |
+| `triage` | **object**, parsed: exactly the object the agent posted to `/triage` (the worker checks only that it is a JSON object <= 32 KB) | not triaged yet, or the stored text is not JSON |
+| `duplicate_of` | string, a code (the root original) | status is not `duplicate` (every write leaving `duplicate` clears it) |
+| `pr_url` | string <= 300 | no PR link sent yet (a later status POST without `prUrl` keeps the old one) |
+| `lease_until` | integer, unix ms | never claimed (an expired lease stays, not nulled) |
+| `lease_by` | string <= 64 | never claimed |
+| `attachments` | array, ordered by `created_at`, then `id`; `[]` when none | never |
+| `attachments[].id` | string (ulid) | never |
+| `attachments[].kind` | `video` · `image` · `frames` | never |
+| `attachments[].filename` | string <= 120 | never |
+| `attachments[].mime` | string | never |
+| `attachments[].size_bytes` | integer (declared size for `video`/`image`, real size for `frames`) | never |
+| `attachments[].status` | `uploading` · `complete` · `aborted` · `deleted` | never |
+| `attachments[].created_at` | integer, unix ms | never |
+| `attachments[].completed_at` | integer, unix ms | not `complete` (yet) |
+
+Note: every attachment of the report is listed, whatever its status (an upload still running, an aborted one, a video
+retention already deleted) and including the agent's own `frames`: a reader that wants the player's files filters on
+`kind` in (`video`, `image`) and `status = complete`. `r2_key`, `upload_id`, `part_size` and `part_count` are not sent.
+Note: `id` (the internal ulid) and the lease columns are sent although CONTRACT.md never named them; they are harmless
+(the key is Valor1's only) and written here so nobody mistakes them for a leak.
+Note: on game reports `roblox_name` holds the Roblox user name the game server sent (`userName`), not a name the
+player typed; "D1 schema" still says "web only". <!-- worker/src/routes/game.ts:24 -->
+Note: the desk's `GET /desk/reports/{code}` is a different shape (nested under `report`); it is not this route's.
+<!-- worker/src/routes/desk.ts:130 -->
+
+### Event data
+
+`GET /agent/events?after=<seq>&limit=n`: `after` defaults to 0, `limit` to 100 and is capped at 500; a value that is
+not a whole number (or `limit` < 1) is 400 `invalid_after` / `invalid_limit`. <!-- worker/src/routes/agent.ts:288-298 -->
+
+```json
+{ "events": [ { "seq": 41, "code": "LUM-482193", "at": 1762400300000, "type": "status_changed",
+                "data": { "from": "received", "to": "looking" } } ],
+  "last": 41 }
+```
+
+| Key | Type |
+|---|---|
+| `events` | array, ascending `seq`, at most `limit`; `[]` when nothing is newer than `after` |
+| `seq` | integer, strictly increasing; gaps are possible (retention deletes a removed report's events) |
+| `code` | string, or `null` when the report no longer exists |
+| `at` | integer, unix ms |
+| `type` | `created` · `file_added` · `triaged` · `status_changed` · `duplicate_linked` (no other type is written) |
+| `data` | **object** (already parsed, never a JSON string); `null` only if the stored text were not JSON, which no writer produces |
+| `last` | the `seq` of the last event in this page; when `events` is empty, the `after` that was asked (0 when absent) |
+
+`data` by type and writer. A key marked "always" is present on every event of that writer, with JSON `null` when its
+value is absent (SQLite `json_object` keeps null keys); no writer omits a key it lists.
+
+| Type | Writer | `data` keys |
+|---|---|---|
+| `created` | every create: web, game, discord (`POST /agent/reports`) <!-- worker/src/lib/reports.ts:29 (called from routes/public.ts:36, routes/game.ts:32, routes/agent.ts:277) --> | `source`: `web` · `game` · `discord`, always |
+| `file_added` | public upload complete (player video/image) <!-- worker/src/routes/uploads.ts:171,176 --> | `attachmentId`: string; `kind`: `video` · `image`; `size`: integer (declared bytes); all always. Written once per attachment (a repeated complete adds none) |
+| `file_added` | agent frames <!-- worker/src/routes/agent.ts:135,147 --> | `attachmentId`: string; `kind`: `frames`; `size`: integer (real bytes); all always |
+| `triaged` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:203 --> | `verdict`: string, always. Written on every triage POST, status change or not |
+| `triaged` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:91 (via routes/agent.ts:180) --> | `verdict`: `"duplicate"`, always |
+| `status_changed` | agent triage, any verdict but `duplicate` <!-- worker/src/routes/agent.ts:198 --> | `from`, `to` (`looking` or `not_bug`): internal statuses, always. **No** `note`/`prUrl` keys. Written only when the stored status differs from `to` |
+| `status_changed` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:174-182) --> | `from`, `to` (`"duplicate"`), always. No `note`/`prUrl`. Written only when the stored status is not already `duplicate` |
+| `status_changed` | agent status POST, any status but `duplicate` <!-- worker/src/routes/agent.ts:247 --> | `from`, `to`: internal statuses; `note`: string or null; `prUrl`: string or null; all always. Written on every POST, also when `from` equals `to` |
+| `status_changed` | agent status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:227-235) --> | `from`, `to` (`"duplicate"`), `note`, `prUrl`, as the row above; written on every POST, also from `duplicate` |
+| `status_changed` | desk status POST, any status but `duplicate` <!-- worker/src/routes/desk.ts:216 --> | `from`, `to`, `note`, `prUrl` as the agent's; plus `by`: `"desk"` and `email`: string or null (null for an Access service token and the dev bypass); all always. Written on every POST, also when `from` equals `to` |
+| `status_changed` | desk status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/desk.ts:198-206) --> | as the desk row above, `to` = `"duplicate"` |
+| `duplicate_linked` | the linked report itself (triage `duplicate`, agent or desk status `duplicate`) <!-- worker/src/lib/duplicates.ts:92 --> | `duplicateOf`: string, the root original's code (may differ from the `duplicateOf` sent, when that one was itself a duplicate), always |
+| `duplicate_linked` | each report re-pointed by that link (it pointed at the report just linked) <!-- worker/src/lib/duplicates.ts:96 --> | `duplicateOf`: string, the new root code, always. No `status_changed` comes with it (it stays `duplicate`) |
+
+No other writer exists: the retention cron and the public, game and discord-thread routes write no event besides
+`created` and `file_added` above (the cron only deletes a removed report's events). <!-- worker/src/cron.ts:208 -->
+Within one write the events come in this order: `status_changed`, then `triaged`, then `duplicate_linked` (the
+report's own, then the re-pointed ones'), all with the same `at`.
+
+Note: `note` exists only in `status_changed` data; no report column stores it.
+Note: `prUrl` in `status_changed` is the value sent with that POST (null when none was sent), not the stored `pr_url`,
+which keeps an earlier link when none is sent.
+Note: agent and desk status POSTs write `status_changed` even when `from` equals `to` (a `looking` resent to deliver a
+PR link or a note); a reader that acts on a transition compares `from` and `to`.
+
+Bot and agent read exactly these keys; any other key is ignored.
 
 ### Desk (team only)
 
@@ -149,15 +299,32 @@ Path prefix `/api/v1/desk/*`, protected by Cloudflare Access; the worker also ve
 
 | Method, path | Answer |
 |---|---|
-| `GET /desk/reports?filter=all|fix_ready|needs_person|duplicate|not_bug|waiting&cursor=` | page of 50 |
+| `GET /desk/reports?filter=all|fix_ready|needs_person|duplicate|not_bug|waiting&cursor=` | page of 50: `{reports, nextCursor, counts}` (below) |
 | `GET /desk/reports/{code}` | full report, triage, attachments, frames, linked duplicates |
 | `GET /desk/attachments/{id}/stream` | the object, with HTTP Range support (video playback) |
 | `POST /desk/reports/{code}/status` | `{status, prUrl?, note?, duplicateOf?}`; `duplicate` needs `duplicateOf` (same answers as triage), any other status clears the link |
+
+Desk list answer (lead, integration slice, 6 Nov 2026):
+
+- `reports[]`: `code, created_at, updated_at, source, status, verdict, title, what` (first 200 chars), `where_area,
+  device, attachment_count`, and `files: [{kind: "video"|"image", size_bytes}]`: the player's files whose status is
+  not `aborted`, oldest first (`created_at`, then `id`); frames never; `[]` when none.
+- `counts: {all, fix_ready, needs_person, duplicate, not_bug, waiting}`: integers over the whole table with the same
+  conditions as the filters; the same whatever `filter` or `cursor` was asked.
+- Filters: `fix_ready` = status `looking`, verdict `simple_fix`, `pr_url` set. `needs_person` = status `looking` and
+  `pr_url` not set and either verdict `needs_person`, or the report's latest `status_changed` event (highest `seq`)
+  has a `note` beginning `needs_person:` (the agent could not make the simple fix). `duplicate` / `not_bug` /
+  `waiting` = status `duplicate` / `not_bug` / `received`. `all` = every report.
+- The desk row shows the first video, else the first image, as `Video 312 MB · Phone` / `Picture 3 MB · Phone`
+  (MB = bytes / 1 000 000 rounded, at least 1; ` · Device` only when known), `No video` when `files` is empty.
 
 ## Worker bindings and secrets
 
 `DB` (D1), `FILES` (R2), vars `ALLOWED_ORIGINS`, `ENVIRONMENT`, `ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`; secrets
 `TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`. Cron `0 3 * * *` (retention).
+
+Dev only: var `TURNSTILE_VERIFY_URL` replaces Cloudflare's siteverify URL **only when `ENVIRONMENT` is `dev`** (the
+end-to-end run on Valor1 answers it locally, so nothing leaves localhost); with any other `ENVIRONMENT` it is ignored.
 
 ## Player-facing text
 

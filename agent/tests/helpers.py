@@ -20,6 +20,7 @@ import atexit
 import base64
 import getpass
 import http.server
+import io
 import json
 import os
 import re
@@ -227,7 +228,7 @@ class FakeWorker:
             "device": "phone",
             "lang": "en",
             "roblox_name": None,
-            "game_context": json.dumps(game_context) if game_context is not None else None,
+            "game_context": game_context,
             "verdict": None,
             "triage": None,
             "duplicate_of": None,
@@ -478,6 +479,83 @@ class EventsWorker(FakeWorker):
             if m and m.group(1) in self.report_fails:
                 return super()._send(h, 500, {"error": "internal"})
         return super()._send(h, status, payload, ctype)
+
+
+CAS_STATUSES = ("received", "looking", "fixed", "duplicate", "not_bug", "closed")  # CONTRACT.md "Statuses"
+
+
+class CasWorker(FakeWorker):
+    """The shared fake worker plus the compare-and-set of CONTRACT.md "Agent and bot" on the triage and status routes:
+    `expectedStatus` present and different from the stored status → 409 `{"error":"status_changed","status":<current>}`
+    and nothing written; outside the statuses → 400 `invalid_expected_status`; absent → the base fake's behaviour.
+
+    `before[(route, code)]`: a function run once, inside the request, just before the check (a person's write landing
+    while the agent's request is on its way, the interleaving of row 6). Route `claim` too: nothing is checked there, the
+    hook is the person's write landing after the queue listed the report and before the agent reads it. `answers` records
+    (route, code, http status sent, error) for every triage/status request, so a spec can tell an accepted write from a
+    refused one."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.before: dict[tuple[str, str], Any] = {}
+        self.answers: list[tuple[str, str, int, str | None]] = []
+        self._sent = threading.local()  # the status the base handler answered, per request thread
+
+    def _send(self, h: http.server.BaseHTTPRequestHandler, status: int, payload: Any, ctype: str = "application/json") -> None:
+        self._sent.status = status
+        super()._send(h, status, payload, ctype)
+
+    def _handle(self, h: http.server.BaseHTTPRequestHandler, method: str) -> None:
+        parsed = urllib.parse.urlsplit(h.path)
+        claim = re.match(r"^/api/v1/agent/reports/(?P<code>[^/]+)/claim$", parsed.path)
+        if method == "POST" and claim:
+            claim_hook = self.before.pop(("claim", claim.group("code")), None)
+            if claim_hook is not None:
+                claim_hook()
+        m = re.match(r"^/api/v1/agent/reports/(?P<code>[^/]+)/(?P<route>triage|status)$", parsed.path)
+        if method != "POST" or not m:
+            return super()._handle(h, method)
+        route, code = m.group("route"), m.group("code")
+        raw = self._read_body(h)
+        # The base handler reads the body again: hand it the same bytes, with a length that matches them.
+        h.rfile = io.BytesIO(raw)
+        del h.headers["Transfer-Encoding"]
+        del h.headers["Content-Length"]
+        h.headers["Content-Length"] = str(len(raw))
+        hook = self.before.pop((route, code), None)
+        if hook is not None:
+            hook()
+        try:
+            sent = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            sent = None
+        authorised = h.headers.get("Authorization") == f"Bearer {AGENT_KEY}"
+        if authorised and isinstance(sent, dict) and "expectedStatus" in sent and code in self.reports:
+            expected = sent["expectedStatus"]
+            with self._lock:
+                current = self.reports[code]["status"]
+            refusal: tuple[int, dict[str, Any]] | None = None
+            if not isinstance(expected, str) or expected not in CAS_STATUSES:
+                refusal = (400, {"error": "invalid_expected_status"})
+            elif expected != current:
+                refusal = (409, {"error": "status_changed", "status": current})
+            if refusal is not None:
+                record = {"method": method, "path": parsed.path, "query": dict(urllib.parse.parse_qsl(parsed.query)),
+                          "route": route, "code": code, "attachment": None,
+                          "headers": {k.lower(): v for k, v in h.headers.items()}, "body": raw}
+                with self._lock:
+                    self.requests.append(record)
+                    self.answers.append((route, code, refusal[0], refusal[1]["error"]))
+                return self._send(h, refusal[0], refusal[1])
+        self._sent.status = None
+        super()._handle(h, method)
+        with self._lock:
+            self.answers.append((route, code, self._sent.status or 0, None))
+
+    def accepted(self, route: str, code: str) -> int:
+        """How many triage/status requests of `code` on `route` were written (answered 200 by the base handler)."""
+        with self._lock:
+            return sum(1 for r, c, s, _ in self.answers if r == route and c == code and s == 200)
 
 
 # --------------------------------------------------------------------------------------------------------------

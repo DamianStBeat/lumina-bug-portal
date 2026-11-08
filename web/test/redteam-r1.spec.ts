@@ -121,7 +121,9 @@ function holdCreateAnswer(name: string, gate: Promise<void>): void {
 // Sends a.mp4 then b.mp4 (one at a time, so a.mp4's create is the one out), Removes a.mp4 while that create is held
 // unless `remove` is false, and closes the page before the create answers. `hold` holds the create: before the
 // server sees it ('request') or after the server made the attachment ('answer'). `writes`: sessionStorage writes from
-// the close until the next visit (lead's decision, tests-commit 12: the late create answer writes nothing).
+// the close until the next visit. `atClose` and `final`: what storage held at the close, and after the late create's
+// DELETE answered (bp-integration brief 5a decision 3: the late create writes its line before its DELETE and takes it
+// out when the DELETE answers gone, so the state returns to the close; only the not-removed case still writes nothing).
 async function closedWhileCreating(hold: 'request' | 'answer', remove = true) {
   const token = server.addReport(CODE)
   const gate = deferred()
@@ -153,9 +155,10 @@ async function closedWhileCreating(hold: 'request' | 'answer', remove = true) {
   setItem.mockRestore()
   removeItem.mockRestore()
   expect(loadSession()).toEqual(saved)
+  const final = loadSession()
   // Back to the plain fake for the next visit.
   server.install()
-  return { token, a: attOf('a.mp4'), writes }
+  return { token, a: attOf('a.mp4'), writes, atClose: saved, final }
 }
 
 // The next visit (any DELETE it sends again answered), and the rest sent from it: b.mp4 picked again and sent, which
@@ -178,15 +181,16 @@ async function sendTheRest(h2: Hook, token: string): Promise<boolean> {
 }
 
 describe('red team r1, finding 1 (Opus, queue.ts:396): Remove while the create is out, then the page closed', () => {
-  // Lead's decision (tests-commit 12): after the close a removed file's create is not aborted; when it answers, its
-  // attachment gets exactly one DELETE and nothing else is written.
-  it('finding 1: the create held before the server, the page closed: it is not aborted, its attachment reaches the server and gets exactly one DELETE, nothing is written to storage after the close, on reopen a.mp4 is not asked for again, and sending b.mp4 reaches done', async () => {
-    const { token, a, writes } = await closedWhileCreating('request')
+  // Lead's decision (tests-commit 12, final state from bp-integration brief 5a decision 3): after the close a removed
+  // file's create is not aborted; when it answers, its attachment gets exactly one DELETE and, once that DELETE answers
+  // gone, storage is what it was at the close.
+  it('finding 1: the create held before the server, the page closed: it is not aborted, its attachment reaches the server and gets exactly one DELETE, storage after the gone DELETE equals storage at the close, on reopen a.mp4 is not asked for again, and sending b.mp4 reaches done', async () => {
+    const { token, a, atClose, final } = await closedWhileCreating('request')
     expect(creates()[0]!.reached).toBe(true)
     expect(a).toBeDefined()
     expect(deletesOf(a!.id)).toHaveLength(1)
     expect(a!.status).toBe('aborted')
-    expect(writes).toBe(0)
+    expect(final).toEqual(atClose)
     const h2 = await reopen()
     expect(missing(h2)).toEqual(['b.mp4'])
     expect(line('a.mp4')).toBeUndefined()
@@ -203,9 +207,9 @@ describe('red team r1, finding 1 (Opus, queue.ts:396): Remove while the create i
   })
 
   it('finding 1: the create reached the server and its answer was lost to the close: that attachment gets a DELETE (on the closed page or on reopen), a.mp4 is not asked for again, and sending b.mp4 reaches done', async () => {
-    const { token, a, writes } = await closedWhileCreating('answer')
+    const { token, a, atClose, final } = await closedWhileCreating('answer')
     expect(a).toBeDefined()
-    expect(writes).toBe(0)
+    expect(final).toEqual(atClose)
     const h2 = await reopen()
     // It would hold one of the 3 places of the report, for a video the player removed.
     expect(deletesOf(a!.id)).toHaveLength(1)

@@ -186,7 +186,19 @@ const deskRow = (w: DeskListRowWire): DeskReportRow => ({
   device: opt(w.device),
   verdict: opt(w.verdict),
   fileCount: w.attachment_count,
+  files: Array.isArray(w.files) ? w.files.map((f) => ({ kind: f.kind, sizeBytes: f.size_bytes })) : undefined,
 })
+
+// Each number is checked on its own: one bad value costs that tab its number, not all six.
+function deskCounts(raw: unknown): DeskListRes['counts'] {
+  const o = asObject(raw)
+  if (!o) return undefined
+  const out: NonNullable<DeskListRes['counts']> = {}
+  for (const [k, v] of Object.entries(o)) {
+    if (typeof v === 'number' && Number.isInteger(v) && v >= 0) out[k as DeskFilter] = v
+  }
+  return out
+}
 
 const deskAttachment = (a: DeskAttachmentWire): DeskAttachment => ({
   id: a.id,
@@ -202,7 +214,7 @@ export async function deskList(filter: DeskFilter, cursor?: string): Promise<Des
   if (cursor) q.set('cursor', cursor)
   const w = await call<DeskListWire>(`/desk/reports?${q}`, { desk: true })
   if (!Array.isArray(w.reports)) throw badAnswer()
-  return { reports: w.reports.map(deskRow), cursor: opt(w.nextCursor) }
+  return { reports: w.reports.map(deskRow), cursor: opt(w.nextCursor), counts: deskCounts(w.counts) }
 }
 
 export async function deskReport(code: string): Promise<DeskReport> {

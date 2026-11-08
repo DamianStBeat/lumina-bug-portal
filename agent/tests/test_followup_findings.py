@@ -446,7 +446,7 @@ class AuditFinding1BadTwoHundred(unittest.TestCase):
         self._pending_stays(raw=NOT_JSON)
 
     def test_audit1_pending_status_kept_when_report_get_is_cut_short(self) -> None:
-        self._pending_stays(body={"report": {"status": "looking", "updated_at": 0}}, cut_short=True)
+        self._pending_stays(body={"status": "looking", "updated_at": 0}, cut_short=True)
 
     def _seed_not_handled(self, **answer: Any) -> None:
         h, w = _events_harness(self)
@@ -470,7 +470,7 @@ class AuditFinding1BadTwoHundred(unittest.TestCase):
         self._seed_not_handled(raw=NOT_JSON)
 
     def test_audit1_seed_not_handled_when_report_get_is_cut_short(self) -> None:
-        self._seed_not_handled(body={"report": {"code": self.X, "title": None}}, cut_short=True)
+        self._seed_not_handled(body={"code": self.X, "title": None}, cut_short=True)
 
 
 class AuditFinding2OwnTriagedEvent(unittest.TestCase):
@@ -567,7 +567,7 @@ class AuditFinding4To6PendingReadsTheReport(unittest.TestCase):
             with self.subTest(status=label):
                 h = _pending_after_round1(self, self.CODE)
                 assert h.worker is not None
-                h.worker.answer_report(self.CODE, body={"report": row})
+                h.worker.answer_report(self.CODE, body=row)
                 _, r2 = _round(h)
                 self.assertTrue([r for r in r2 if r["route"] == "report" and r["code"] == self.CODE],
                                 "scenario: round 2 read the report")
@@ -582,7 +582,7 @@ class AuditFinding4To6PendingReadsTheReport(unittest.TestCase):
         # Round 3, rule 1: `updated_at` is no longer read, so an answer carrying only the status is a full answer.
         h = _pending_after_round1(self, self.CODE)
         assert h.worker is not None
-        h.worker.answer_report(self.CODE, body={"report": {"status": "looking"}})
+        h.worker.answer_report(self.CODE, body={"status": "looking"})
         _, r2 = _round(h)
         self.assertEqual([b.get("status") for b in _status_bodies(r2, self.CODE)], ["looking"],
                          "the status `looking` alone is enough to deliver the pending one")

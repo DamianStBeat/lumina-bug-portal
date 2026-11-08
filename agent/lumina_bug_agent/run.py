@@ -13,7 +13,7 @@ from typing import Any
 
 from . import AGENT_VERSION, claude_cli, fix, log, media, triage
 from .cache import Cache
-from .client import Client, TooLarge, WorkerError
+from .client import Client, StatusChanged, TooLarge, WorkerError
 from .config import Config
 from .lock import round_lock
 from .media import MediaError
@@ -74,16 +74,6 @@ def fit_triage(triage: dict[str, Any]) -> dict[str, Any]:
     if len(json.dumps(clipped)) <= MAX_TRIAGE_BYTES:
         return clipped
     return dict(clipped, stage_a=None, stage_b=None, files=triage["files"][:3], notes=["triage_too_large"])
-
-
-def _game_context(row: dict[str, Any]) -> Any:
-    context = row.get("game_context")  # a JSON string in D1; kept as text when it does not parse
-    if isinstance(context, str):
-        try:
-            return json.loads(context)
-        except ValueError:
-            pass
-    return context
 
 
 class Round:
@@ -152,14 +142,23 @@ class Round:
     def process(self, code: str, tmp: Path) -> None:
         cfg, dry = self.cfg, self.cfg.dry_run
         if not dry and self.cache.failures(code) >= MAX_FAILURES:
-            self.post_triage(code, "unclear", None, None, [], ["agent_failed"])
+            # No report was read on this path: the queue, which lists `received` reports only, is what the agent read.
+            self.post_triage(code, "unclear", None, None, [], ["agent_failed"], "received")
             self.cache.clear_failures(code)
             return
         answer = self.client.get_json(f"/agent/reports/{code}")
         if not isinstance(answer, dict):
             raise ValueError("report answer is not an object")
-        row = answer["report"] if isinstance(answer.get("report"), dict) else answer
-        attachments = answer.get("attachments") or row.get("attachments") or []
+        row = answer  # CONTRACT.md "Agent report shape": one flat object
+        expected = row.get("status")  # named on the triage POST: a person's change after this read wins over the triage
+        if not isinstance(expected, str):
+            raise ValueError("report answer has no status")
+        if expected != "received":
+            # The queue, read once at the start of the round, listed it as `received`: someone moved it since. Naming
+            # this status on the triage would make the worker accept a write over that person's decision.
+            fix.note_superseded(self.cache, code, expected)
+            return
+        attachments = row.get("attachments")
         files, images, uploads = self.files(code, attachments if isinstance(attachments, list) else [], tmp)
         for att_id, n, sheet in uploads:
             if dry:
@@ -189,8 +188,10 @@ class Round:
                 stage_a["injection_suspected"] = True
             stage_b = self.stage_b(code, row, stage_a)
             verdict, notes = (stage_b["verdict"], []) if stage_b else ("unclear", ["stage_b_invalid"])
-        self.post_triage(code, verdict, stage_a, stage_b, files, notes)
+        written = self.post_triage(code, verdict, stage_a, stage_b, files, notes, expected)
         self.cache.clear_failures(code)
+        if not written:  # a person decided meanwhile: a triage the worker refused is not remembered, and no stage C
+            return
         if stage_a is not None:
             status = {"duplicate": "duplicate", "not_bug": "not_bug"}.get(verdict, "looking")  # as the worker sets it
             summary = stage_b["summary"] if stage_b else ""
@@ -204,7 +205,7 @@ class Round:
             triage.fetch(self.cfg)  # GitError: no verdict on stale or missing code, the report is retried
             self.fetched = True
         # The duplicate list carries stage A's summaries, never another report's raw text (see remember above).
-        return triage.run(self.cfg, code, stage_a, _game_context(row), self.cache.recent(exclude=code))
+        return triage.run(self.cfg, code, stage_a, row.get("game_context"), self.cache.recent(exclude=code))
 
     def sync_events(self) -> None:
         """Statuses of remembered reports, and unknown ones (seed), from GET /agent/events; a failure is not fatal.
@@ -247,13 +248,8 @@ class Round:
             return True
         if ev.get("type") in ("created", "triaged") and not self.seed(ev["code"], refresh=ev.get("type") == "triaged"):
             return False
-        data = ev.get("data")
-        if isinstance(data, str):
-            try:
-                data = json.loads(data)
-            except ValueError:
-                data = None
-        status = (data.get("status") or data.get("to")) if isinstance(data, dict) else None
+        data = ev.get("data")  # CONTRACT.md "Event data": an object, or null; only `to` names a status
+        status = data.get("to") if isinstance(data, dict) else None
         if ev.get("type") == "duplicate_linked" and status is None:
             status = "duplicate"
         if status in STATUSES:
@@ -281,16 +277,11 @@ class Round:
                 return True
             log("seed failed", code=code, status=exc.status or "none")
             return self.stall(code)
-        row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
+        row = answer
         if not isinstance(row, dict):
             log("seed failed", code=code, status="bad_answer")
             return self.stall(code)
-        found = row.get("triage")  # a JSON string in D1, null until triaged
-        if isinstance(found, str):
-            try:
-                found = json.loads(found)
-            except ValueError:
-                found = None
+        found = row.get("triage")  # parsed by the worker, null until triaged
         stage_b = found.get("stage_b") if isinstance(found, dict) else None
         summary = stage_b.get("summary") if isinstance(stage_b, dict) else None
         title, verdict, status = row.get("title"), row.get("verdict"), row.get("status")
@@ -313,7 +304,7 @@ class Round:
 
     def stage_a_prompt(self, row: dict[str, Any]) -> str:
         data: dict[str, Any] = {k: row.get(k) for k in PLAYER_FIELDS}
-        data["game_context"] = _game_context(row)
+        data["game_context"] = row.get("game_context")
         nonce, block = claude_cli.data_block(data)
         # NONCE first: the player data is inserted last, so text in it is never treated as a placeholder.
         return claude_cli.render("stage_a.md", {"NONCE": nonce, "PLAYER_DATA": block})
@@ -362,10 +353,16 @@ class Round:
             dest.unlink(missing_ok=True)  # up to 2 GiB each: gone as soon as the frames exist
 
     def post_triage(
-        self, code: str, verdict: str, stage_a: Any, stage_b: Any, files: list[Any], notes: list[str]
-    ) -> None:
+        self, code: str, verdict: str, stage_a: Any, stage_b: Any, files: list[Any], notes: list[str], expected: str
+    ) -> bool:
+        """False: the report left status `expected` since it was read: the worker refused the triage, it is dropped."""
         triage = {"stage_a": stage_a, "stage_b": stage_b, "files": files, "notes": notes, "agent": AGENT_VERSION}
         duplicate = stage_b.get("duplicate_of") if verdict == "duplicate" and isinstance(stage_b, dict) else None
-        body = {"verdict": verdict, "triage": fit_triage(triage), "duplicateOf": duplicate}
-        self.client.post_json(f"/agent/reports/{code}/triage", body)
+        body = {"verdict": verdict, "triage": fit_triage(triage), "duplicateOf": duplicate, "expectedStatus": expected}
+        try:
+            self.client.post_json(f"/agent/reports/{code}/triage", body)
+        except StatusChanged as exc:
+            fix.note_superseded(self.cache, code, exc.current)
+            return False
         log("triaged", code=code, verdict=verdict, files=len(files))
+        return True

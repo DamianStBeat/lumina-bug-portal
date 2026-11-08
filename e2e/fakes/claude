@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""The `claude` of the end-to-end rows: answers the agent's three calls (stage A, stage B, builder) from the round's
+scenario, the way the real CLI prints them (one `result` line, with a `system` line first on stage A's stream-json).
+Its stage is read from the same flags the agent sends. A stage may also carry `desk_post`: a person changing the report
+while this call runs (row 6). Modelled on agent/tests/helpers.py, which fakes it for the unit specs."""
+
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True  # the fakes run from the repo's e2e/fakes: no __pycache__ left there
+import fakelib  # noqa: E402
+
+
+def stage_of(argv: list[str]) -> str:
+    value = lambda flag: argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+    if value("--input-format") == "stream-json":
+        return "stage_a"
+    tools = value("--tools")
+    if (tools is not None and "Edit" in tools) or "Edit" in (value("--allowedTools") or ""):
+        return "builder"
+    return "stage_b" if tools is not None else "unknown"
+
+
+argv = sys.argv[1:]
+stage = stage_of(argv)
+stdin = sys.stdin.buffer.read().decode("utf-8", "replace")
+images = 0
+if stage == "stage_a":
+    message = json.loads(stdin.splitlines()[0])
+    images = sum(1 for c in message["message"]["content"] if c.get("type") == "image")
+fakelib.record({"tool": "claude", "stage": stage, "images": images, "cwd": os.getcwd()})
+
+sc = fakelib.scenario().get(stage)
+if sc is None:
+    sys.stderr.write(f"fake claude: no scenario for {stage}\n")
+    sys.exit(3)
+fakelib.desk_post(sc.get("desk_post"))
+for rel, content in (sc.get("writes") or {}).items():
+    path = os.path.join(os.getcwd(), rel)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+if stage == "stage_a":
+    print(json.dumps({"type": "system", "subtype": "init", "session_id": "0", "tools": [], "model": "claude-opus-5-5"}))
+obj = sc["object"]
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "num_turns": 1, "session_id": "0",
+                  "result": json.dumps(obj), "structured_output": obj}))
