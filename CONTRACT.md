@@ -359,6 +359,10 @@ own authentication on every route.
   `image/jpeg`, `image/png`. A file is its parts: `<attachmentId>/part-NNNNN` (5 digits, from 00001). Frames are one
   object `<attachmentId>/frame` written by the function. The function never carries video or player-image bytes.
 
+- Event order: `seq` must become visible in order, or a reader's cursor passes a number still uncommitted and that event
+  is lost. A `BEFORE INSERT ... FOR EACH STATEMENT` trigger on `events` takes one transaction-scoped advisory lock, so
+  every writer serializes from before `seq` is assigned until its commit.
+
 ### Upload routes
 
 `PUT /attachments/{id}/parts/{n}` no longer exists. New:
