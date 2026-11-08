@@ -362,6 +362,8 @@ own authentication on every route.
 - Event order: `seq` must become visible in order, or a reader's cursor passes a number still uncommitted and that event
   is lost. A `BEFORE INSERT ... FOR EACH STATEMENT` trigger on `events` takes one transaction-scoped advisory lock, so
   every writer serializes from before `seq` is assigned until its commit.
+  The trigger function carries `SET lock_timeout = '2s'`, so a stuck holder cannot pile up writers: any route that hits a lock
+  timeout or deadlock answers `503 {"error":"busy"}` with `Retry-After`, except the duplicate-link path's `409 duplicate_busy`.
 
 ### Upload routes
 
