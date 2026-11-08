@@ -43,8 +43,14 @@ agent/lumina_bug_agent/client.py|storage requests carry no Authorization|reuse _
 agent/lumina_bug_agent/client.py|one new manifest per download|retry without limit|test_s7_row3_a_second_expiry
 agent/lumina_bug_agent/client.py|one new manifest per download|one per report round|test_s7_row3_each_attachment
 agent/lumina_bug_agent/client.py|resume at the expired part|restart at part 1|test_s7_row3_a_403_gets_one_new_manifest
-agent/lumina_bug_agent/client.py|only 403 asks for a new manifest|any storage error|test_s7_row3_a_storage_server_error
+agent/lumina_bug_agent/client.py|only 400, 401 and 403 ask for a new manifest|any storage error|test_s7_row3_a_storage_server_error
+agent/lumina_bug_agent/client.py|EXPIRED_URL = (400, 401, 403)|EXPIRED_URL = (403,)|test_s7_row3_a_400_or_401
+agent/lumina_bug_agent/client.py|EXPIRED_URL = (400, 401, 403)|EXPIRED_URL = (400, 403)|test_s7_row3_a_400_or_401
+agent/lumina_bug_agent/client.py|exc.code in EXPIRED_URL|exc.code < 500|test_s7_row3_a_404
+agent/lumina_bug_agent/client.py|part url must start with https:// or http://|drop the scheme check|test_s7_row2_a_local_file_url
+agent/lumina_bug_agent/client.py|new manifest must keep the part sizes of the first|if False|test_s7_row3_a_new_manifest_with_other_part_sizes
 agent/lumina_bug_agent/run.py|retention only when RETENTION_FALLBACK is 1|run it whenever the key is set|test_s7_row4_only_the_value_1
+agent/lumina_bug_agent/config.py|text("RETENTION_FALLBACK", "0") == "1"|!= "0"|test_s7_row4_only_the_value_1
 agent/lumina_bug_agent/run.py|retention off when the variable is unset|default on|test_s7_row4_unset
 agent/lumina_bug_agent/run.py|at most 20 calls|at most 200|test_s7_row4_never_done
 agent/lumina_bug_agent/run.py|stop when done is true|always 20|test_s7_row4_done_on_the_first

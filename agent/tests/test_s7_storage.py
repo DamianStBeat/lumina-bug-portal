@@ -176,6 +176,21 @@ class S7Row2ThreeParts(unittest.TestCase):
                 h.assert_round_ok(p)
                 assert_download_failed(h, self, code, "att-3p")
 
+    def test_s7_row2_a_local_file_url_is_refused_even_at_the_declared_size(self) -> None:
+        h = Harness(self)
+        three_part_report(h, "LUM-710013")
+        # The local file holds the very bytes of the part it replaces: only the URL's scheme can refuse it. With a wrong
+        # size the per-part check would fail it first and hide a missing scheme check.
+        local = h.root / "not-the-bucket.bin"
+        local.write_bytes(h.worker.storage.files["att-3p"][1])
+
+        def edit(m: dict[str, Any]) -> dict[str, Any]:
+            return {**m, "parts": [m["parts"][0], {**m["parts"][1], "url": local.as_uri()}, m["parts"][2]]}
+
+        h.worker.manifest_edit["att-3p"] = edit
+        h.assert_round_ok(h.run())
+        assert_download_failed(h, self, "LUM-710013", "att-3p")
+
     def test_s7_row2_declared_over_the_cap_is_refused_before_any_part_is_fetched(self) -> None:
         h = Harness(self)
         three_part_report(h, "LUM-710011")
@@ -260,6 +275,56 @@ class S7Row3UrlExpired(unittest.TestCase):
         self.assertEqual(len(h.worker.calls("download")), 1, "a 500 asks for no new manifest")
         assert_download_failed(h, self, "LUM-720005", "att-3p")
 
+    def test_s7_row3_a_400_or_401_counts_as_an_expired_url_too(self) -> None:
+        # Hosted Supabase may send an expired URL as HTTP 400 with `statusCode: "403"` in the body.
+        expired = b'{"statusCode":"403","error":"Unauthorized","message":"exp claim timestamp check failed"}'
+        for status in (400, 401):
+            with self.subTest(status):
+                h = Harness(self)
+                data = three_part_report(h, "LUM-720008")
+                h.worker.storage.answer("att-3p", 2, status=status, body=expired)
+                h.assert_round_ok(h.run())
+                self.assertEqual(len(h.worker.calls("download")), 2, "exactly one new manifest")
+                self.assertEqual(h.worker.storage.parts_asked("att-3p"), [1, 2, 2, 3], "it resumes from the refused part")
+                tokens = [r["token"] for r in h.worker.storage.calls("att-3p") if r["n"] == 2]
+                self.assertNotEqual(tokens[0], tokens[1], "the second try is on the new manifest's URL")
+                assert_probed(h, self, data)
+                self.assertEqual(entry_of(h, "LUM-720008", "att-3p").get("status"), "ok")
+
+    def test_s7_row3_a_404_is_not_an_expiry(self) -> None:
+        h = Harness(self)
+        three_part_report(h, "LUM-720009")
+        h.worker.storage.answer("att-3p", 2, status=404, body=b'{"error":"not_found"}')
+        h.assert_round_ok(h.run())
+        self.assertEqual(len(h.worker.calls("download")), 1, "a missing object asks for no new manifest")
+        assert_download_failed(h, self, "LUM-720009", "att-3p")
+
+    def test_s7_row3_a_new_manifest_with_other_part_sizes_is_a_failed_download(self) -> None:
+        h = Harness(self)
+        data = three_part_report(h, "LUM-720010")
+        h.worker.storage.expire("att-3p", 2)
+        first = len(h.worker.storage.files["att-3p"][0])
+        served = 0
+
+        def re_split_on_the_second_manifest(m: dict[str, Any]) -> dict[str, Any]:
+            nonlocal served
+            served += 1
+            if served == 1:
+                return m
+            # The same bytes cut elsewhere, and the bucket holds these parts now: every part matches its own size and
+            # the total is the same, so only the comparison of the two plans can tell that part 1 was cut differently.
+            cuts = [0, first // 2, first + first // 2, len(data)]
+            parts = [data[a:b] for a, b in zip(cuts, cuts[1:], strict=False)]
+            h.worker.storage.files["att-3p"] = parts
+            return {**m, "parts": [{**p, "size": len(b)} for p, b in zip(m["parts"], parts, strict=True)]}
+
+        h.worker.manifest_edit["att-3p"] = re_split_on_the_second_manifest
+        h.assert_round_ok(h.run())
+        assert_download_failed(h, self, "LUM-720010", "att-3p")
+        self.assertEqual(len(h.worker.calls("download")), 2, "the new manifest was asked for and read")
+        self.assertEqual(h.worker.storage.parts_asked("att-3p"), [1, 2],
+                         "part 1 was joined under the first plan; nothing of the second one is fetched")  # fmt: skip
+
     def test_s7_row3_each_attachment_has_its_own_new_manifest(self) -> None:
         h = Harness(self)
         a, b = video_bytes(), video_bytes(duration=2)
@@ -305,7 +370,7 @@ class S7Row4RetentionFallback(unittest.TestCase):
         self.assertEqual(len(h.triages("LUM-740001")), 1, "the round itself ran")
 
     def test_s7_row4_only_the_value_1_turns_it_on(self) -> None:
-        for value in ("0", ""):
+        for value in ("0", "", "2", "true"):
             with self.subTest(value):
                 h, _ = self.round_with("LUM-740002", RETENTION_FALLBACK=value)
                 self.assertEqual(h.worker.calls("retention"), [])
