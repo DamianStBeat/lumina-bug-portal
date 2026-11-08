@@ -191,7 +191,9 @@ describe('queue: Remove', () => {
   it('remove pressed while the file is hashed waits for the hash, then sends the DELETE, and onBack is not called', () => {
     const s1 = reduce(initial(session([saved('a.mp4', H1, att('A'))])), pickOf([vid('a.mp4')]))
     const s2 = reduce(s1, { t: 'remove', key: s1.items[0]!.key })
-    expect(s2.fx).toEqual([])
+    // Row 10 (DESIGN.md section 6): saved at press, by the only name the file has before its hash; no request goes yet.
+    expect(s2.session?.pending).toEqual([{ name: 'a.mp4', size: SIZE }])
+    expect(s2.fx).toEqual([{ t: 'save', session: s2.session }])
     const s3 = hashed(s2, {}, s1)
     expect(fxOf(s3, 'delete').map((d) => d.id)).toEqual(['A'])
     expect(fxOf(s3, 'back')).toEqual([])
@@ -304,10 +306,12 @@ describe('queue: Remove and Send together (rows 1 and 2)', () => {
     const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
     const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'a.mp4') })
     expect(item(s1, 'a.mp4')?.step).toBe('removing')
-    // Lead's decision (brief-build-4 item 1): its open line leaves storage at once, so no reload asks for it.
+    // DESIGN.md section 1 reverses the earlier decision (brief-build-4 item 1, the open line left storage at once): the
+    // line is marked at press and kept, so the create's answer finds where to write its id. A reload still never asks
+    // for it (`resumeOf` skips a marked line) and the next load drops it (queue-reload.spec.ts spec 7).
     expect(line(s0, 'a.mp4')).toMatchObject({ attachmentId: null })
-    expect(line(s1, 'a.mp4')).toBeUndefined()
-    expect(s1.session?.files.map((f) => f.name)).toEqual(['b.mp4'])
+    expect(line(s1, 'a.mp4')).toMatchObject({ attachmentId: null, done: false, removing: true })
+    expect(s1.session?.files.map((f) => f.name)).toEqual(['a.mp4', 'b.mp4'])
     expect(s1.fx).toEqual([{ t: 'save', session: s1.session }])
     const s2 = created(s1, 'A', s0)
     expect(fxOf(s2, 'upload')).toEqual([])
@@ -592,7 +596,9 @@ describe('queue: completing, paused, and Remove wins at once', () => {
     const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'b.mp4') })
     expect(fxOf(s1, 'delete').map((d) => d.id)).toEqual(['B'])
     const s2 = reduce(s1, { t: 'remove', key: t.key })
-    expect(s2.fx).toEqual([{ t: 'abort', key: t.key }])
+    // Saved at press, before the abort (DESIGN.md section 6); its DELETE still waits for its turn.
+    expect(line(s2, 'a.mp4')).toMatchObject({ attachmentId: 'A', removing: true })
+    expect(s2.fx).toEqual([{ t: 'save', session: s2.session }, { t: 'abort', key: t.key }])
     const answers: Event[] = [
       { t: 'uploaded', ...t },
       { t: 'failed', ...t, why: null },
@@ -611,10 +617,10 @@ describe('queue: completing, paused, and Remove wins at once', () => {
     expect(s4.session).toBeNull()
   })
 
-  it('Remove while its create is out: its open line leaves the session at once (saved), so a reload never asks for it; the create is not stopped', () => {
+  it('Remove while its create is out: its open line is marked at once (saved), so a reload never asks for it; the create is not stopped', () => {
     const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
     const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'a.mp4') })
-    expect(line(s1, 'a.mp4')).toBeUndefined()
+    expect(line(s1, 'a.mp4')).toMatchObject({ attachmentId: null, done: false, removing: true })
     expect(fxOf(s1, 'save')).toEqual([{ t: 'save', session: s1.session }])
     expect(fxOf(s1, 'abort')).toEqual([])
     expect(resumeOf({ session: s1.session, items: [] })?.missing).toEqual([{ name: 'b.mp4', size: SIZE }])
@@ -628,7 +634,8 @@ describe('queue: completing, paused, and Remove wins at once', () => {
     const s1 = reduce(s0, { t: 'remove', key: keyOf(s0, 'b.mp4') })
     expect(fxOf(s1, 'delete').map((d) => d.id)).toEqual(['B'])
     const s2 = reduce(s1, { t: 'remove', key: keyOf(s0, 'a.mp4') })
-    expect(line(s2, 'a.mp4')).toBeUndefined()
+    // Saved at press even while its turn waits (DESIGN.md section 1): the id-less line, marked.
+    expect(line(s2, 'a.mp4')).toMatchObject({ attachmentId: null, done: false, removing: true })
     return { s0, s1, s2 }
   }
   it('created for a file whose Remove waits behind another DELETE: no upload, the attachment written down marked, its turn deletes it', () => {
@@ -653,7 +660,7 @@ describe('queue: completing, paused, and Remove wins at once', () => {
     expect(names(deletedFx(s3, true, s1))).toEqual([])
   })
 
-  it('page left while a removed file\'s create is out: that create is kept; its answer afterwards sends its DELETE once and writes nothing', () => {
+  it('page left while a removed file\'s create is out: that create is kept; its answer afterwards hands on its id once, as an adopt, and the old page writes nothing', () => {
     const s0 = reduce(ready(initial(null), [vid('a.mp4'), vid('b.mp4')], { 'b.mp4': H2 }), { t: 'send', target: T })
     const c = fxOf(s0, 'create')[0]!
     const ans: Event = { t: 'created', key: c.key, gen: c.gen, epoch: c.epoch, att: att('A') }
@@ -667,7 +674,9 @@ describe('queue: completing, paused, and Remove wins at once', () => {
     expect(fxOf(s2, 'stop')).toEqual([{ t: 'stop', keep: [c.key] }])
     expect(fxOf(s2, 'save')).toEqual([])
     const s3 = reduce(s2, ans)
-    expect(s3.fx).toEqual([{ t: 'delete', id: 'A', token: 'tok', epoch: 0, by: { k: 'left' } }])
+    // DESIGN.md section 3: a bare DELETE would forget the attachment if it failed, so the old page hands on a marked
+    // line; the hook decides who sends the DELETE and keeps a failed one (queue-reload.spec.ts specs 5 and 6).
+    expect(s3.fx).toEqual([{ t: 'adopt', code: T.code, token: 'tok', line: saved('a.mp4', H1, att('A'), { removing: true }) }])
     expect(s3.session).toBe(s2.session)
     expect(reduce(s3, ans)).toBe(s3)
     for (const gone of [true, false]) expect(reduce(s3, { t: 'deleted', id: 'A', epoch: 0, by: { k: 'left' }, gone })).toBe(s3)
