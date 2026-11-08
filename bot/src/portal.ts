@@ -82,19 +82,6 @@ type CallOptions = { json?: unknown; bytes?: Uint8Array; auth: Auth };
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
 
-function normaliseData(data: unknown): Record<string, unknown> {
-  if (isObject(data)) return data;
-  if (typeof data === 'string') {
-    try {
-      const parsed: unknown = JSON.parse(data);
-      return isObject(parsed) ? parsed : {};
-    } catch {
-      return {};
-    }
-  }
-  return {};
-}
-
 export class PortalApi {
   private readonly base: string;
   private readonly agentKey: string;
@@ -122,15 +109,13 @@ export class PortalApi {
 
   async getReport(code: string): Promise<ReportRow> {
     const body = await this.call('GET', `/agent/reports/${enc(code)}`, { auth: { kind: 'agent' } });
-    // CONTRACT.md says "the full report row + attachments" without pinning the shape: a flat row and
-    // `{ report, attachments }` are both read (the agent slice accepts both too).
-    const row = isObject(body) && isObject(body['report']) ? body['report'] : body;
+    // CONTRACT.md "Agent report shape": one flat object, nothing else is the row.
     // Without a string status the bot would have to guess one, and a player must never read a status the worker
     // did not send (fix round 3, decision 20).
-    if (!isObject(row) || typeof row['code'] !== 'string' || typeof row['status'] !== 'string') {
+    if (!isObject(body) || typeof body['code'] !== 'string' || typeof body['status'] !== 'string') {
       throw new PortalError('bad_response');
     }
-    return row as ReportRow;
+    return body as ReportRow;
   }
 
   async getEvents(after: number, limit = 50): Promise<{ events: PortalEvent[]; last: number }> {
@@ -147,7 +132,8 @@ export class PortalApi {
         code: e['code'] as string | null,
         at: typeof e['at'] === 'number' ? e['at'] : 0,
         type: e['type'],
-        data: normaliseData(e['data']),
+        // CONTRACT.md "Event data": an object, or null when the stored text was not JSON. Anything else names no key.
+        data: isObject(e['data']) ? e['data'] : {},
       });
     }
     const last = typeof body['last'] === 'number' ? body['last'] : Math.max(after, ...events.map((e) => e.seq));

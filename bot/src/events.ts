@@ -141,9 +141,14 @@ export class EventPoller {
     if (cursor === undefined) return;
     const { events } = await this.api.getEvents(cursor);
     const ordered = events.filter((e) => e.seq > cursor).sort((a, b) => a.seq - b.seq);
+    let last = cursor;
     for (const event of ordered) {
+      // A seq listed twice is one event, and a player reads its message once (row 7). The page is sorted: a repeat is
+      // always next to the first one.
+      if (event.seq <= last) continue;
       await this.handleOrSkip(event);
       await this.advance(event.seq);
+      last = event.seq;
     }
   }
 
@@ -283,13 +288,12 @@ export class EventPoller {
   }
 
   private async onStatusChanged(event: CodedEvent): Promise<void> {
-    // The worker writes `{ from, to, note?, prUrl? }`; `status` is read too for tolerance. An event that names its
-    // new status is trusted; only one without it costs a lookup to learn whether it is fixed.
-    const { to, status: named } = event.data;
-    const status = typeof to === 'string' ? to : named;
-    if (typeof status === 'string' && status !== 'fixed') return;
+    // CONTRACT.md "Event data": every writer sends `from` and `to`; an event without them names no status. An event
+    // that names its new status is trusted, with no lookup to learn whether it is fixed. A status POST writes this
+    // event even when nothing changed (a `fixed` resent with a note or a PR link): only a real transition is news.
+    const { from, to } = event.data;
+    if (to !== 'fixed' || typeof from !== 'string' || from === to) return;
     const report = await this.api.getReport(event.code);
-    if (typeof status !== 'string' && report.status !== 'fixed') return;
     const threadId = this.threadOf(report);
     if (!threadId) return;
     const note = typeof event.data['note'] === 'string' ? event.data['note'] : undefined;
@@ -299,8 +303,8 @@ export class EventPoller {
 
   private async onDuplicateLinked(event: CodedEvent): Promise<void> {
     const report = await this.api.getReport(event.code);
-    // CONTRACT.md does not name the data key: both spellings are read.
-    const named = event.data['duplicateOf'] ?? event.data['duplicate_of'];
+    // CONTRACT.md "Event data": `duplicateOf` is the one key. The row comes first: a later link may have moved it.
+    const named = event.data['duplicateOf'];
     const original = report.duplicate_of ?? (typeof named === 'string' ? named : null);
     if (!original) return;
     const threadId = this.threadOf(report);

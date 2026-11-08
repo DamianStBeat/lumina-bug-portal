@@ -12,7 +12,7 @@ from typing import Any
 
 from . import claude_cli, guard, log, triage
 from .cache import Cache
-from .client import Client, WorkerError
+from .client import Client, StatusChanged, WorkerError
 from .config import Config
 
 MIN_CONFIDENCE = 0.8
@@ -69,7 +69,11 @@ def run(cfg: Config, client: Client, cache: Cache, code: str, row: dict[str, Any
         except Exception as exc:  # cleaned up by attempt's `finally`; a person must still hear of it
             log("stage C error", code=code, error=type(exc).__name__)
             reason = "agent_failed"
-    body = {"status": "looking", "prUrl": url} if url else {"status": "looking", "note": f"needs_person: {reason}"}
+    body: dict[str, Any] = {"status": "looking"}
+    body.update({"prUrl": url} if url else {"note": f"needs_person: {reason}"})
+    # The status this agent's triage left: stage C runs only on a `simple_fix`, which the worker stores as `looking`.
+    # A person who moved the report while stage C worked wins: the worker refuses this write (StatusChanged).
+    body["expectedStatus"] = "looking"
     log("stage C", code=code, result="draft_pr" if url else reason)
     post_status(client, cache, code, body)
 
@@ -81,6 +85,9 @@ def post_status(client: Client, cache: Cache, code: str, body: dict[str, Any]) -
         try:
             client.post_json(f"/agent/reports/{code}/status", body)
             return
+        except StatusChanged as exc:
+            note_superseded(cache, code, exc.current)  # a final answer, not a failure: no retry, nothing pending
+            return
         except WorkerError as exc:
             log("status failed", code=code, status=exc.status or "none")
         time.sleep(pause)
@@ -88,9 +95,22 @@ def post_status(client: Client, cache: Cache, code: str, body: dict[str, Any]) -
     log("status pending", code=code)
 
 
+def _loggable(status: str) -> str:
+    """A status from the worker as it may appear in a log line."""
+    return status if STATUS_RX.fullmatch(status) else "other"
+
+
+def note_superseded(cache: Cache, code: str, current: str) -> None:
+    """The worker refused a write of ours because someone else changed the report: drop it, and anything still waiting
+    for that report, which was decided from the same out-of-date status."""
+    cache.drop_pending_status(code)
+    log("status superseded", code=code, current=_loggable(current))
+
+
 def send_pending(client: Client, cache: Cache) -> None:
     """Once per round, before the queue, oldest first: each pending status once, and only onto a report still
-    `looking`. Kept on a transient failure (no answer: then stop); dropped on another 4xx or after 7 days."""
+    `looking`. Kept on a transient failure (no answer: then stop); dropped on a 409 `status_changed`, on another 4xx or
+    after 7 days."""
     now = int(time.time())
     for code, body, at in cache.pending_statuses():
         if now - at > PENDING_MAX_AGE:
@@ -104,9 +124,13 @@ def send_pending(client: Client, cache: Cache) -> None:
             # `fixed` or `closed` back. Not updated_at: a player's upload moves it with no status change (uploads.ts),
             # and a `looking` resent onto `looking` changes no status, it only delivers the PR link or the note.
             if current is not None and current != "looking":
-                superseded = current if STATUS_RX.fullmatch(current) else "other"
+                superseded = _loggable(current)
             elif current is not None:
-                client.post_json(f"/agent/reports/{code}/status", json.loads(body))
+                # The GET saves a POST and catches a body stored before `expectedStatus` existed; the key below closes
+                # the window between this read and the write, which the GET alone cannot.
+                client.post_json(f"/agent/reports/{code}/status", {**json.loads(body), "expectedStatus": current})
+        except StatusChanged as exc:
+            note_superseded(cache, code, exc.current)
         except WorkerError as exc:
             if transient(exc.status):
                 log("status still pending", code=code, status=exc.status or "none")
@@ -128,8 +152,7 @@ def send_pending(client: Client, cache: Cache) -> None:
 def _current(client: Client, code: str) -> str | None:
     """The report's status as the worker has it now; None for an answer without a string status."""
     answer = client.get_json(f"/agent/reports/{code}")
-    row = answer.get("report") if isinstance(answer, dict) and isinstance(answer.get("report"), dict) else answer
-    status = row.get("status") if isinstance(row, dict) else None
+    status = answer.get("status") if isinstance(answer, dict) else None
     return status if isinstance(status, str) else None
 
 

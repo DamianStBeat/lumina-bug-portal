@@ -11,6 +11,7 @@ from typing import Any
 
 TIMEOUT = 30
 CHUNK = 1 << 20
+MAX_ERROR_BODY = 1024  # an error answer is one short JSON object: nothing longer is worth reading
 
 
 class WorkerError(Exception):
@@ -21,8 +22,29 @@ class WorkerError(Exception):
         self.status = status
 
 
+class StatusChanged(WorkerError):
+    """409 `status_changed`: the report is no longer in the status this write named as `expectedStatus` (CONTRACT.md
+    "Agent and bot"), so nothing was written. `current` is the status it has now, "" when the answer named none."""
+
+    def __init__(self, current: str) -> None:
+        super().__init__(409)
+        self.current = current
+
+
 class TooLarge(Exception):
     pass
+
+
+def _status_changed(exc: urllib.error.HTTPError) -> str | None:
+    """The current status of a 409 `status_changed`; None for any other 409 (`leased`, `duplicate_cycle`, ...)."""
+    try:
+        answer = json.loads(exc.read(MAX_ERROR_BODY))
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+    if not isinstance(answer, dict) or answer.get("error") != "status_changed":
+        return None
+    status = answer.get("status")
+    return status if isinstance(status, str) else ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -46,7 +68,10 @@ class Client:
         try:
             return self._opener.open(req, timeout=TIMEOUT)
         except urllib.error.HTTPError as exc:
+            current = _status_changed(exc) if exc.code == 409 else None
             exc.close()
+            if current is not None:
+                raise StatusChanged(current) from None
             raise WorkerError(exc.code) from None
         # A bad status line or header from the worker comes out of urllib as http.client's own error, not OSError.
         except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):

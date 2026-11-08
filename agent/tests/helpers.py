@@ -228,7 +228,7 @@ class FakeWorker:
             "device": "phone",
             "lang": "en",
             "roblox_name": None,
-            "game_context": json.dumps(game_context) if game_context is not None else None,
+            "game_context": game_context,
             "verdict": None,
             "triage": None,
             "duplicate_of": None,

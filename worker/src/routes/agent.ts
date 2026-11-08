@@ -1,7 +1,7 @@
 // Agent and bot routes (CONTRACT.md "Agent and bot"): the Valor1 triage agent and the Discord bot, bearer AGENT_KEY.
 import { requireAgentKey } from "../lib/auth";
 import { CODE_PATTERN, ulid } from "../lib/codes";
-import { duplicateTarget, linkDuplicate } from "../lib/duplicates";
+import { duplicateTarget, linkDuplicate, statusChanged } from "../lib/duplicates";
 import { apiPath, dispatch, HttpError, json, readBody, readJson, type Route, type RouteHandler } from "../lib/http";
 import { enforceRate } from "../lib/rate";
 import { insertReport, reportOf } from "../lib/reports";
@@ -41,6 +41,12 @@ function parseStored(text: string | null): unknown {
     return null;
   }
 }
+
+/**
+ * `expectedStatus` of an agent write (CONTRACT.md "Agent and bot"): the status the agent read, or null when absent
+ * (JSON null too) for today's unconditional write; any value outside the internal statuses is 400.
+ */
+const expectedStatusOf = (raw: unknown): string | null => v.oneOf(raw, "expected_status", v.STATUSES);
 
 async function queue(env: Env, url: URL): Promise<Response> {
   const limit = intParam(url, "limit", 10, 1, 50);
@@ -161,6 +167,7 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
   const isObject = typeof body.triage === "object" && body.triage !== null && !Array.isArray(body.triage);
   const triageText = JSON.stringify(body.triage ?? null);
   if (!isObject || new TextEncoder().encode(triageText).byteLength > MAX_TRIAGE_BYTES) throw new HttpError(400, "invalid_triage");
+  const expected = expectedStatusOf(body.expectedStatus);
   // A link only on a duplicate verdict, to an existing other report: a stray duplicateOf is an agent bug, refused.
   const dup = duplicateTarget(verdict === "duplicate", body.duplicateOf, code);
   if (dup !== null) {
@@ -171,27 +178,39 @@ async function triage(req: Request, env: Env, code: string): Promise<Response> {
       eventBinds: [],
       onlyOnChange: true,
       events: [{ type: "triaged", data: { verdict } }],
+      expectedStatus: expected,
     });
     return json({ ok: true });
   }
   const status = verdict === "not_bug" ? "not_bug" : "looking";
   const report = await reportOf(env, code);
+  if (expected !== null && report.status !== expected) throw statusChanged(report.status);
   const now = Date.now();
   // One batch is one transaction: the new status and its events land together or not at all. The status_changed
   // event goes first and reads `from` from the row inside the transaction, written only when the stored status
   // differs: a desk change landing after our lookup is never lost from the history the bot follows. Every statement
   // writes only while the row exists: retention may delete it after the lookup, and an event on its id is an orphan.
-  const [, updated] = await env.DB.batch([
+  // With `expectedStatus` every statement also holds only while the status is still the one the agent read: the
+  // check sits inside the write, so a person's change landing after the lookup above is never overwritten. That is
+  // why the UPDATE comes last: the events read the row before it changes the status they are conditioned on.
+  const [, , updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
-       SELECT id, ?, 'status_changed', json_object('from', status, 'to', ?) FROM reports WHERE id = ? AND status <> ?`,
-    ).bind(now, status, report.id, status),
-    env.DB.prepare("UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = NULL, updated_at = ? WHERE id = ?")
-      .bind(verdict, triageText, status, now, report.id),
-    env.DB.prepare("INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'triaged', ? FROM reports WHERE id = ?")
-      .bind(now, JSON.stringify({ verdict }), report.id),
+       SELECT id, ?, 'status_changed', json_object('from', status, 'to', ?) FROM reports WHERE id = ? AND status <> ?
+         AND (? IS NULL OR status = ?)`,
+    ).bind(now, status, report.id, status, expected, expected),
+    env.DB.prepare(
+      "INSERT INTO events (report_id, at, type, data) SELECT id, ?, 'triaged', ? FROM reports WHERE id = ? AND (? IS NULL OR status = ?)",
+    ).bind(now, JSON.stringify({ verdict }), report.id, expected, expected),
+    env.DB.prepare(
+      "UPDATE reports SET verdict = ?, triage = ?, status = ?, duplicate_of = NULL, updated_at = ? WHERE id = ? AND (? IS NULL OR status = ?)",
+    ).bind(verdict, triageText, status, now, report.id, expected, expected),
   ]);
-  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
+  if (updated!.meta.changes === 0) {
+    // The row is there but no longer in the expected status: refused, not lost (reportOf answers 404 when it is gone).
+    if (expected !== null) throw statusChanged((await reportOf(env, code)).status);
+    throw new HttpError(404, "not_found");
+  }
   return json({ ok: true });
 }
 
@@ -201,6 +220,7 @@ async function setStatus(req: Request, env: Env, code: string): Promise<Response
   if (!status) throw new HttpError(400, "invalid_status");
   const prUrl = v.prUrl(body.prUrl);
   const note = v.text(body.note, "note", 0, 2000);
+  const expected = expectedStatusOf(body.expectedStatus);
   // `duplicate` by hand is a link like triage's, through the same guarded write; any other status clears it below.
   const dup = duplicateTarget(status === "duplicate", body.duplicateOf, code);
   if (dup !== null) {
@@ -211,23 +231,33 @@ async function setStatus(req: Request, env: Env, code: string): Promise<Response
       eventBinds: [note, prUrl],
       onlyOnChange: false,
       events: [],
+      expectedStatus: expected,
     });
     return json({ ok: true });
   }
   const report = await reportOf(env, code);
+  if (expected !== null && report.status !== expected) throw statusChanged(report.status);
   const now = Date.now();
   // The event first, its `from` read from the row inside the same transaction, as the desk's status route does.
   // Leaving `duplicate` clears the link: a stale one would come back, unguarded, if the report were set back later.
+  // With `expectedStatus` both statements hold only while the status is still the one the agent read: the check is
+  // part of the write, so a person's `fixed` landing after the lookup above is never overwritten by the agent.
   const [, updated] = await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO events (report_id, at, type, data)
-       SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5) FROM reports WHERE id = ?1`,
-    ).bind(report.id, now, status, note, prUrl),
-    env.DB.prepare("UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), duplicate_of = NULL, updated_at = ? WHERE id = ?")
-      .bind(status, prUrl, now, report.id),
+       SELECT id, ?2, 'status_changed', json_object('from', status, 'to', ?3, 'note', ?4, 'prUrl', ?5) FROM reports WHERE id = ?1
+         AND (?6 IS NULL OR status = ?6)`,
+    ).bind(report.id, now, status, note, prUrl, expected),
+    env.DB.prepare(
+      "UPDATE reports SET status = ?, pr_url = COALESCE(?, pr_url), duplicate_of = NULL, updated_at = ? WHERE id = ? AND (? IS NULL OR status = ?)",
+    ).bind(status, prUrl, now, report.id, expected, expected),
   ]);
-  // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
-  if (updated!.meta.changes === 0) throw new HttpError(404, "not_found");
+  if (updated!.meta.changes === 0) {
+    // The row is there but no longer in the expected status: refused (reportOf answers 404 when it is gone).
+    if (expected !== null) throw statusChanged((await reportOf(env, code)).status);
+    // Retention deleted the report after the lookup: both statements matched nothing, so it is gone, not changed.
+    throw new HttpError(404, "not_found");
+  }
   return json({ ok: true });
 }
 
