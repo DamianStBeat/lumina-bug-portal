@@ -24,6 +24,10 @@
 // worker/src/routes/agent.ts (builder)|the status condition inside the write (`UPDATE ... WHERE status = ?`)|check with a read before an unconditional write|c7, d4 (race)
 // worker/src/lib/duplicates.ts (builder)|the status condition in every statement of the link batch|condition only on the report's UPDATE, or none|c8, d5 (race, duplicate path)
 // worker/src/routes/agent.ts (builder)|400 invalid_expected_status for a value outside STATUSES|accept any string|c5
+// worker/src/routes/agent.ts (builder)|expectedStatus: null refused on both routes|null counts as absent again (= 312f690)|c5 JSON null, c5b, d3b
+// worker/src/routes/agent.ts (builder)|the null check in the status route's reading of expectedStatus|triage only|c5 JSON null, c5b
+// worker/src/routes/agent.ts (builder)|the null check in the triage route's reading of expectedStatus|status only|d3b
+// worker/src/routes/agent.ts (builder)|null refused, absent passes|absent refused too|c4, d3, and every write that sends no key
 // worker/src/routes/agent.ts|'triaged', ? FROM reports WHERE id = ? AND (? IS NULL OR status = ?)|'triaged', ? FROM reports WHERE id = ? AND (? IS NULL OR ? IS NOT NULL)|d4 refused triage writes no triaged event (audit 1 finding 4)
 // worker/src/routes/agent.ts|status <> ?\n         AND (? IS NULL OR status = ?)|status <> ?\n         AND (? IS NULL OR ? IS NOT NULL)|d4 refused triage writes no status_changed event (finding 4)
 // worker/src/routes/agent.ts|the triage's UPDATE last in its batch|back before the `triaged` event (the guard then sees the new status)|d2 non-duplicate events (finding 3)
@@ -548,11 +552,27 @@ describe("contract: status POST compare-and-set (expectedStatus)", () => {
     ["an empty string", ""],
     ["a number", 3],
     ["an object", { status: "fixed" }],
+    // Reverses "null counts as absent" (brief 5a, decision 1): a null would switch off the compare-and-set.
+    ["JSON null", null],
   ])("c5: expectedStatus %s -> 400 invalid_expected_status, nothing written", async (_label, value) => {
     const { code } = await createReport();
     const before = await snapshot(code);
     await expectError(await agentStatus(code, { status: "looking", expectedStatus: value }), 400, INVALID_EXPECTED);
     expect(await snapshot(code)).toEqual(before);
+  });
+
+  it("c5b (Astra, agent.ts:49): a person's fixed report, the agent's write with expectedStatus null -> 400, it stays fixed, nothing written (plain status and duplicate link)", async () => {
+    const { code } = await createReport();
+    await ok(deskStatus(code, { status: "fixed", prUrl: "https://github.com/DamianStBeat/Lumina2/pull/9" }), "desk fixed");
+    const before = await snapshot(code);
+    const writes: Json[] = [
+      { status: "looking", note: "needs_person: x", expectedStatus: null },
+      { status: "duplicate", duplicateOf: (await createReport()).code, expectedStatus: null },
+    ];
+    for (const write of writes) {
+      await expectError(await agentStatus(code, write), 400, INVALID_EXPECTED);
+      expect(await snapshot(code)).toEqual(before);
+    }
   });
 
   it("c6 (missing): an unknown code with expectedStatus is 404 not_found, not 409", async () => {
@@ -667,6 +687,23 @@ describe("contract: triage POST compare-and-set (expectedStatus)", () => {
     await ok(deskStatus(code, { status: "fixed" }), "desk fixed");
     await ok(agentTriage(code, { verdict: "needs_person", triage: {} }), "triage without expectedStatus");
     expect((await reportByCode(code))!.status).toBe("looking");
+  });
+
+  it("d3b (Astra, agent.ts:49): expectedStatus null on triage -> 400 invalid_expected_status, nothing written, on a new report and on a person's fixed one (plain verdict and duplicate link)", async () => {
+    const fresh = await createReport();
+    const fixed = await createReport();
+    await ok(deskStatus(fixed.code, { status: "fixed" }), "desk fixed");
+    for (const { code } of [fresh, fixed]) {
+      const before = await snapshot(code);
+      const writes: Json[] = [
+        { verdict: "needs_person", triage: { s: 1 }, expectedStatus: null },
+        { verdict: "duplicate", triage: { s: 1 }, duplicateOf: (await createReport()).code, expectedStatus: null },
+      ];
+      for (const write of writes) {
+        await expectError(await agentTriage(code, write), 400, INVALID_EXPECTED);
+        expect(await snapshot(code)).toEqual(before);
+      }
+    }
   });
 
   it("d4 (race): the desk's fixed between the triage's read and its write -> 409, verdict not written, no event of the refused write", async () => {
