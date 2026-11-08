@@ -27,6 +27,11 @@ function nameOf(pid) {
   if (cmd.includes('sample-rss.mjs')) return 'sampler (node)'
   if (cmd.includes('fake-siteverify')) return 'fake siteverify (node)'
   if (cmd.includes('harness.mjs')) return 'harness (node)'
+  if (cmd.includes('bot-rows.mjs')) return 'bot rows (node)'
+  if (cmd.includes('lumina_bug_agent')) return 'agent (python)'
+  if (/e2e\/fakes\//.test(cmd)) return `fake ${/fakes\/(\S+)/.exec(cmd)?.[1] ?? 'tool'}`
+  if (/^\S*ffmpeg /.test(cmd)) return 'ffmpeg'
+  if (/^\S*ffprobe /.test(cmd)) return 'ffprobe'
   if (/^\S*bash /.test(cmd)) return 'bash (run.sh)'
   if (/workerd/.test(cmd.split(' ')[0] ?? '')) return 'workerd'
   if (/\bvite(\.js)?\b/.test(cmd)) return 'vite preview (node)'

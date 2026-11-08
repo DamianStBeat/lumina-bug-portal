@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end run of the bug portal on Valor1: real worker (wrangler dev, local mode), real site (vite preview), real
 # Chromium, only the outside faked (Turnstile's script in the browser, siteverify on localhost). See e2e/README.md.
-#   e2e/run.sh [--rows 1,2,8,9,10]
+#   e2e/run.sh [--rows 1,2,3,4,5,6,7,8,9,10]   (the default is all of them)
 # Exit 0 only if every asked row passes and nothing tried to leave localhost.
 set -Eeuo pipefail
 
@@ -16,7 +16,7 @@ INSPECTOR_PORT=18788
 PREVIEW_PORT=18790
 SITEVERIFY_PORT=18791
 
-ROWS=1,2,8,9,10
+ROWS=1,2,3,4,5,6,7,8,9,10
 while (($#)); do
   case "$1" in
     --rows) ROWS=${2:?--rows needs a list}; shift 2 ;;
@@ -31,6 +31,9 @@ die() { echo "e2e: $*" >&2; exit 2; }
 [[ $(node -p 'process.versions.node.split(".")[0]') == 24 ]] || die "Node 24 is required, found $(node --version)"
 [[ -d $ROOT/web/node_modules/playwright-core ]] || die "run npm ci in web/ first"
 [[ -x $ROOT/worker/node_modules/.bin/wrangler ]] || die "run npm ci in worker/ first"
+[[ -d $ROOT/bot/node_modules/discord.js ]] || die "run npm ci in bot/ first"
+command -v ffmpeg >/dev/null || die "ffmpeg is required (rows 3 and 5)"
+command -v ffprobe >/dev/null || die "ffprobe is required (row 3)"
 compgen -G "$HOME/.cache/ms-playwright/chromium_headless_shell-*" >/dev/null || die "Chromium is not in ~/.cache/ms-playwright"
 command -v ss >/dev/null || die "ss is required"
 

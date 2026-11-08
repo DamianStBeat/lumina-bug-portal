@@ -3,8 +3,12 @@
 // what this file seeded through the real APIs, a word is the page's copy (web/src/i18n/en.ts, as the preview has it).
 import { createHash, randomFillSync } from 'node:crypto'
 import { promises as fs } from 'node:fs'
+import { execFile } from 'node:child_process'
 import path from 'node:path'
+import { promisify } from 'node:util'
+import { fileURLToPath } from 'node:url'
 import { chromium } from '../web/node_modules/playwright-core/index.mjs'
+import { makeAgentRows } from './agent-rows.mjs'
 
 const env = process.env
 const WORKER = env.E2E_WORKER_ORIGIN
@@ -15,7 +19,7 @@ const LOGS = env.E2E_LOGS
 const GAME_KEY = env.E2E_GAME_KEY
 const AGENT_KEY = env.E2E_AGENT_KEY
 const ROWS = env.E2E_ROWS.split(',').map(Number)
-const KNOWN = [1, 2, 8, 9, 10]
+const KNOWN = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 for (const r of ROWS) if (!KNOWN.includes(r)) throw new Error(`no row ${r} in this harness`)
 const FAKE_TURNSTILE = await fs.readFile(new URL('./fake-turnstile.js', import.meta.url), 'utf8')
 
@@ -171,11 +175,17 @@ async function openPage(pathname, { width = 390, height = 844 } = {}) {
 // are added here: the answers are the real worker's.
 async function deskSameSite(page) {
   await page.route(/\/api\/v1\/desk\//, async (route) => {
-    const res = await route.fetch()
-    await route.fulfill({
-      response: res,
-      headers: { ...res.headers(), 'access-control-allow-origin': SITE, 'access-control-allow-credentials': 'true' },
-    })
+    // A row can close its page with a desk answer still in flight (the detail refetches after a filter click); a
+    // rejection here would be unhandled and would kill the whole run, so it is the browser's failure to see instead.
+    try {
+      const res = await route.fetch()
+      await route.fulfill({
+        response: res,
+        headers: { ...res.headers(), 'access-control-allow-origin': SITE, 'access-control-allow-credentials': 'true' },
+      })
+    } catch {
+      await route.abort().catch(() => {})
+    }
   })
 }
 
@@ -595,9 +605,26 @@ async function row10() {
 
 // ---- run -------------------------------------------------------------------------------------------------------
 
-const RUNNERS = { 1: row1, 2: row2, 8: row8, 9: row9, 10: row10 }
-// Row 9 first: its tabs count what it seeded, so reports from other rows must not be there yet (the D1 of a run starts empty).
-const ORDER = [9, 1, 2, 8, 10].filter((r) => ROWS.includes(r))
+// Rows 4, 5 and 7: bot-rows.mjs, one process per row, against the same worker.
+const execFileP = promisify(execFile)
+const botRow = (n) => async () => {
+  const script = fileURLToPath(new URL('./bot-rows.mjs', import.meta.url))
+  try {
+    const { stdout } = await execFileP(process.execPath, [script, String(n)], { env: process.env, maxBuffer: 4 * 1024 * 1024 })
+    const m = /^ok (.*)$/m.exec(stdout)
+    if (!m) fail(`bot-rows.mjs gave no result: ${stdout.slice(-300)}`)
+    return m[1]
+  } catch (e) {
+    fail((e.stderr || e.message || String(e)).trim().split('\n')[0])
+  }
+}
+const { row3, row6 } = makeAgentRows({
+  API, STATE, LOGS, AGENT_KEY, must, eq, fail, until, gameReport, deskStatus, agentReport, openPage, deskSameSite,
+})
+const RUNNERS = { 1: row1, 2: row2, 3: row3, 4: botRow(4), 5: botRow(5), 6: row6, 7: botRow(7), 8: row8, 9: row9, 10: row10 }
+// Row 9 first: its tabs count what it seeded, so reports from other rows must not be there yet (the D1 of a run starts
+// empty). The agent and bot rows last: rows 3 and 6 close what is still `received` before each round.
+const ORDER = [9, 1, 2, 8, 10, 3, 6, 4, 5, 7].filter((r) => ROWS.includes(r))
 
 const results = new Map()
 const ROW_MS = 480_000

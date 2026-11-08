@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""The agent's GIT_WORKSPACE in the end-to-end rows: the real `~/Developer/GitHub/_tools/git-workspace.py` also runs the
+machine's placement check, which a worktree under the run's temp folder would fail. Only the git part is kept, as in
+agent/tests/helpers.py. Usage, as the agent calls it: `git-workspace worktree [--branch B] <repo> <dst> <ref>`."""
+
+import os
+import subprocess
+import sys
+
+rest = sys.argv[2:]
+branch = None
+if "--branch" in rest:
+    i = rest.index("--branch")
+    branch = rest[i + 1]
+    del rest[i : i + 2]
+repo, dst, ref = rest
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+sys.exit(subprocess.call(["git", "-C", repo, "worktree", "add", *(["-b", branch] if branch else ["--detach"]), "--", dst, ref]))
