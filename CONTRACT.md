@@ -402,3 +402,20 @@ as the public ones.
 
 `TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`, `ALLOWED_ORIGINS` (function); `VITE_TURNSTILE_SITE_KEY`
 (site). `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_DB_URL` are provided by the platform.
+
+### Turnstile not configured: the intake fails closed (lead, Damian 8 Nov 2026, Q-490)
+
+The function counts Turnstile as configured only when `TURNSTILE_SECRET` is set, not empty and, unless `ENVIRONMENT` is
+exactly `dev`, is not one of Cloudflare's documented test secrets. Test keys never work in production; a missing
+`ENVIRONMENT` is production.
+
+Not configured: `POST /reports`, `POST /reports/{code}/attach-session` and `POST /reports/{code}/attachments` answer
+`503 {"error":"reports_closed"}` before reading anything else, and write nothing. Every other route keeps working: status,
+desk, agent, game (`X-Game-Key`, no Turnstile), retention, and parts of attachments already created.
+
+| Method, path | Answer |
+|---|---|
+| `GET /intake` | `200 {open: boolean}`, no authentication |
+
+The site shows the "closed for now" state in place of the form (`/bugs` and its add-video page) when `open` is false, when
+that call answers `reports_closed`, or when `VITE_TURNSTILE_SITE_KEY` is missing or, outside dev, a Cloudflare test key.
