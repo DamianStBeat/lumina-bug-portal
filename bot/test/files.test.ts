@@ -25,6 +25,7 @@ beforeEach(() => {
   worker.requests.length = 0;
   worker.mode = 'ok';
   worker.override = undefined;
+  worker.storage.reset();
 });
 
 function att(id: string, name: string, size: number, contentType?: string): RawAttachment {
@@ -48,8 +49,9 @@ describe('copyAttachments', () => {
     assert.deepEqual(cdn.calls, [cdnUrl(png)], 'the .exe is never downloaded');
     assert.equal(creates().length, 1);
     assert.deepEqual(creates()[0]!.json, { filename: 'shot.png', size: 5000, mime: 'image/png' });
-    const parts = worker.find('PUT', /\/parts\/1$/);
+    const parts = worker.storage.puts();
     assert.equal(parts.length, 1);
+    assert.equal(parts[0]!.part, 1);
     assert.ok(Buffer.from(pngBytes).equals(parts[0]!.body));
     assert.equal(worker.find('POST', /\/complete$/).length, 1);
   });

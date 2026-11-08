@@ -31,3 +31,23 @@ agent/lumina_bug_agent/lock.py|LOCK_NB busy → exit 0 before any request|block 
 agent/lumina_bug_agent/run.py|409 leased → skip|treat 409 as success|test_row10_claim_409
 agent/lumina_bug_agent/config.py|missing AGENT_KEY → exit 2|default to empty string|test_config_missing_agent_key
 agent/lumina_bug_agent/run.py|mkdtemp + chmod 700|chmod 755|test_report_temp_dir_is_private
+# slice 7 (Supabase contract): the code does not exist yet, `old` describes the line for the auditor; filter -k test_s7
+agent/lumina_bug_agent/client.py|download parts in ascending n|keep the manifest order|test_s7_row2_a_manifest_out_of_order
+agent/lumina_bug_agent/client.py|each part's size checked against the manifest|skip the per-part check|test_s7_row2_a_short_part
+agent/lumina_bug_agent/client.py|part longer than declared refused|stop at the declared size silently|test_s7_row2_a_long_part
+agent/lumina_bug_agent/client.py|total checked against sizeBytes|skip it|test_s7_row2_parts_not_adding_up
+agent/lumina_bug_agent/client.py|manifest shape validated (parts list, n, size, url)|trust the fields|test_s7_row2_a_manifest_that_is_broken
+agent/lumina_bug_agent/client.py|declared size over the cap raises TooLarge before fetching|check only while streaming|test_s7_row2_declared_over_the_cap
+agent/lumina_bug_agent/client.py|cap comparison: size > cap|size >= cap|test_s7_row2_declared_exactly_at_the_cap
+agent/lumina_bug_agent/client.py|storage requests carry no Authorization|reuse _open with the bearer|test_s7_row2_no_key_on_storage
+agent/lumina_bug_agent/client.py|one new manifest per download|retry without limit|test_s7_row3_a_second_expiry
+agent/lumina_bug_agent/client.py|one new manifest per download|one per report round|test_s7_row3_each_attachment
+agent/lumina_bug_agent/client.py|resume at the expired part|restart at part 1|test_s7_row3_a_403_gets_one_new_manifest
+agent/lumina_bug_agent/client.py|only 403 asks for a new manifest|any storage error|test_s7_row3_a_storage_server_error
+agent/lumina_bug_agent/run.py|retention only when RETENTION_FALLBACK is 1|run it whenever the key is set|test_s7_row4_only_the_value_1
+agent/lumina_bug_agent/run.py|retention off when the variable is unset|default on|test_s7_row4_unset
+agent/lumina_bug_agent/run.py|at most 20 calls|at most 200|test_s7_row4_never_done
+agent/lumina_bug_agent/run.py|stop when done is true|always 20|test_s7_row4_done_on_the_first
+agent/lumina_bug_agent/config.py|RETENTION_FALLBACK read through load (agent.env)|read os.environ only|test_s7_row4_from_the_env_file
+agent/lumina_bug_agent/run.py|no retention in a dry run|run it in dry run too|test_s7_row4_a_dry_run
+agent/lumina_bug_agent/run.py|a failing retention caught|let WorkerError propagate|test_s7_row4_a_retention_that_fails

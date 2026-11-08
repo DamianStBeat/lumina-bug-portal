@@ -4,7 +4,8 @@ Every spec starts the real agent as a subprocess (`python -m lumina_bug_agent ru
 systemd unit does on Valor1, so the lock file, PATH lookup and the clean environment given to children behave as in
 production. Around it the harness builds, per test, inside one private temp dir:
 
-- a fake worker (`http.server` on 127.0.0.1:0) for the `/api/v1/agent/*` routes of CONTRACT.md, recording requests;
+- a fake worker (`http.server` on 127.0.0.1:0) for the `/api/v1/agent/*` routes of CONTRACT.md, recording requests,
+  with a fake storage behind it (a second server, so a signed URL is another origin, as on Supabase);
 - fake `claude`, `gh`, red team script and git-workspace, plus recording ffmpeg/ffprobe shims that exec the real
   binaries; each writes one JSON record per call into a log dir whose absolute path is baked into the script,
   because the agent hands children only HOME/PATH/USER/LANG/TERM;
@@ -148,7 +149,126 @@ _ROUTES = [
     ("GET", re.compile(r"^/api/v1/agent/reports/(?P<code>[^/]+)$"), "report"),
     ("GET", re.compile(r"^/api/v1/agent/attachments/(?P<id>[^/]+)/download$"), "download"),
     ("GET", re.compile(r"^/api/v1/agent/events$"), "events"),
+    ("POST", re.compile(r"^/api/v1/internal/retention$"), "retention"),
 ]
+
+_SIGNED_PART = re.compile(r"^/storage/v1/object/sign/bug-portal/(?P<id>[\w-]+)/part-(?P<n>\d{5})$")
+MANIFEST_SECONDS = 900  # CONTRACT.md "Download routes": signed download URLs live 900 s
+
+
+def split_parts(data: bytes, count: int) -> list[bytes]:
+    """`data` in `count` consecutive parts, the last one taking the remainder."""
+    if count <= 1:
+        return [data]
+    each = len(data) // count
+    return [data[i * each : (i + 1) * each if i < count - 1 else len(data)] for i in range(count)]
+
+
+class FakeStorage:
+    """The private bucket behind signed download URLs: another origin, no key expected, every request recorded.
+
+    A URL's token says which manifest handed it out (`m<manifest>-<attachment>-<n>`), so a spec can expire exactly the
+    URLs of one manifest and an expired URL stays expired however often it is tried."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, list[bytes]] = {}
+        self.expired: set[tuple[str, int, int]] = set()  # (attachment, n, manifest)
+        self.answers: dict[tuple[str, int], list[dict[str, Any]]] = {}  # (attachment, n) -> the next special answers
+        self.requests: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        storage = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                storage._handle(self)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self._thread = threading.Thread(target=self.server.serve_forever, name="fake-storage", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self._thread.join(timeout=10)
+
+    def url(self, att: str, n: int, manifest: int) -> str:
+        return (f"http://127.0.0.1:{self.port}/storage/v1/object/sign/bug-portal/{att}/part-{n:05d}"
+                f"?token=m{manifest}-{att}-{n}")  # fmt: skip
+
+    # -- scenario -------------------------------------------------------------------------------------------
+    def expire(self, att: str, n: int, manifest: int = 1) -> None:
+        """Part `n`'s URL in the `manifest`-th manifest of `att` answers 403 from now on."""
+        self.expired.add((att, n, manifest))
+
+    def answer(self, att: str, n: int, status: int = 200, body: bytes | None = None, cut_short: bool = False) -> None:
+        """The next GET of this part answers `status` with `body` (default: the real part). `cut_short`: half the body is
+        sent under the full Content-Length and the connection closes, so the reader sees EOF before the promised end."""
+        self.answers.setdefault((att, n), []).append({"status": status, "body": body, "cut_short": cut_short})
+
+    # -- inspection -----------------------------------------------------------------------------------------
+    def calls(self, att: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            reqs = list(self.requests)
+        return [r for r in reqs if att is None or r["attachment"] == att]
+
+    def parts_asked(self, att: str | None = None) -> list[int]:
+        """Which part numbers were requested, in arrival order."""
+        return [r["n"] for r in self.calls(att)]
+
+    # -- HTTP -----------------------------------------------------------------------------------------------
+    def _handle(self, h: http.server.BaseHTTPRequestHandler) -> None:
+        parsed = urllib.parse.urlsplit(h.path)
+        match = _SIGNED_PART.match(parsed.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        token = query.get("token", "")
+        with self._lock:
+            self.requests.append({"method": "GET", "path": parsed.path, "query": query, "token": token,
+                                  "attachment": match.group("id") if match else None,
+                                  "n": int(match.group("n")) if match else None,
+                                  "headers": {k.lower(): v for k, v in h.headers.items()}})  # fmt: skip
+        if match is None:
+            return self._send(h, 404, json.dumps({"error": "not_found"}).encode("utf-8"))
+        att, n = match.group("id"), int(match.group("n"))
+        if not token.endswith(f"-{att}-{n}") or not token.startswith("m"):
+            return self._send(h, 400, json.dumps({"error": "InvalidToken"}).encode("utf-8"))
+        manifest = int(token[1:].split("-", 1)[0])
+        with self._lock:
+            expired = (att, n, manifest) in self.expired
+            queued = self.answers.get((att, n)) or []
+            special = queued.pop(0) if queued and not expired else None
+        if expired:
+            return self._send(h, 403, json.dumps({"statusCode": "403", "error": "Unauthorized",
+                                                  "message": "exp claim timestamp check failed"}).encode("utf-8"))  # fmt: skip
+        parts = self.files.get(att)
+        if parts is None or not 1 <= n <= len(parts):
+            return self._send(h, 404, json.dumps({"error": "not_found"}).encode("utf-8"))
+        status, body, cut_short = 200, parts[n - 1], False
+        if special is not None:
+            status, cut_short = special["status"], special["cut_short"]
+            body = special["body"] if special["body"] is not None else body
+        if cut_short:
+            h.close_connection = True
+            h.send_response(status)
+            h.send_header("Content-Type", "application/octet-stream")
+            h.send_header("Content-Length", str(len(body)))
+            h.send_header("Connection", "close")
+            h.end_headers()
+            h.wfile.write(body[: len(body) // 2])
+            h.wfile.flush()
+            return None
+        return self._send(h, status, body)
+
+    def _send(self, h: http.server.BaseHTTPRequestHandler, status: int, data: bytes) -> None:
+        h.send_response(status)
+        h.send_header("Content-Type", "application/octet-stream")
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
 
 
 class FakeWorker:
@@ -157,6 +277,14 @@ class FakeWorker:
     def __init__(self, port: int = 0) -> None:
         self.reports: dict[str, dict[str, Any]] = {}
         self.blobs: dict[str, bytes] = {}
+        self.storage = FakeStorage()
+        self.manifests: dict[str, int] = {}  # attachment -> how many manifests it has answered
+        # attachment -> a function that edits every manifest answered for it, or the raw bytes to answer instead.
+        self.manifest_edit: dict[str, Any] = {}
+        self.manifest_status: dict[str, tuple[int, str]] = {}  # attachment -> (status, error) instead of a manifest
+        self.mimes: dict[str, str] = {}
+        self.retention_rounds_left = 0  # how many POST /internal/retention still answer done:false before done:true
+        self.retention_answers: list[Any] = []  # the next retention answers, as JSON bodies (bytes = raw), then normal
         self.leased: set[str] = set()  # codes whose claim answers 409 leased
         # Leases as the real worker keeps them (CONTRACT.md "Agent and bot"): a successful claim holds the report until
         # now + minutes; while it is live the queue leaves the report out and another claim answers 409. Nothing in the
@@ -199,6 +327,7 @@ class FakeWorker:
         return f"http://127.0.0.1:{self.port}/api/v1"
 
     def stop(self) -> None:
+        self.storage.stop()
         self.server.shutdown()
         self.server.server_close()
         self._thread.join(timeout=10)
@@ -252,8 +381,24 @@ class FakeWorker:
             }
             row["attachments"].append(meta)
             self.blobs[att["id"]] = data
+            # `parts` (default 1): how many objects the bucket holds for this attachment.
+            self.storage.files[att["id"]] = split_parts(data, int(att.get("parts", 1)))
+            self.mimes[att["id"]] = att.get("mime", "video/mp4")
         self.reports[code] = row
         return row
+
+    def manifest(self, att: str) -> dict[str, Any]:
+        """The next manifest for `att`, as the function answers it (CONTRACT.md "Download routes")."""
+        with self._lock:
+            self.manifests[att] = self.manifests.get(att, 0) + 1
+            number = self.manifests[att]
+        parts = self.storage.files[att]
+        return {
+            "mime": self.mimes.get(att, "application/octet-stream"),
+            "sizeBytes": sum(len(p) for p in parts),
+            "expiresIn": MANIFEST_SECONDS,
+            "parts": [{"n": i, "size": len(p), "url": self.storage.url(att, i, number)} for i, p in enumerate(parts, 1)],
+        }
 
     def fail(self, route: str, status: int, times: int | None = None) -> None:
         if times is None:
@@ -426,7 +571,26 @@ class FakeWorker:
             att = params.get("id")
             if att not in self.blobs:
                 return self._send(h, 404, {"error": "not_found"})
-            return self._send(h, 200, self.blobs[att], "application/octet-stream")
+            if att in self.manifest_status:
+                status, error = self.manifest_status[att]
+                return self._send(h, status, {"error": error})
+            edit = self.manifest_edit.get(att)
+            if isinstance(edit, (bytes, bytearray)):
+                self.manifest(att)  # it still counts as a manifest served
+                return self._send(h, 200, bytes(edit))
+            manifest = self.manifest(att)
+            if edit is not None:
+                manifest = edit(manifest)
+            return self._send(h, 200, manifest)
+        if route == "retention":
+            with self._lock:
+                answer = self.retention_answers.pop(0) if self.retention_answers else None
+                if answer is None:
+                    done = self.retention_rounds_left <= 0
+                    self.retention_rounds_left -= 1
+            if answer is not None:
+                return self._send(h, 200, answer)
+            return self._send(h, 200, {"done": done})
         if route == "frames":
             with self._lock:
                 self._frames += 1

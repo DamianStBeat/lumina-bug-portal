@@ -50,6 +50,7 @@ beforeEach(() => {
   worker.requests.length = 0;
   worker.mode = 'ok';
   worker.override = undefined;
+  worker.storage.reset();
   log = makeLogger();
 });
 afterEach(() => {
@@ -115,7 +116,8 @@ describe('new forum post', () => {
     const up = worker.find('POST', `/reports/${CODE}/attachments`);
     assert.equal(up.length, 1);
     assert.deepEqual(up[0]!.json, { filename: 'bridge.png', size: 4000, mime: 'image/png' });
-    const parts = worker.find('PUT', /\/parts\/1$/);
+    const parts = worker.storage.puts();
+    assert.equal(parts[0]?.part, 1);
     assert.ok(Buffer.from(bytes).equals(parts[0]!.body), 'the image bytes reached the archive');
     assert.equal(worker.find('POST', /\/complete$/).length, 1);
 
