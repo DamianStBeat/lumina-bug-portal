@@ -455,9 +455,19 @@ describe('row 2 still holds with adopt: a late create of one report never writes
     expect(before).toMatchObject({ code: OTHER, reportToken: tokenB, files: [{ name: 'b.mp4', attachmentId: attB.id }] })
 
     answer()
+    // Read while the DELETE is out: a line wrongly taken from another report goes away with a DELETE that answers 200,
+    // so storage ends equal to `before` whatever the code/token check did (audit-3 finding 3).
+    const gate = deferred()
+    server.holdRoute = (m) => (m === 'DELETE' ? gate.promise : null)
     await letRun()
     const made = server.attsOf(CODE)[0]!
     expect(deletedIds()).toEqual([made.id])
+    expect(made.status).toBe('uploading')
+    expect(loadSession()).toEqual(before)
+
+    gate.resolve()
+    server.holdRoute = () => null
+    await letRun()
     expect(made.status).toBe('aborted')
     expect(loadSession()).toEqual(before)
 
