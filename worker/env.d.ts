@@ -12,6 +12,7 @@ declare namespace Cloudflare {
     AGENT_KEY: string;
     IP_SALT_SEED: string;
     DESK_DEV_BYPASS?: string;
+    TURNSTILE_VERIFY_URL?: string;
     TEST_MIGRATIONS: import("cloudflare:test").D1Migration[];
   }
 }
