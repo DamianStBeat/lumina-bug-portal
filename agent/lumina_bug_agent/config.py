@@ -38,6 +38,7 @@ class Config:
     max_reports_per_round: int
     fork_remote: str
     pr_repo: str
+    retention_fallback: bool = False  # RETENTION_FALLBACK=1: only where pg_cron or pg_net is not available
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -114,4 +115,5 @@ def load(env_file: str | None) -> Config:
         max_reports_per_round=number("MAX_REPORTS_PER_ROUND", 5, low=1, high=50),
         fork_remote=text("FORK_REMOTE", "fork"),
         pr_repo=text("PR_REPO", "DamianStBeat/Lumina2"),
+        retention_fallback=text("RETENTION_FALLBACK", "0") == "1",
     )

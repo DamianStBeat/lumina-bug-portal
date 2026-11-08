@@ -77,7 +77,11 @@ export type NewDiscordReport = {
 export type UploadFile = { filename: string; mime: string; size: number; body: Uint8Array | AsyncIterable<Uint8Array> };
 
 type Auth = { kind: 'agent' } | { kind: 'report'; token: string };
-type CallOptions = { json?: unknown; bytes?: Uint8Array; auth: Auth };
+type CallOptions = { json?: unknown; auth: Auth };
+
+// What the bucket answers when a signed URL is expired or refused. Hosted Supabase may send an expired one as HTTP 400
+// with `statusCode: "403"` in the body, so 400 counts too. A 5xx says nothing about the URL.
+const REFUSED_URL = new Set([400, 401, 403]);
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isPositiveInt = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v > 0;
@@ -171,14 +175,14 @@ export class PortalApi {
           off += take;
           if (filled === part.byteLength) {
             sent += 1;
-            await this.call('PUT', `/attachments/${id}/parts/${sent}`, { bytes: part, auth });
+            await this.sendPart(id, sent, part, auth);
             filled = 0;
           }
         }
       }
       if (filled > 0) {
         sent += 1;
-        await this.call('PUT', `/attachments/${id}/parts/${sent}`, { bytes: part.subarray(0, filled), auth });
+        await this.sendPart(id, sent, part.subarray(0, filled), auth);
       }
       // Fewer bytes than declared would complete a truncated file.
       if (received !== file.size || sent !== partCount) throw new PortalError('size_mismatch');
@@ -190,6 +194,34 @@ export class PortalApi {
     }
   }
 
+  /**
+   * CONTRACT.md "Upload routes": the part goes straight to the bucket on its own signed URL. A URL can expire while a
+   * long file is on its way, so a refused one is asked again, once per part; `bytes` is refilled only after this returns.
+   */
+  private async sendPart(id: string, n: number, bytes: Uint8Array, auth: Auth): Promise<void> {
+    for (let askedAgain = false; ; askedAgain = true) {
+      const answer = await this.call('POST', `/attachments/${id}/parts/${n}/upload-url`, { auth });
+      if (!isObject(answer) || typeof answer['url'] !== 'string') throw new PortalError('bad_response');
+      try {
+        await this.putToStorage(answer['url'], bytes);
+        return;
+      } catch (err) {
+        if (askedAgain || !(err instanceof PortalError) || !REFUSED_URL.has(err.status ?? 0)) throw err;
+      }
+    }
+  }
+
+  private async putToStorage(url: string, bytes: Uint8Array): Promise<void> {
+    // The signed URL is the only credential of this request: the report token and the key never go to the bucket.
+    const { res } = await this.send(url, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: bytes as Uint8Array<ArrayBuffer>,
+    });
+    // A fixed code: the bucket's errors are not the contract's, and a signed URL must never reach a message or a log.
+    if (!res.ok) throw new PortalError('storage_error', res.status);
+  }
+
   private async call(method: string, path: string, opts: CallOptions): Promise<unknown> {
     const headers: Record<string, string> = {};
     if (opts.auth.kind === 'agent') headers['authorization'] = `Bearer ${this.agentKey}`;
@@ -198,21 +230,9 @@ export class PortalApi {
     if (opts.json !== undefined) {
       headers['content-type'] = 'application/json';
       body = JSON.stringify(opts.json);
-    } else if (opts.bytes !== undefined) {
-      headers['content-type'] = 'application/octet-stream';
-      body = opts.bytes as Uint8Array<ArrayBuffer>;
     }
 
-    let res: Response;
-    let text: string;
-    try {
-      // One signal covers the headers and the body, so a worker that stalls mid-answer also times out.
-      res = await this.fetchImpl(`${this.base}${path}`, { method, headers, body, signal: AbortSignal.timeout(this.timeoutMs) });
-      text = await res.text();
-    } catch (err) {
-      const name = err instanceof Error ? err.name : '';
-      throw new PortalError(name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'network');
-    }
+    const { res, text } = await this.send(`${this.base}${path}`, { method, headers, body });
 
     const NOT_JSON = Symbol();
     let parsed: unknown;
@@ -230,6 +250,17 @@ export class PortalApi {
     // Callers that need fields check the shape; an empty 2xx is only fine where nothing is read.
     if (parsed === NOT_JSON) throw new PortalError('bad_response', res.status);
     return parsed;
+  }
+
+  private async send(url: string, init: RequestInit): Promise<{ res: Response; text: string }> {
+    try {
+      // One signal covers the headers and the body, so a server that stalls mid-answer also times out.
+      const res = await this.fetchImpl(url, { ...init, signal: AbortSignal.timeout(this.timeoutMs) });
+      return { res, text: await res.text() };
+    } catch (err) {
+      const name = err instanceof Error ? err.name : '';
+      throw new PortalError(name === 'TimeoutError' || name === 'AbortError' ? 'timeout' : 'network');
+    }
   }
 }
 

@@ -29,6 +29,7 @@ EVENT_PAGES = 10
 MAX_SEEDS = 50  # GET /agent/reports/{code} per round for codes the cache does not know (sync_events)
 SEED_STALL = "seed_stall"  # meta key: "<code> <rounds>", the code whose failing GET stopped the events cursor
 STALL_ROUNDS = 3  # rounds in a row a failing seed may stop the cursor before it is let go
+MAX_RETENTION_CALLS = 20  # one run's bound: what is left is drained by the next timer run
 
 
 def _is_int(value: Any) -> bool:
@@ -48,11 +49,30 @@ def run_round(cfg: Config) -> int:
             log("another round is running")
             return 0
         cache = Cache(cfg.state_dir / "cache.sqlite3")
+        client = Client(cfg.api_base, cfg.agent_key)
         try:
-            Round(cfg, Client(cfg.api_base, cfg.agent_key), cache).run()
+            Round(cfg, client, cache).run()
         finally:
             cache.close()
+        if cfg.retention_fallback and not cfg.dry_run:  # a dry round makes GET requests only
+            retention_fallback(client)
     return 0
+
+
+def retention_fallback(client: Client) -> None:
+    """CONTRACT.md "CORS, IP, retention": without pg_cron or pg_net the agent's timer runs the batches. Anything but a
+    plain `done: false` stops it: the next run tries again, and a failure here costs the round nothing."""
+    for calls in range(1, MAX_RETENTION_CALLS + 1):
+        try:
+            answer = client.post_json("/internal/retention", {})
+        except WorkerError as exc:
+            log("retention failed", status=exc.status or "none")
+            return
+        done = answer.get("done") if isinstance(answer, dict) else None
+        if done is not False:
+            log("retention ran" if done is True else "retention failed", calls=calls)
+            return
+    log("retention not finished", calls=MAX_RETENTION_CALLS)
 
 
 def _clip(value: Any, width: int) -> Any:

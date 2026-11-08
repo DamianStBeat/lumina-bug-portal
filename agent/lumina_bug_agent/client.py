@@ -7,11 +7,14 @@ import json
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 TIMEOUT = 30
 CHUNK = 1 << 20
 MAX_ERROR_BODY = 1024  # an error answer is one short JSON object: nothing longer is worth reading
+# What the bucket answers when a signed URL expired. Hosted Supabase may send an expired one as HTTP 400 with
+# `statusCode: "403"` in the body, so 400 counts too. A 5xx says nothing about the URL.
+EXPIRED_URL = (400, 401, 403)
 
 
 class WorkerError(Exception):
@@ -33,6 +36,14 @@ class StatusChanged(WorkerError):
 
 class TooLarge(Exception):
     pass
+
+
+class _UrlExpired(WorkerError):
+    """The bucket refused a signed URL: a new manifest may help, once."""
+
+
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value > 0  # type(): JSON's `true` is an int to isinstance
 
 
 def _status_changed(exc: urllib.error.HTTPError) -> str | None:
@@ -97,22 +108,79 @@ class Client:
     def post_bytes(self, path: str, data: bytes, headers: dict[str, str]) -> Any:
         return self._json("POST", path, data, headers)
 
-    def download(self, path: str, dest: Path, cap: int) -> int:
-        """Streams to `dest`; past `cap` bytes it stops and raises TooLarge (the caller deletes the file)."""
-        resp = self._open("GET", path)
-        total = 0
+    def _manifest(self, path: str, cap: int) -> list[tuple[str, int]]:
+        """The (url, size) of each part, ascending n (CONTRACT.md "Download routes"). WorkerError for anything else than
+        the contract's shape; TooLarge when the declared size is past `cap`, before a single byte is fetched."""
+        answer = self.get_json(path)
+        parts = answer.get("parts") if isinstance(answer, dict) else None
+        if not isinstance(parts, list) or not parts:
+            raise WorkerError(200)
+        plan: list[tuple[str, int]] = []
+        for n, part in enumerate(parts, 1):
+            numbered = isinstance(part, dict) and _is_count(part.get("n")) and part["n"] == n
+            url = part.get("url") if numbered and _is_count(part.get("size")) else None
+            # urllib also opens file: and ftp: URLs: a broken manifest must not turn into a local file read.
+            if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+                raise WorkerError(200)
+            plan.append((url, part["size"]))
+        declared = answer.get("sizeBytes")
+        if not _is_count(declared) or declared != sum(size for _, size in plan):
+            raise WorkerError(200)
+        if declared > cap:
+            raise TooLarge()
+        return plan
+
+    def _open_storage(self, url: str) -> Any:
+        # A signed URL is its own credential: this request is built apart so the bearer can never go with it.
         try:
-            with resp, open(dest, "wb") as out:
-                while chunk := resp.read(CHUNK):
-                    total += len(chunk)
-                    if total > cap:
-                        raise TooLarge()
-                    out.write(chunk)
-        except (OSError, http.client.HTTPException):  # a download cut short: the caller notes download_failed
+            return self._opener.open(urllib.request.Request(url), timeout=TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise (_UrlExpired if exc.code in EXPIRED_URL else WorkerError)(exc.code) from None
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
             raise WorkerError(None) from None
-        # A streamed read(amt) returns short at EOF without raising: only the declared length shows a cut-off file,
-        # which must never reach ffprobe. An absent or unreadable header leaves nothing to compare.
-        declared = resp.headers.get("Content-Length", "").strip()
-        if declared.isascii() and declared.isdigit() and int(declared) != total:
+
+    def _read_part(self, url: str, size: int, out: BinaryIO) -> None:
+        resp = self._open_storage(url)
+        got = 0
+        try:
+            with resp:
+                while chunk := resp.read(CHUNK):
+                    got += len(chunk)
+                    if got > size:
+                        raise WorkerError(resp.status)
+                    out.write(chunk)
+        except (OSError, http.client.HTTPException):  # a part cut short: the caller notes download_failed
+            raise WorkerError(None) from None
+        # A streamed read(amt) returns short at EOF without raising: only the size in the manifest shows a cut-off part,
+        # which must never reach ffprobe.
+        if got != size:
             raise WorkerError(resp.status)
-        return total
+
+    def download(self, path: str, dest: Path, cap: int) -> int:
+        """Joins the parts of the manifest at `path` into `dest`, in order. Every part is checked against its declared
+        size, so nothing past `cap` is ever written. A signed URL that expired gets one new manifest for the whole
+        download and it goes on from that part (the caller deletes the file on any failure)."""
+        plan = self._manifest(path, cap)
+        renewed = False
+        index = 0
+        try:
+            with open(dest, "wb") as out:
+                while index < len(plan):
+                    url, size = plan[index]
+                    try:
+                        self._read_part(url, size, out)
+                    except _UrlExpired:  # refused before any byte of this part was written
+                        if renewed:
+                            raise
+                        renewed = True
+                        fresh = self._manifest(path, cap)
+                        # The parts already joined were cut by the first manifest: another plan would mix two files.
+                        if [s for _, s in fresh] != [s for _, s in plan]:
+                            raise WorkerError(200) from None
+                        plan = fresh
+                        continue
+                    index += 1
+        except OSError:  # the disk, not the network: the caller notes download_failed all the same
+            raise WorkerError(None) from None
+        return sum(size for _, size in plan)
