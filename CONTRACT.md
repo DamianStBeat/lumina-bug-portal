@@ -236,7 +236,7 @@ Note: `id` (the internal ulid) and the lease columns are sent although CONTRACT.
 Note: on game reports `roblox_name` holds the Roblox user name the game server sent (`userName`), not a name the
 player typed; "D1 schema" still says "web only". <!-- worker/src/routes/game.ts:24 -->
 Note: the desk's `GET /desk/reports/{code}` is a different shape (nested under `report`); it is not this route's.
-<!-- worker/src/routes/desk.ts:96 -->
+<!-- worker/src/routes/desk.ts:130 -->
 
 ### Event data
 
@@ -273,8 +273,8 @@ value is absent (SQLite `json_object` keeps null keys); no writer omits a key it
 | `status_changed` | agent triage, verdict `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:174-182) --> | `from`, `to` (`"duplicate"`), always. No `note`/`prUrl`. Written only when the stored status is not already `duplicate` |
 | `status_changed` | agent status POST, any status but `duplicate` <!-- worker/src/routes/agent.ts:247 --> | `from`, `to`: internal statuses; `note`: string or null; `prUrl`: string or null; all always. Written on every POST, also when `from` equals `to` |
 | `status_changed` | agent status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/agent.ts:227-235) --> | `from`, `to` (`"duplicate"`), `note`, `prUrl`, as the row above; written on every POST, also from `duplicate` |
-| `status_changed` | desk status POST, any status but `duplicate` <!-- worker/src/routes/desk.ts:182 --> | `from`, `to`, `note`, `prUrl` as the agent's; plus `by`: `"desk"` and `email`: string or null (null for an Access service token and the dev bypass); all always. Written on every POST, also when `from` equals `to` |
-| `status_changed` | desk status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/desk.ts:164-172) --> | as the desk row above, `to` = `"duplicate"` |
+| `status_changed` | desk status POST, any status but `duplicate` <!-- worker/src/routes/desk.ts:216 --> | `from`, `to`, `note`, `prUrl` as the agent's; plus `by`: `"desk"` and `email`: string or null (null for an Access service token and the dev bypass); all always. Written on every POST, also when `from` equals `to` |
+| `status_changed` | desk status POST, `duplicate` <!-- worker/src/lib/duplicates.ts:87 (via routes/desk.ts:198-206) --> | as the desk row above, `to` = `"duplicate"` |
 | `duplicate_linked` | the linked report itself (triage `duplicate`, agent or desk status `duplicate`) <!-- worker/src/lib/duplicates.ts:92 --> | `duplicateOf`: string, the root original's code (may differ from the `duplicateOf` sent, when that one was itself a duplicate), always |
 | `duplicate_linked` | each report re-pointed by that link (it pointed at the report just linked) <!-- worker/src/lib/duplicates.ts:96 --> | `duplicateOf`: string, the new root code, always. No `status_changed` comes with it (it stays `duplicate`) |
 
