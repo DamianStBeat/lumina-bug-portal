@@ -389,7 +389,7 @@ when the attachment is not `complete`.
 ### Desk authentication (replaces Cloudflare Access)
 
 Header `Authorization: Bearer <Supabase user JWT>` (Google sign-in on the site). The function validates it with Supabase
-Auth and requires the lowercased email in table `bug_portal.desk_team(email primary key)`. Missing or invalid token: 401
+Auth, requires a confirmed email and Google among the user's providers (a password account on a team address is refused), and requires the lowercased email in table `bug_portal.desk_team(email primary key)`. Missing or invalid token: 401
 `unauthorized`; valid but not listed: 403 `not_team`, the same answer on every desk route and with no desk data. An
 empty table closes the desk. `by: "desk"`, `email` of the events are this user's. Desk routes follow the same CORS rule
 as the public ones.
@@ -402,16 +402,19 @@ as the public ones.
 - Retention: `POST /internal/retention` runs one bounded batch and answers `{done: boolean}`; the caller repeats until
   `done`. Auth: header `X-Cron-Token` equal to `bug_portal.cron_token.token` (generated inside the database by the
   migration, never in a repo or chat), or `Authorization: Bearer <AGENT_KEY>` (the documented fallback when pg_cron or
-  pg_net is not available: the agent's timer calls it). The schedule is hourly (`0 * * * *`), one batch per call: that drains the
+  pg_net is not available: the agent's timer calls it). The schedule is every 10 minutes (`*/10 * * * *`), one batch per call: that drains the
   backlog and honours the 24-hour window below; the migration enables pg_cron and pg_net itself and only falls back to a notice if it cannot. Besides the rules above it removes objects of `aborted` and
   `deleted` attachments for 24 hours after that status (a signed URL issued before it can still land for 2 hours; 24 hours
-  does not hang on one hourly run). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
+  does not hang on one run; rows take turns through `attachments.swept_at bigint`, oldest or never swept first, so a flood cannot starve the others). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
   file is the reporter's own and the agent rechecks sizes and the real type.
 
 ### Secrets
 
 `TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`, `ALLOWED_ORIGINS` (function); `VITE_TURNSTILE_SITE_KEY`
 (site). `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_DB_URL` are provided by the platform.
+
+- Attachment creation: 30 per hour per ip_hash (429 `rate_limited`), because aborted attachments do not count toward the 3 per report.
+- An `uploading` attachment past 7 days becomes `aborted` only after Storage removed its objects; a Storage failure leaves it to retry.
 
 ### Turnstile not configured: the intake fails closed (lead, Damian 8 Nov 2026, Q-490)
 
