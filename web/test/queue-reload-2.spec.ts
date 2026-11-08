@@ -346,6 +346,13 @@ describe('audit-3 finding 1: a late create never makes a new session over a repo
     expect(deletedIds()).toEqual([a.id])
     expect(saved()?.code).toBe(CODE)
     expect(line('a.mp4')).toMatchObject({ attachmentId: a.id, removing: true })
+
+    // The storage above is the same whether the page took the line or the no-page way wrote it: only the pick tells them
+    // apart. A page that took it holds the place, sends the DELETE again first and refuses the file that does not fit.
+    await pick(h, [small('b.mp4'), small('c.mp4'), small('d.mp4')])
+    expect(names(h)).toEqual(['b.mp4', 'c.mp4'])
+    expect(h.result.current.rejection).toBe('count')
+    expect(deletedIds()).toEqual([a.id, a.id])
   })
 })
 
