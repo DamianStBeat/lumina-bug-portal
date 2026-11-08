@@ -350,7 +350,8 @@ own authentication on every route.
 ### Storage (replaces D1 + R2 wording)
 
 - Postgres schema `bug_portal`, same tables and columns (`INTEGER` ms stay `bigint`; `r2_key` is named `storage_prefix`;
-  `events.seq` is `bigint generated always as identity`). RLS on every table, no policy, no grant to `anon` or
+  `events.seq` is `bigint generated always as identity`; `attachments.status_at bigint`, unix ms, is set whenever an
+  attachment becomes `aborted` or `deleted`). RLS on every table, no policy, no grant to `anon` or
   `authenticated`. The function reaches it through `SUPABASE_DB_URL` (one connection per invocation, `prepare: false`),
   because PostgREST does not expose extra schemas. Every "one atomic step" above is one Postgres transaction or one
   conditional `UPDATE`.
