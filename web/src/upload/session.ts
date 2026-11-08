@@ -7,13 +7,17 @@
 // could not hash it (no crypto.subtle, file unreadable), so name and size are all there is (useUpload.ts, sameFile).
 // `removing: true`: the player pressed Remove and the DELETE of its attachment has not been answered 2xx { ok: true }
 // or 404 yet. Such a line is never offered for resume; it still holds one of the 3 places, as the server still counts
-// its attachment, and the next load sends the DELETE again.
+// its attachment, and the next load sends the DELETE again. Written when Remove is pressed, so a page left before the
+// Remove's turn still finishes it. Without an attachment: Remove pressed while its create was out; the create answering
+// on this tab writes its id here, and a load finding it without one drops it (that create died with its tab).
 export type SavedFile = { name: string; size: number; head: string | null; done: boolean } & (
-  | { attachmentId: null }
+  | { attachmentId: null; removing?: true }
   | { attachmentId: string; partSize: number; partCount: number; removing?: true }
 )
 // v3: lines carry `head` in place of lastModified. A v2 session is dropped on load like any value we cannot trust.
-export type Session = { v: 3; code: string; reportToken: string; files: SavedFile[] }
+// `pending`: Remove pressed while a re-picked saved file was still being hashed, so it is known only by name and size;
+// the next load strikes every open line of that name and size (a removed video must never upload).
+export type Session = { v: 3; code: string; reportToken: string; files: SavedFile[]; pending?: { name: string; size: number }[] }
 
 const KEY = 'lumina-bug-upload'
 
@@ -26,16 +30,18 @@ function isSavedFile(v: unknown): v is SavedFile {
   if (!f || typeof f.name !== 'string' || !isNat(f.size) || !isHead(f.head) || typeof f.done !== 'boolean') {
     return false
   }
-  // Not created yet cannot be done, nor be removing (it goes at once, with no DELETE); created needs the part layout
-  // the server gave.
-  if (f.attachmentId === null) return !f.done && f.removing === undefined
   if (f.removing !== undefined && f.removing !== true) return false
+  // Not created yet cannot be done; created needs the part layout the server gave.
+  if (f.attachmentId === null) return !f.done
   return isStr(f.attachmentId) && isNat(f.partSize) && f.partSize > 0 && isNat(f.partCount) && f.partCount > 0
 }
 
 function isSession(v: unknown): v is Session {
   const s = v as Partial<Session> | null
+  const named = (p: { name?: unknown; size?: unknown } | null) => !!p && typeof p.name === 'string' && isNat(p.size)
+  const pending = s?.pending === undefined || (Array.isArray(s.pending) && s.pending.every(named))
   return !!s && s.v === 3 && isStr(s.code) && isStr(s.reportToken) && Array.isArray(s.files) && s.files.every(isSavedFile)
+    && pending
 }
 
 export function loadSession(): Session | null {
