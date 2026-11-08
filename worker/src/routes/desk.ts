@@ -10,10 +10,17 @@ import * as v from "../lib/validate";
 const PAGE_SIZE = 50;
 const ID_PATTERN = "[0-9A-Za-z-]{1,64}";
 
+// The first 13 characters of the note on the report's latest status_changed, where the agent says it could not make
+// the simple fix (`needs_person: tests_failed`). Compared with substr, because LIKE reads `_` as any character and ignores
+// case. json_valid first: json_extract throws on a stored event that is not JSON, which would take the whole desk down.
+const LATEST_NOTE_PREFIX = `(SELECT CASE WHEN json_valid(e.data) THEN substr(json_extract(e.data, '$.note'), 1, 13) END
+  FROM events e WHERE e.report_id = r.id AND e.type = 'status_changed' ORDER BY e.seq DESC LIMIT 1)`;
+
 /**
  * The desk's tabs as SQL conditions. CONTRACT.md names the tabs, not their meaning; this mapping is the lead's:
  * - fix_ready: triage said simple_fix, the agent opened a PR, and nobody has closed the report yet (status looking);
- * - needs_person: triage said needs_person and the report is still open (looking);
+ * - needs_person: still open with no PR linked, and either triage said needs_person or the agent could not make the
+ *   simple fix (LATEST_NOTE_PREFIX);
  * - duplicate / not_bug: by status, whatever the verdict was, so a person's decision wins over triage;
  * - waiting: received, not looked at yet; all: everything.
  * Constant strings only: the request picks a key, never SQL text.
@@ -21,11 +28,21 @@ const ID_PATTERN = "[0-9A-Za-z-]{1,64}";
 const FILTERS: Record<string, string> = {
   all: "1 = 1",
   fix_ready: "r.verdict = 'simple_fix' AND r.pr_url IS NOT NULL AND r.status = 'looking'",
-  needs_person: "r.verdict = 'needs_person' AND r.status = 'looking'",
+  needs_person: `r.status = 'looking' AND r.pr_url IS NULL AND (r.verdict = 'needs_person' OR ${LATEST_NOTE_PREFIX} = 'needs_person:')`,
   duplicate: "r.status = 'duplicate'",
   not_bug: "r.status = 'not_bug'",
   waiting: "r.status = 'received'",
 };
+
+// One source for the tabs' rows and their numbers. COALESCE: SUM over an empty table is NULL. The alias is quoted
+// because `all` is a keyword in SQLite. A report is one row here, so several files or events can never multiply it.
+const COUNT_COLUMNS = Object.entries(FILTERS)
+  .map(([key, condition]) => `COALESCE(SUM(CASE WHEN ${condition} THEN 1 ELSE 0 END), 0) AS "${key}"`)
+  .join(", ");
+
+// The player's files: frames are the agent's, an aborted upload never arrived. One condition, so the count and the list
+// of a row cannot disagree.
+const PLAYER_FILE = "a.kind IN ('video', 'image') AND a.status != 'aborted'";
 
 // The cursor is opaque to the desk: base64url of [created_at, id] of the last row shown.
 const encodeCursor = (createdAt: number, id: string) =>
@@ -44,6 +61,22 @@ function decodeCursor(raw: string): [number, string] {
   throw new HttpError(400, "invalid_cursor");
 }
 
+type ListedFile = { kind: string; size_bytes: number };
+
+/** The kind and size of each report's files, oldest first: one query for the whole page (at most 50 ids to bind). */
+async function playerFiles(env: Env, ids: string[]): Promise<Map<string, ListedFile[]>> {
+  const byReport = new Map<string, ListedFile[]>();
+  if (ids.length === 0) return byReport;
+  const { results } = await env.DB.prepare(
+    `SELECT a.report_id, a.kind, a.size_bytes FROM attachments a
+     WHERE a.report_id IN (${ids.map(() => "?").join(", ")}) AND ${PLAYER_FILE} ORDER BY a.created_at, a.id`,
+  )
+    .bind(...ids)
+    .all<ListedFile & { report_id: string }>();
+  for (const f of results) byReport.set(f.report_id, [...(byReport.get(f.report_id) ?? []), { kind: f.kind, size_bytes: f.size_bytes }]);
+  return byReport;
+}
+
 async function listReports(env: Env, url: URL): Promise<Response> {
   const filter = url.searchParams.get("filter") ?? "all";
   if (!Object.hasOwn(FILTERS, filter)) throw new HttpError(400, "invalid_filter");
@@ -51,21 +84,22 @@ async function listReports(env: Env, url: URL): Promise<Response> {
   const after = cursor ? decodeCursor(cursor) : null;
   // Newest first, with id as the tie-break so two reports in the same millisecond are neither skipped nor repeated.
   const keyset = after ? "AND (r.created_at < ?1 OR (r.created_at = ?1 AND r.id < ?2))" : "";
-  // The count is the player's files (frames are the agent's) that did not end as an aborted upload.
   const { results } = await env.DB.prepare(
     `SELECT r.id, r.code, r.created_at, r.updated_at, r.source, r.status, r.verdict, r.title,
        substr(r.what, 1, 200) AS what, r.where_area, r.device,
-       (SELECT count(*) FROM attachments a WHERE a.report_id = r.id AND a.kind IN ('video', 'image')
-          AND a.status != 'aborted') AS attachment_count
+       (SELECT count(*) FROM attachments a WHERE a.report_id = r.id AND ${PLAYER_FILE}) AS attachment_count
      FROM reports r WHERE ${FILTERS[filter]} ${keyset}
      ORDER BY r.created_at DESC, r.id DESC LIMIT ${PAGE_SIZE + 1}`,
   )
     .bind(...(after ?? []))
     .all<{ id: string; created_at: number } & Record<string, unknown>>();
   const page = results.slice(0, PAGE_SIZE);
+  // The whole table, whatever filter or page was asked: a tab's number must not change with the tab being read.
+  const counts = await env.DB.prepare(`SELECT ${COUNT_COLUMNS} FROM reports r`).first<Record<string, number>>();
+  const filesByReport = await playerFiles(env, page.map((r) => r.id));
   const last = page[page.length - 1];
   const nextCursor = results.length > PAGE_SIZE && last ? encodeCursor(last.created_at, last.id) : null;
-  return json({ reports: page.map(({ id: _id, ...row }) => row), nextCursor });
+  return json({ reports: page.map(({ id, ...row }) => ({ ...row, files: filesByReport.get(id) ?? [] })), nextCursor, counts });
 }
 
 /** A stored JSON column as data; a value that does not parse is shown as its text rather than hiding the report. */

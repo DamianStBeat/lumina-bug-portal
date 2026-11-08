@@ -26,6 +26,7 @@ function row(code: string, attachment_count: number, what = `What happened in ${
     where_area: null,
     device: null,
     attachment_count,
+    files: Array.from({ length: attachment_count }, () => ({ kind: 'video' as const, size_bytes: 5_000_000 })),
   }
 }
 
@@ -125,13 +126,13 @@ describe('desk list: nextCursor pages the list', () => {
 })
 
 describe('desk list: attachment_count is the row\'s file count', () => {
-  it('attachment_count: 2 says "2 files", 1 says "1 file", 0 says "No video"', async () => {
+  it('attachment_count: 2 and 1 show the first file\'s line, 0 says "No video"', async () => {
     const C = 'LUM-482195'
     serve(() => ({ reports: [row(A, 2), row(B, 1), row(C, 0)], nextCursor: null }))
     open()
     await listed(A)
-    expect(rowOf(A).textContent).toContain('2 files')
-    expect(rowOf(B).textContent).toContain('1 file')
+    expect(rowOf(A).textContent).toContain('Video 5 MB')
+    expect(rowOf(B).textContent).toContain('Video 5 MB')
     expect(rowOf(B).textContent).not.toContain('files')
     expect(rowOf(C).textContent).toContain('No video')
   })
@@ -241,7 +242,7 @@ describe('desk: the worker\'s columns reach the page (snake_case in, null as not
     await screen.findByRole('heading', { name: A })
     await listed(A)
     const text = rowOf(A).textContent ?? ''
-    expect(text).toContain('1 file · Phone')
+    expect(text).toContain('Video 5 MB · Phone')
     expect(text).toContain('Boss froze on the bridge')
     expect(text).not.toContain(`What happened in ${A}`)
     expect(text).toContain('Match')
@@ -254,7 +255,7 @@ describe('desk: the worker\'s columns reach the page (snake_case in, null as not
     await screen.findByRole('heading', { name: A })
     const text = rowOf(B).textContent ?? ''
     expect(text).toContain('Not a bug')
-    expect(text).toContain('2 files · Console')
+    expect(text).toContain('Video 5 MB · Console')
   })
 
   it('fields, list client: every column is renamed and null becomes absent', async () => {
@@ -272,7 +273,7 @@ describe('desk: the worker\'s columns reach the page (snake_case in, null as not
     open()
     await listed(A)
     const text = rowOf(A).textContent ?? ''
-    expect(text).toContain('1 file')
+    expect(text).toContain('Video 5 MB')
     expect(text).not.toContain('·')
     expect(text).toContain(`What happened in ${A}`)
     expect(text).toContain('—')

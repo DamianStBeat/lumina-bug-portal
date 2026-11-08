@@ -66,14 +66,18 @@ export type DeskReportRow = {
   // Not in the list answer: a row gets them from its detail answer (Desk patchRow).
   prUrl?: string
   duplicateOf?: string
-  // The player's files (video or picture) that did not end as an aborted upload; their kind and size are not sent.
+  // The player's files (video or picture) that did not end as an aborted upload.
   fileCount: number
+  // The same files, oldest first. Absent when the answer did not carry them: not known, which is not "none".
+  files?: DeskFile[]
 }
+
+export type DeskFile = { kind: Exclude<AttachmentKind, 'frames'>; sizeBytes: number }
 
 export type DeskListRes = {
   reports: DeskReportRow[]
   cursor?: string
-  // The worker on main sends no counts: the filter pills then show no number.
+  // Over the whole table. A tab with no valid number here shows its plain label.
   counts?: Partial<Record<DeskFilter, number>>
 }
 
@@ -90,8 +94,13 @@ export type DeskListRowWire = {
   where_area: WhereArea | null
   device: Device | null
   attachment_count: number
+  files: { kind: Exclude<AttachmentKind, 'frames'>; size_bytes: number }[]
 }
-export type DeskListWire = { reports: DeskListRowWire[]; nextCursor: string | null }
+export type DeskListWire = {
+  reports: DeskListRowWire[]
+  nextCursor: string | null
+  counts: Record<DeskFilter, number>
+}
 
 // Every attachment of the report, frames included, in creation order. R2 keys and upload ids stay in the worker.
 export type DeskAttachmentWire = {
@@ -168,7 +177,7 @@ export type DeskTriage = {
   agent: string
 }
 
-export type DeskReport = Omit<DeskReportRow, 'fileCount'> & {
+export type DeskReport = Omit<DeskReportRow, 'fileCount' | 'files'> & {
   lang?: string
   robloxName?: string
   robloxUserId?: number

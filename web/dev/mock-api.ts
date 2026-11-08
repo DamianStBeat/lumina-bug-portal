@@ -143,11 +143,13 @@ const liveFiles = (code: string) => fileAtts(code).filter((a) => a.status === 'u
 function row(rec: Rec): DeskListRowWire {
   const r = rec.report
   const t = times(rec)
+  const sent = fileAtts(r.code).filter((a) => a.status !== 'aborted')
   // Listed field by field: the list row carries no detail-only field (lang, names, triage, PR link, link target).
   return {
     code: r.code, created_at: t.createdAt, updated_at: t.updatedAt, source: r.source, status: r.status,
     verdict: r.verdict ?? null, title: r.title ?? null, what: r.what.slice(0, 200), where_area: r.whereArea ?? null,
-    device: r.device ?? null, attachment_count: fileAtts(r.code).filter((a) => a.status !== 'aborted').length,
+    device: r.device ?? null, attachment_count: sent.length,
+    files: sent.map((a) => ({ kind: a.kind as 'video' | 'image', size_bytes: a.sizeBytes })),
   }
 }
 
@@ -176,11 +178,12 @@ function detail(rec: Rec): DeskReportWire {
   }
 }
 
-// The worker's tabs (desk.ts FILTERS): a person's status wins over the verdict, and fix_ready needs the PR.
+// The worker's tabs (desk.ts FILTERS): a person's status wins over the verdict, and fix_ready needs the PR. The mock
+// keeps no events, so needs_person has only its triage branch here, not the agent's note.
 const MATCH: Record<DeskFilter, (r: Report) => boolean> = {
   all: () => true,
   fix_ready: (r) => r.verdict === 'simple_fix' && !!r.prUrl && r.status === 'looking',
-  needs_person: (r) => r.verdict === 'needs_person' && r.status === 'looking',
+  needs_person: (r) => r.verdict === 'needs_person' && r.status === 'looking' && !r.prUrl,
   duplicate: (r) => r.status === 'duplicate',
   not_bug: (r) => r.status === 'not_bug',
   waiting: (r) => r.status === 'received',
@@ -412,14 +415,18 @@ async function api(req: IncomingMessage, res: ServerResponse, url: URL, jpg: str
   if (at(/^\/desk\/reports$/, 'GET')) {
     const filter = url.searchParams.get('filter') ?? 'all'
     if (!FILTERS.includes(filter as DeskFilter)) throw new HttpError(400, 'invalid_filter')
-    // The worker's cursor is opaque to the desk; an offset is enough here. No tab counts: the worker sends none.
+    // The worker's cursor is opaque to the desk; an offset is enough here.
     const offset = Number(url.searchParams.get('cursor') || 0)
     if (!Number.isInteger(offset) || offset < 0) throw new HttpError(400, 'invalid_cursor')
     const all = [...state.reports.values()].sort((a, b) => times(b).createdAt - times(a).createdAt)
     const hits = all.filter((r) => MATCH[filter as DeskFilter](r.report))
     const page = hits.slice(offset, offset + PAGE).map(row)
     const nextCursor = offset + PAGE < hits.length ? String(offset + PAGE) : null
-    return send(res, 200, { reports: page, nextCursor } satisfies DeskListWire)
+    // Over every report, whatever the filter or page, as the worker counts them.
+    const counts = Object.fromEntries(
+      FILTERS.map((f) => [f, all.filter((r) => MATCH[f](r.report)).length]),
+    ) as DeskListWire['counts']
+    return send(res, 200, { reports: page, nextCursor, counts } satisfies DeskListWire)
   }
   if ((m = at(/^\/desk\/reports\/(LUM-\d{6})$/, 'GET'))) return send(res, 200, detail(needReport(m[1]!)))
   if ((m = at(/^\/desk\/attachments\/([\w-]+)\/stream$/, 'GET'))) {
