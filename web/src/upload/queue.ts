@@ -200,17 +200,30 @@ function leave(s: State, it: Item, fx: Effect[]): State {
 }
 const identOf = (x: Item): Ident => ({ name: x.file.name, size: x.file.size, head: x.head ?? null })
 const lineAt = (id: Ident, att: Att): MarkedFile => ({ ...id, done: false, ...att, removing: true })
-// The marked line of an attachment into a session: its id-less removing twin filled (the line Remove marked while the
-// create was out), or appended.
+// Where a marked line's id-less removing twin is (the line Remove marked while the create was out), -1 when it has none.
+const twinAt = (sess: Session, line: MarkedFile) =>
+  sess.files.findIndex((f) => f.attachmentId === null && struck(f) && sameFile(line, f))
+// The marked line of an attachment into a session: its twin filled, or appended.
 function fill(sess: Session, line: MarkedFile): Session {
   if (sess.files.some((f) => f.attachmentId === line.attachmentId)) return sess
-  const i = sess.files.findIndex((f) => f.attachmentId === null && struck(f) && sameFile(line, f))
+  const i = twinAt(sess, line)
   return { ...sess, files: i < 0 ? [...sess.files, line] : sess.files.map((f, j) => (j === i ? line : f)) }
 }
 // An adopted line goes only into a session of its report (or makes one); undefined: another report's, write nothing.
 export function adoptInto(sess: Session | null, a: Omit<Adopt, 't'>): Session | undefined {
   if (!sess) return { v: 3, code: a.code, reportToken: a.token, files: [a.line] }
   return sess.code === a.code && sess.reportToken === a.token ? fill(sess, a.line) : undefined
+}
+// The DELETE of a line `adoptInto` wrote answered gone. `was`: storage as read before that write. The line leaves a
+// session of its report and the twin it filled comes back, so storage ends as the close left it; whatever else that
+// session holds by now stays, and a page of this report that already dropped the line loses nothing. undefined:
+// another report's session, or none, write nothing. null: the session was made for this line and holds nothing else.
+export function adoptOut(sess: Session | null, a: Omit<Adopt, 't'>, was: Session | null): Session | null | undefined {
+  if (!sess || sess.code !== a.code || sess.reportToken !== a.token) return undefined
+  const id = a.line.attachmentId
+  const twin = was?.files[twinAt(was, a.line)]
+  const files = sess.files.flatMap((f) => (f.attachmentId !== id ? [f] : twin ? [twin] : []))
+  return was === null && files.length === 0 && !sess.pending ? null : { ...sess, files }
 }
 
 // What Remove writes when it is pressed, before any request it causes. Nothing for a done file (Remove leaves it).

@@ -141,7 +141,7 @@ Header `Authorization: Bearer <AGENT_KEY>`.
 | `POST /agent/reports/{code}/discord` | `{threadId}` | `200` |
 | `GET /agent/events?after=<seq>&limit=n` | | `200 {events:[{seq, code, at, type, data}], last}` (shape: "Event data" below) |
 
-`expectedStatus` (triage and status routes, optional): one of the internal statuses of "Statuses" (any other value:
+`expectedStatus` (triage and status routes, optional): one of the internal statuses of "Statuses" (any other value, JSON null included:
 400 `invalid_expected_status`). When it is present and differs from the report's current internal status, nothing is
 written (no column, no event) and the worker answers `409 {"error":"status_changed","status":"<current internal
 status>"}`. Absent: today's behaviour, unchanged. The check and the write are one atomic step: one conditional

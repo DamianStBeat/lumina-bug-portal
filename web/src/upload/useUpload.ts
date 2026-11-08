@@ -2,7 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from 'react'
 import { ApiError, createAttachment, deleteAttachment } from '../api/client'
 import { clearSession, loadSession, saveSession, type Session } from './session'
 import { retryable, uploadFile } from './uploader'
-import { adoptInto, initial, reduce, resumeOf, unremoved, viewState, type Effect, type Event, type Item, type Refusal, type Stage, type State } from './queue'
+import { adoptInto, adoptOut, initial, reduce, resumeOf, unremoved, viewState, type Effect, type Event, type Item, type Refusal, type Stage, type State } from './queue'
 import type { Rejection } from './validate'
 
 // The hook only dispatches the player's actions and the answers of the requests it ran to the queue (queue.ts), and
@@ -158,14 +158,26 @@ function machine(boot: Session | null, only?: string) {
       case 'adopt': {
         const page = adopter()
         if (page) return page.dispatch(f)
-        // No page that can take it: the DELETE goes now, and only a failed one is written down (to a page opened since,
-        // else to storage of its report only), so the next load sends it again. A gone one writes nothing (red team r1,
-        // tests-commit 12: a late create answer leaves storage as the close left it).
+        // No page that can take it: the line goes into storage (of its report only, or empty) before the DELETE leaves.
+        // A reload ends this tab's callback, so whatever waited for the DELETE's answer would be lost with the id, and
+        // the next load could not send it again. A gone answer takes the line out again, from a session of its report
+        // only, so storage ends as the close left it. A failed one stays written down: the next load sends it again, and
+        // a page opened since read it and sent its own. Only when storage lost it meanwhile is it handed on or written again.
+        const before = loadSession()
+        const written = adoptInto(before, f)
+        if (written) saveSession(written)
         void gone(f.line.attachmentId, f.token).then((g) => {
-          if (g) return
+          if (g) {
+            const back = adoptOut(loadSession(), f, before)
+            if (back) saveSession(back)
+            else if (back === null) clearSession()
+            return
+          }
+          const now = loadSession()
+          if (now?.files.some((l) => l.attachmentId === f.line.attachmentId)) return
           const since = adopter()
           if (since) return since.dispatch(f)
-          const next = adoptInto(loadSession(), f)
+          const next = adoptInto(now, f)
           if (next) saveSession(next)
         })
         return

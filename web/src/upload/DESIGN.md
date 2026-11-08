@@ -58,11 +58,15 @@ state before any effect runs and the pages keep what it says (audit-3 finding 2)
   no-owner way. With an owner, the hook dispatches `{ t: 'adopt', ... }` to it: if its session has the same
   code and reportToken (or is null, then a session with only that line is made, as `run` does at queue.ts:488), the
   line is written (or its id-less twin filled) and a DELETE `by: 'load'` goes under the owner's epoch, so its failure
-  is kept in `failed` and the place held. Without an owner, the hook sends the DELETE first; a gone answer writes
-  nothing (redteam-r1.spec.ts finding 1: exactly one DELETE, storage as the close left it); a failed one goes to a
-  page opened since, else into storage (read, check code and token, or empty storage, write), and the next load sends
-  it again. If the stored or owned session is another report's, nothing is written (row 2) and the DELETE still goes,
-  untracked (known limit: one storage key).
+  is kept in `failed` and the place held. Without an owner, the hook writes the marked line to storage **before** the
+  DELETE leaves (read, check code and token, or empty storage, write), because a reload kills the callback waiting for
+  the answer and the next load can only send what storage holds (red team round 1). A gone answer takes it out again,
+  only from a session of the same code and token (`adoptOut`): its id-less twin comes back, nothing else in the session
+  changes, and a session the line made for itself is cleared, so storage ends as the close left it
+  (redteam-r1.spec.ts finding 1: exactly one DELETE). A failed one keeps the line and the next load sends it again; a
+  page opened since read it and sent its own DELETE. Only a line storage lost meanwhile goes to such a page, else back
+  into storage. If the stored or owned session is another report's, nothing is written or taken out (row 2)
+  and the DELETE still goes, untracked (known limit: one storage key).
 - The gap between the boot read (`useState`) and the mount effect: the `mount` event carries `stored: loadSession()`
   (filtered by `only`) and adopts marked lines of the same code and token missing from the state's session.
 

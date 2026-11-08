@@ -43,10 +43,14 @@ function parseStored(text: string | null): unknown {
 }
 
 /**
- * `expectedStatus` of an agent write (CONTRACT.md "Agent and bot"): the status the agent read, or null when absent
- * (JSON null too) for today's unconditional write; any value outside the internal statuses is 400.
+ * `expectedStatus` of an agent write (CONTRACT.md "Agent and bot"): the status the agent read, or null when the key is
+ * absent, for today's unconditional write; any value outside the internal statuses is 400. JSON null is one of those:
+ * `oneOf` reads it as absent, and a null that passed would switch off the check and write over a person's status.
  */
-const expectedStatusOf = (raw: unknown): string | null => v.oneOf(raw, "expected_status", v.STATUSES);
+const expectedStatusOf = (raw: unknown): string | null => {
+  if (raw === null) throw new HttpError(400, "invalid_expected_status");
+  return v.oneOf(raw, "expected_status", v.STATUSES);
+};
 
 async function queue(env: Env, url: URL): Promise<Response> {
   const limit = intParam(url, "limit", 10, 1, 50);
