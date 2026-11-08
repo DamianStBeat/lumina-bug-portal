@@ -401,8 +401,10 @@ as the public ones.
   `done`. Auth: header `X-Cron-Token` equal to `bug_portal.cron_token.token` (generated inside the database by the
   migration, never in a repo or chat), or `Authorization: Bearer <AGENT_KEY>` (the documented fallback when pg_cron or
   pg_net is not available: the agent's timer calls it). The schedule is hourly (`0 * * * *`), one batch per call: that drains the
-  backlog and honours the 3-hour window below; the migration enables pg_cron and pg_net itself and only falls back to a notice if it cannot. Besides the rules above it removes objects of `aborted` and
-  `deleted` attachments for 3 hours after that status (a signed URL issued before it can still land).
+  backlog and honours the 24-hour window below; the migration enables pg_cron and pg_net itself and only falls back to a notice if it cannot. Besides the rules above it removes objects of `aborted` and
+  `deleted` attachments for 24 hours after that status (a signed URL issued before it can still land for 2 hours; 24 hours
+  does not hang on one hourly run). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
+  file is the reporter's own and the agent rechecks sizes and the real type.
 
 ### Secrets
 
