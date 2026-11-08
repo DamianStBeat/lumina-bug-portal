@@ -29,6 +29,8 @@
 // web/src/pages/desk/Desk.tsx|return { ...l, rows: [...l.rows|return { key: l.key, rows: [...l.rows|d load more loses counts
 // web/src/pages/desk/Desk.tsx|setList({ key, rows: res.reports, cursor: res.cursor, counts: res.counts })|setList((l) => ({ key, rows: res.reports, cursor: res.cursor, counts: l.counts ?? res.counts }))|d first counts kept
 // web/src/pages/desk/ReportDetail.tsx|onChanged({ code, status, updatedAt, prUrl, verdict, duplicateOf })|onChanged({ code, status, updatedAt, prUrl, verdict, duplicateOf, files: [] })|r detail wipes files
+// web/src/pages/desk/ReportList.tsx|if (!files) return ''|if (!files) return 'No video'|files absent read as No video
+// web/src/api/client.ts|Array.isArray(w.files) ? w.files.map((f) => ({ kind: f.kind, sizeBytes: f.size_bytes })) : undefined|(w.files ?? []).map((f) => ({ kind: f.kind, sizeBytes: f.size_bytes }))|client turns absent files into []
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createElement } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -233,6 +235,25 @@ describe('desk row: the file line from the worker\'s files', () => {
     await rows([[A, [], 'phone']])
     expect(showsLine(A, 'No video')).toBeTruthy()
     expect(rowOf(A).textContent).not.toContain('Phone')
+  })
+
+  // "Not known" is not "none" (audit-1-2-r2 finding 1): `files: []` is a report with no file, an answer with no `files`
+  // says nothing about them, so the row must not claim "No video" about a report that may have one. B is the control:
+  // the same row with an empty list does read "No video", so this spec tells the two apart.
+  it('row 9, not yet: a row with no files key shows no file line, never No video', async () => {
+    const noKey: Partial<ReturnType<typeof wireRow>> = wireRow(A, [])
+    delete noKey.files
+    const nullFiles = { ...wireRow(C, []), files: null }
+    serve(() => ({ reports: [noKey, wireRow(B, []), nullFiles], nextCursor: null }))
+    open()
+    await listed(A)
+    await listed(C)
+    expect(showsLine(B, 'No video')).toBeTruthy()
+    for (const code of [A, C]) {
+      expect(rowOf(code).textContent, code).not.toContain('No video')
+      // The whole cell is the player's text: no line of any wording, the known device included, is added under it.
+      expect(rowOf(code).querySelector('.c-what')?.textContent, code).toBe(`What happened in ${code}`)
+    }
   })
 
   it('row 9: the other devices of the preview', async () => {
