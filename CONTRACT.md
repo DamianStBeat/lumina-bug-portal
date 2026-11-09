@@ -414,6 +414,7 @@ as the public ones.
 (site). `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_DB_URL` are provided by the platform.
 
 - Attachment creation: 30 per hour per ip_hash (429 `rate_limited`), because aborted attachments do not count toward the 3 per report.
+- From 364 days after a report's `created_at`, `POST /reports/{code}/attachments` and `.../upload-url` answer 404 `not_found` for it: a signed URL lives 2 hours, so no upload can land after the report's 12-month removal has taken its row.
 - An `uploading` attachment past 7 days becomes `aborted` only after Storage removed its objects; a Storage failure leaves it to retry.
 
 ### Turnstile not configured: the intake fails closed (lead, Damian 8 Nov 2026, Q-490)
