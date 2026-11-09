@@ -10,6 +10,10 @@ ffmpeg, ffprobe, claude, git and gh are external commands.
 
 Copy `agent.env.example` to `~/.config/lumina-bug-portal/agent.env` and `chmod 600` it. The process environment
 overrides the file. Missing `PORTAL_API_BASE`, `AGENT_KEY` or `LUMINA2_REPO`, or a bad number, exits 2.
+`PORTAL_API_BASE` is `https://<project>.supabase.co/functions/v1/bug-portal/api/v1`.
+
+`RETENTION_FALLBACK=1` is for a project without pg_cron or pg_net: each run that is not dry also calls
+`POST /internal/retention`, until it answers `done` or 20 calls. Unset, the agent never calls it.
 
 `FRAME_FONT` is the font file of the time stamps drawn on the video sheets (default
 `/usr/share/fonts/truetype/freefont/FreeSans.ttf`). When the file is missing the agent logs it and asks fontconfig for

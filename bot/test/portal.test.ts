@@ -18,6 +18,7 @@ beforeEach(() => {
   worker.requests.length = 0;
   worker.mode = 'ok';
   worker.override = undefined;
+  worker.storage.reset();
   worker.reports.clear();
   worker.events.length = 0;
 });
@@ -108,22 +109,27 @@ describe('PortalApi', () => {
     assert.ok(create);
     assert.equal(create.headers['x-report-token'], REPORT_TOKEN);
     assert.deepEqual(create.json, { filename: 'boss.mp4', size, mime: 'video/mp4' });
-    const parts = worker.find('PUT', /^\/attachments\/att-\d+\/parts\/\d+$/);
+    const urls = worker.find('POST', /^\/attachments\/att-\d+\/parts\/\d+\/upload-url$/);
     assert.deepEqual(
-      parts.map((p) => p.path.split('/').pop()),
+      urls.map((p) => p.path.split('/').at(-2)),
       ['1', '2'],
+    );
+    assert.ok(urls.every((p) => p.headers['x-report-token'] === REPORT_TOKEN));
+    const parts = worker.storage.puts();
+    assert.deepEqual(
+      parts.map((p) => p.part),
+      [1, 2],
     );
     assert.equal(parts[0]!.body.length, PART_SIZE);
     assert.equal(parts[1]!.body.length, 1234);
     assert.ok(Buffer.from(body.subarray(PART_SIZE)).equals(parts[1]!.body), 'second part carries the tail bytes');
-    assert.ok(parts.every((p) => p.headers['x-report-token'] === REPORT_TOKEN));
     const complete = worker.find('POST', /^\/attachments\/att-\d+\/complete$/);
     assert.equal(complete.length, 1);
-    assert.ok(worker.requests.indexOf(complete[0]!) > worker.requests.indexOf(parts[1]!), 'complete comes last');
+    assert.equal(worker.storage.objects.size, 2, 'complete was called with both parts in the bucket');
   });
 
   test('design: a failed part aborts the upload (DELETE) and throws', async () => {
-    worker.override = (r) => (r.method === 'PUT' ? { status: 500, body: { error: 'internal' } } : undefined);
+    worker.storage.override = () => ({ status: 500, body: { error: 'internal' } });
     const err = await portalError(
       api().uploadAttachment('LUM-482193', REPORT_TOKEN, {
         filename: 'a.png',

@@ -41,7 +41,7 @@ worker (with the bearer `AGENT_KEY`). See `../CONTRACT.md` for the worker API.
 
 `~/.config/lumina-bug-portal/bot.env`, mode 600, never in the repository. Names and placeholders are in
 `bot.env.example`: `DISCORD_TOKEN`, `DISCORD_APP_ID`, `DISCORD_GUILD_ID`, `BUG_FORUM_CHANNEL_ID`,
-`PORTAL_API_BASE` (including `/api/v1`), `AGENT_KEY`, `SITE_BASE`, optional `LUMINA_BOT_STATE_DIR`.
+`PORTAL_API_BASE` (`https://<project>.supabase.co/functions/v1/bug-portal/api/v1`), `AGENT_KEY`, `SITE_BASE`, optional `LUMINA_BOT_STATE_DIR`.
 
 When the cursor file is missing (first start, or a lost state dir) or unreadable, the bot goes through the event
 history without posting past "Fixed" and "Same bug" messages, but a game report that never got its forum post still

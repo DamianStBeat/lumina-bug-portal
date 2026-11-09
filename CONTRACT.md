@@ -338,3 +338,98 @@ gender are never asked). In the game the four audiences of `lumina2-four-audienc
 No email, no real name, Roblox name optional on the web; audio stripped before the AI sees a video; videos deleted
 at 60 days; testers and moderators only until a lawyer has reviewed it; no analytics or third-party scripts on the
 site except Cloudflare Turnstile.
+
+## Supabase deployment (official site, Damian 8 Nov 2026: «Inside the Lovable site»)
+
+The API moves from the Cloudflare Worker to the Supabase Edge Function `bug-portal` of the site's project. Everything
+above holds (paths, shapes, errors, limits, statuses, events, `expectedStatus`, retention) except what this section
+replaces. Base: `https://<project>.supabase.co/functions/v1/bug-portal/api/v1`, configured by `PORTAL_API_BASE` (agent,
+bot), `VITE_BUG_PORTAL_API_BASE` (site), Lumina2's config (game). `verify_jwt = false` for this function: it does its
+own authentication on every route.
+
+### Storage (replaces D1 + R2 wording)
+
+- Postgres schema `bug_portal`, same tables and columns (`INTEGER` ms stay `bigint`; `r2_key` is named `storage_prefix`;
+  `events.seq` is `bigint generated always as identity`; `attachments.status_at bigint`, unix ms, is set whenever an
+  attachment becomes `aborted` or `deleted`). RLS on every table, no policy, no grant to `anon` or
+  `authenticated`. The function reaches it through `SUPABASE_DB_URL` (one connection per invocation, `prepare: false`),
+  because PostgREST does not expose extra schemas. Every "one atomic step" above is one Postgres transaction or one
+  conditional `UPDATE`.
+- Private bucket `bug-portal`, `public = false`, `file_size_limit = 16777216`, allowed types `application/octet-stream`,
+  `image/jpeg`, `image/png`. A file is its parts: `<attachmentId>/part-NNNNN` (5 digits, from 00001). Frames are one
+  object `<attachmentId>/frame` written by the function. The function never carries video or player-image bytes.
+
+- Event order: `seq` must become visible in order, or a reader's cursor passes a number still uncommitted and that event
+  is lost. A `BEFORE INSERT ... FOR EACH STATEMENT` trigger on `events` takes one transaction-scoped advisory lock, so
+  every writer serializes from before `seq` is assigned until its commit.
+  The trigger function carries `SET lock_timeout = '2s'`, so a stuck holder cannot pile up writers: any route that hits a lock
+  timeout or deadlock answers `503 {"error":"busy"}` with `Retry-After`, except the duplicate-link path's `409 duplicate_busy`.
+
+### Upload routes
+
+`PUT /attachments/{id}/parts/{n}` no longer exists. New:
+
+| Method, path | Body / headers | Answer |
+|---|---|---|
+| `POST /attachments/{id}/parts/{n}/upload-url` | header `X-Report-Token`; n = 1..partCount | `200 {n, url, expiresIn}`; 409 `not_uploading` when the attachment is not `uploading` |
+
+The client `PUT`s the part's raw bytes to `url` with `Content-Type: application/octet-stream`; re-sending replaces it
+(signed with upsert). Supabase fixes these URLs at 2 hours (`expiresIn: 7200`); an expired one is simply asked again.
+`GET /attachments/{id}/parts` answers from the objects present in the bucket. `POST .../complete` also checks each
+object's size (`partSize`, the last one the remainder): a wrong size counts as missing in 409 `missing_parts`, and the
+object is removed. `DELETE` removes the objects present.
+
+### Download routes (replace the streamed routes)
+
+`GET /agent/attachments/{id}/download` and the new `GET /desk/attachments/{id}/parts` (replaces `/stream`) answer
+`200 {mime, sizeBytes, expiresIn, parts: [{n, size, url}]}`, ascending `n`, signed download URLs valid 900 s; the reader
+joins the parts in order and asks again when a URL expired. `frames` attachments have one part. 409 `not_available`
+when the attachment is not `complete`.
+
+### Desk authentication (replaces Cloudflare Access)
+
+Header `Authorization: Bearer <Supabase user JWT>` (Google sign-in on the site). The function validates it with Supabase
+Auth, requires a confirmed email and Google among the user's providers (a password account on a team address is refused), and requires the lowercased email in table `bug_portal.desk_team(email primary key)`. Missing or invalid token: 401
+`unauthorized`; valid but not listed: 403 `not_team`, the same answer on every desk route and with no desk data. An
+empty table closes the desk. `by: "desk"`, `email` of the events are this user's. Desk routes follow the same CORS rule
+as the public ones.
+
+### CORS, IP, retention
+
+- `ALLOWED_ORIGINS` (function secret, comma separated) covers every browser route, desk included; `Authorization`,
+  `X-Report-Token`, `Content-Type` allowed. No wildcard.
+- `ip_hash` input: first address of `x-forwarded-for`; none: the literal `unknown`.
+- Retention: `POST /internal/retention` runs one bounded batch and answers `{done: boolean}`; the caller repeats until
+  `done`. Auth: header `X-Cron-Token` equal to `bug_portal.cron_token.token` (generated inside the database by the
+  migration, never in a repo or chat), or `Authorization: Bearer <AGENT_KEY>` (the documented fallback when pg_cron or
+  pg_net is not available: the agent's timer calls it). The schedule is every 10 minutes (`*/10 * * * *`), one batch per call: that drains the
+  backlog and honours the 24-hour window below; the migration enables pg_cron and pg_net itself and only falls back to a notice if it cannot. Besides the rules above it removes objects of `aborted` and
+  `deleted` attachments for 24 hours after that status (a signed URL issued before it can still land for 2 hours; 24 hours
+  does not hang on one run; rows take turns through `attachments.swept_at bigint`, oldest or never swept first, so a burst shares the capacity; at 150 or more new ended rows an hour a late part can wait for the 12-month removal, in the private bucket). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
+  file is the reporter's own and the agent rechecks sizes and the real type.
+
+### Secrets
+
+`TURNSTILE_SECRET`, `GAME_KEY`, `AGENT_KEY`, `IP_SALT_SEED`, `ALLOWED_ORIGINS` (function); `VITE_TURNSTILE_SITE_KEY`
+(site). `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`, `SUPABASE_DB_URL` are provided by the platform.
+
+- Attachment creation: 30 per hour per ip_hash (429 `rate_limited`), because aborted attachments do not count toward the 3 per report.
+- From 364 days after a report's `created_at`, `POST /reports/{code}/attachments` and `.../upload-url` answer 404 `not_found` for it: a signed URL lives 2 hours, so no upload can land after the report's 12-month removal has taken its row.
+- An `uploading` attachment past 7 days becomes `aborted` only after Storage removed its objects; a Storage failure leaves it to retry.
+
+### Turnstile not configured: the intake fails closed (lead, Damian 8 Nov 2026, Q-490)
+
+The function counts Turnstile as configured only when `TURNSTILE_SECRET` is set, not empty and, unless `ENVIRONMENT` is
+exactly `dev`, is not one of Cloudflare's documented test secrets. Test keys never work in production; a missing
+`ENVIRONMENT` is production.
+
+Not configured: `POST /reports`, `POST /reports/{code}/attach-session` and `POST /reports/{code}/attachments` answer
+`503 {"error":"reports_closed"}` before reading anything else, and write nothing. Every other route keeps working: status,
+desk, agent, game (`X-Game-Key`, no Turnstile), retention, and parts of attachments already created.
+
+| Method, path | Answer |
+|---|---|
+| `GET /intake` | `200 {open: boolean}`, no authentication |
+
+The site shows the "closed for now" state in place of the form (`/bugs` and its add-video page) when `open` is false, when
+that call answers `reports_closed`, or when `VITE_TURNSTILE_SITE_KEY` is missing or, outside dev, a Cloudflare test key.

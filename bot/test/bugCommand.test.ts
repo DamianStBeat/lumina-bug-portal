@@ -40,6 +40,7 @@ beforeEach(() => {
   worker.requests.length = 0;
   worker.mode = 'ok';
   worker.override = undefined;
+  worker.storage.reset();
   forum = new FakeForum();
   log = makeLogger();
 });
@@ -162,7 +163,7 @@ describe('/bug command and modal', () => {
     const up = worker.find('POST', `/reports/${CODE}/attachments`);
     assert.equal(up.length, 1);
     assert.deepEqual(up[0]!.json, { filename: 'boss-bridge.mp4', size: 18 * MiB, mime: 'video/mp4' });
-    const parts = worker.find('PUT', /\/parts\/\d+$/);
+    const parts = worker.storage.puts();
     assert.deepEqual(
       parts.map((p) => p.body.length),
       [PART_SIZE, 18 * MiB - PART_SIZE],

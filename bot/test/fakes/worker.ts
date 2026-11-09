@@ -1,6 +1,8 @@
-// A fake of the portal worker (CONTRACT.md "HTTP API"), served by a real node:http server on 127.0.0.1, port 0.
-// It checks the auth headers the contract asks for, so a request with the wrong header fails here as it would
-// on Cloudflare, and it records every request so the specs assert what reached the worker, never internals.
+// A fake of the portal API (CONTRACT.md "HTTP API" and "Supabase deployment"), served by a real node:http server on
+// 127.0.0.1, port 0. It checks the auth headers the contract asks for, so a request with the wrong header fails here as
+// it would on the function, and it records every request so the specs assert what reached the API, never internals.
+// FakeStorage is a second server, so a signed URL is another origin as on Supabase: whatever the client sends there
+// is recorded apart from the API's requests.
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
@@ -27,8 +29,139 @@ export type WorkerMode = 'ok' | 'error' | 'hang' | 'close';
 // status_changed data is `{ from, to, note?, prUrl? }`, as worker/src/routes/agent.ts and desk.ts write it.
 export type FakeEvent = { seq: number; code: string | null; at: number; type: string; data: unknown };
 
+// ---------------------------------------------------------------- the private bucket, behind signed URLs
+export type StorageRequest = {
+  method: string;
+  path: string;
+  query: URLSearchParams;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+  /** Parsed from the object path; undefined when the path is not a part of the bucket. */
+  attachment: string | undefined;
+  part: number | undefined;
+  token: string | null;
+};
+
+type StorageOverride = (req: StorageRequest) => Reply | 'hang' | 'close' | undefined;
+
+const SIGNED_UPLOAD_PATH = /^\/storage\/v1\/object\/upload\/sign\/bug-portal\/([\w-]+)\/part-(\d{5})$/;
+
+export class FakeStorage {
+  readonly requests: StorageRequest[] = [];
+  /** Per-request override: a Reply answers it, 'hang' never answers, 'close' drops the socket. */
+  override: StorageOverride | undefined;
+  /** The status a dead URL answers (403 unless a spec asks for another refusal). */
+  deadStatus = 403;
+  /** Objects stored, `<attachmentId>/<n>`. */
+  readonly objects = new Map<string, Buffer>();
+
+  private readonly tokens = new Map<string, { attachment: string; part: number; dead: boolean }>();
+  private readonly dieNext = new Map<number, number>();
+  private tokenSeq = 0;
+  private port = 0;
+  private server: http.Server;
+
+  constructor() {
+    this.server = http.createServer((req, res) => this.onRequest(req, res));
+  }
+
+  async start(): Promise<void> {
+    await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', resolve));
+    this.port = (this.server.address() as AddressInfo).port;
+  }
+
+  async stop(): Promise<void> {
+    this.server.closeAllConnections();
+    await new Promise<void>((resolve) => this.server.close(() => resolve()));
+  }
+
+  reset(): void {
+    this.requests.length = 0;
+    this.override = undefined;
+    this.deadStatus = 403;
+    this.objects.clear();
+    this.tokens.clear();
+    this.dieNext.clear();
+  }
+
+  /** The next `times` URLs signed for part `n` are dead from birth: they answer `deadStatus` however often they are tried. */
+  killNextUrls(n: number, times = 1): void {
+    this.dieNext.set(n, (this.dieNext.get(n) ?? 0) + times);
+  }
+
+  /** What the function does for POST .../upload-url: a fresh URL on another origin, with its own token. */
+  signUpload(attachment: string, part: number): string {
+    this.tokenSeq += 1;
+    const token = `signed-token-${this.tokenSeq}`;
+    const left = this.dieNext.get(part) ?? 0;
+    if (left > 0) this.dieNext.set(part, left - 1);
+    this.tokens.set(token, { attachment, part, dead: left > 0 });
+    const object = `${attachment}/part-${String(part).padStart(5, '0')}`;
+    return `http://127.0.0.1:${this.port}/storage/v1/object/upload/sign/bug-portal/${object}?token=${token}`;
+  }
+
+  /** PUTs that carried bytes to the bucket, in arrival order, refused ones included. */
+  puts(): StorageRequest[] {
+    return this.requests.filter((r) => r.method === 'PUT');
+  }
+
+  /** The bytes of the file as the bucket holds them, parts joined by ascending n. */
+  joined(attachment: string, partCount: number): Buffer {
+    const parts: Buffer[] = [];
+    for (let n = 1; n <= partCount; n++) parts.push(this.objects.get(`${attachment}/${n}`) ?? Buffer.alloc(0));
+    return Buffer.concat(parts);
+  }
+
+  private onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const chunks: Buffer[] = [];
+    req.on('data', (c: Buffer) => chunks.push(c));
+    req.on('end', () => {
+      const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const m = url.pathname.match(SIGNED_UPLOAD_PATH);
+      const rec: StorageRequest = {
+        method: req.method ?? '',
+        path: url.pathname,
+        query: url.searchParams,
+        headers: req.headers,
+        body: Buffer.concat(chunks),
+        attachment: m?.[1],
+        part: m ? Number(m[2]) : undefined,
+        token: url.searchParams.get('token'),
+      };
+      this.requests.push(rec);
+      const forced = this.override?.(rec);
+      if (forced === 'hang') return;
+      if (forced === 'close') {
+        req.socket.destroy();
+        return;
+      }
+      const reply = forced ?? this.answer(rec);
+      res.writeHead(reply.status, { 'content-type': reply.raw !== undefined ? 'text/plain' : 'application/json' });
+      res.end(reply.raw ?? (reply.body === undefined ? '' : JSON.stringify(reply.body)));
+    });
+  }
+
+  private answer(r: StorageRequest): Reply {
+    const signed = r.token === null ? undefined : this.tokens.get(r.token);
+    if (signed === undefined || signed.attachment !== r.attachment || signed.part !== r.part) {
+      return { status: 400, body: { statusCode: '400', error: 'InvalidToken', message: 'invalid signature' } };
+    }
+    if (signed.dead) return { status: this.deadStatus, body: { statusCode: String(this.deadStatus), error: 'Unauthorized', message: 'jwt expired' } };
+    if (r.method !== 'PUT') return { status: 405, body: { error: 'method_not_allowed' } };
+    // The bucket's allowed types (CONTRACT.md "Storage"): what a part is sent as.
+    if (r.headers['content-type'] !== 'application/octet-stream') return { status: 415, body: { error: 'invalid_mime_type' } };
+    if (r.body.length > PART_SIZE) return { status: 413, body: { error: 'too_large' } };
+    this.objects.set(`${signed.attachment}/${signed.part}`, r.body);
+    return { status: 200, body: { Key: r.path } };
+  }
+}
+
+type UploadState = { size: number; partCount: number; status: 'uploading' | 'complete' | 'aborted' };
+
 export class FakeWorker {
   readonly requests: RecordedRequest[] = [];
+  /** The bucket behind the signed URLs this API hands out. */
+  readonly storage = new FakeStorage();
   mode: WorkerMode = 'ok';
   /** Rows served by GET /agent/reports/{code}, keyed by code (snake_case, as the D1 row). */
   readonly reports = new Map<string, Record<string, unknown>>();
@@ -41,6 +174,7 @@ export class FakeWorker {
   private server: http.Server;
   private port = 0;
   private attachmentSeq = 0;
+  private readonly uploads = new Map<string, UploadState>();
 
   private constructor() {
     this.server = http.createServer((req, res) => this.onRequest(req, res));
@@ -50,6 +184,7 @@ export class FakeWorker {
     const w = new FakeWorker();
     await new Promise<void>((resolve) => w.server.listen(0, '127.0.0.1', resolve));
     w.port = (w.server.address() as AddressInfo).port;
+    await w.storage.start();
     return w;
   }
 
@@ -62,6 +197,7 @@ export class FakeWorker {
     // Hanging requests keep their sockets open: close them so the test process can exit.
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
+    await this.storage.stop();
   }
 
   /** Requests matching a method and a path (string = exact, RegExp = test). */
@@ -152,21 +288,38 @@ export class FakeWorker {
       const size = Number((r.json as { size?: unknown } | undefined)?.size);
       if (!Number.isFinite(size) || size <= 0) return { status: 400, body: { error: 'bad_size' } };
       this.attachmentSeq += 1;
-      return {
-        status: 201,
-        body: { attachmentId: `att-${this.attachmentSeq}`, partSize: PART_SIZE, partCount: Math.ceil(size / PART_SIZE) },
-      };
+      const partCount = Math.ceil(size / PART_SIZE);
+      this.uploads.set(`att-${this.attachmentSeq}`, { size, partCount, status: 'uploading' });
+      return { status: 201, body: { attachmentId: `att-${this.attachmentSeq}`, partSize: PART_SIZE, partCount } };
     }
-    if (r.method === 'PUT' && (m = r.path.match(/^\/attachments\/([\w-]+)\/parts\/(\d+)$/))) {
+    // CONTRACT.md "Upload routes": `PUT /attachments/{id}/parts/{n}` no longer exists, so it falls through to the 404.
+    if (r.method === 'POST' && (m = r.path.match(/^\/attachments\/([\w-]+)\/parts\/(\d+)\/upload-url$/))) {
       if (!tokenOk) return { status: 401, body: { error: 'unauthorized' } };
-      return { status: 200, body: { n: Number(m[2]), etag: `etag-${m[1]}-${m[2]}` } };
+      const up = this.uploads.get(m[1]!);
+      if (!up) return { status: 404, body: { error: 'not_found' } };
+      if (up.status !== 'uploading') return { status: 409, body: { error: 'not_uploading' } };
+      const n = Number(m[2]);
+      if (n < 1 || n > up.partCount) return { status: 400, body: { error: 'invalid_part' } };
+      return { status: 200, body: { n, url: this.storage.signUpload(m[1]!, n), expiresIn: 7200 } };
     }
     if (r.method === 'POST' && (m = r.path.match(/^\/attachments\/([\w-]+)\/complete$/))) {
       if (!tokenOk) return { status: 401, body: { error: 'unauthorized' } };
+      const up = this.uploads.get(m[1]!);
+      if (!up) return { status: 404, body: { error: 'not_found' } };
+      // As the function: a part missing from the bucket or of the wrong size counts as missing.
+      const missing: number[] = [];
+      for (let n = 1; n <= up.partCount; n++) {
+        const want = n < up.partCount ? PART_SIZE : up.size - PART_SIZE * (up.partCount - 1);
+        if (this.storage.objects.get(`${m[1]!}/${n}`)?.length !== want) missing.push(n);
+      }
+      if (missing.length > 0) return { status: 409, body: { error: 'missing_parts', missing } };
+      up.status = 'complete';
       return { status: 200, body: { ok: true } };
     }
     if (r.method === 'DELETE' && (m = r.path.match(/^\/attachments\/([\w-]+)$/))) {
       if (!tokenOk) return { status: 401, body: { error: 'unauthorized' } };
+      const up = this.uploads.get(m[1]!);
+      if (up) up.status = 'aborted';
       return { status: 200, body: { ok: true } };
     }
     return { status: 404, body: { error: 'not_found' } };
