@@ -405,7 +405,7 @@ as the public ones.
   pg_net is not available: the agent's timer calls it). The schedule is every 10 minutes (`*/10 * * * *`), one batch per call: that drains the
   backlog and honours the 24-hour window below; the migration enables pg_cron and pg_net itself and only falls back to a notice if it cannot. Besides the rules above it removes objects of `aborted` and
   `deleted` attachments for 24 hours after that status (a signed URL issued before it can still land for 2 hours; 24 hours
-  does not hang on one run; rows take turns through `attachments.swept_at bigint`, oldest or never swept first, so a flood cannot starve the others). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
+  does not hang on one run; rows take turns through `attachments.swept_at bigint`, oldest or never swept first, so a burst shares the capacity; at 150 or more new ended rows an hour a late part can wait for the 12-month removal, in the private bucket). After `complete`, a part can still be replaced until its signed URL expires: accepted, the
   file is the reporter's own and the agent rechecks sizes and the real type.
 
 ### Secrets
